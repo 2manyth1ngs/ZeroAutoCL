@@ -1,36 +1,38 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Paper-level forecasting configuration — tuned for RTX 4060 Laptop (8 GB).
+# Paper-level forecasting configuration — tuned for RTX 4090 (24 GB).
 #
 # VRAM budget notes
 # -----------------
 # The dominant memory cost is the InfoNCE similarity matrix of shape (B·T,B·T)
-# where T = 201 (sliding window).  At B=32 the matrix is ~165 MB; encoder
+# where T = 201 (sliding window).  At B=64 the matrix is ~660 MB; encoder
 # activations on the worst-case multivariate source (PEMS-BAY, 325 nodes) add
-# another ~300 MB.  Peak ≈ 1.5 GB — safe headroom on 8 GB.
+# another ~600 MB.  Peak ≈ 3 GB — comfortable headroom on 24 GB.
+#
+# For an 8 GB card use batch_size=32 instead.
 # ─────────────────────────────────────────────────────────────────────────────
 
 seed_generation:
-  n_per_dataset: 150        # 150 × 7 sources = 1050 seed records (paper-grade)
+  n_per_dataset: 200        # 200 × 8 sources = 1600 seed records (paper-grade)
   pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
   pretrain_lr: 0.001
-  batch_size: 32            # 8 GB-safe; halves InfoNCE matrix vs bs=64
+  batch_size: 64            # 4090-safe; doubles negatives vs the 8 GB config
   max_input_length: 2000
 
 # Per-dataset training budget (Bug #003a).
 #
 # Forecasting datasets (ETT*) suffer from train→val→test distribution drift,
 # so val-based early stopping is unreliable.  Instead we fix an iter budget
-# matching TS2Vec's official recipe.  When ``pretrain_iters`` is set,
-# ``pretrain_epochs`` is ignored.
+# matching TS2Vec's official recipe (hardware-independent).  When
+# ``pretrain_iters`` is set, ``pretrain_epochs`` is ignored.
 #
 # Classification / anomaly datasets keep epoch-based training and use
 # val-best checkpointing (val signal is reliable for them).
 dataset_budgets:
   # ── Forecasting (target pool) ──────────────────────────────────────────────
   ETTh1:        { pretrain_iters: 600 }
-  ETTh2:        { pretrain_iters: 600 }
   ETTm1:        { pretrain_iters: 600 }
   # ── Forecasting (source pool) ──────────────────────────────────────────────
+  ETTh2:        { pretrain_iters: 600 }
   PEMS03:       { pretrain_iters: 600 }
   PEMS04:       { pretrain_iters: 600 }
   PEMS07:       { pretrain_iters: 600 }
@@ -44,17 +46,16 @@ dataset_budgets:
   KPI:          { pretrain_epochs: 40 }
 
 comparator:
-  epochs: 200               # bumped from 100 — paper-grade comparator fit
+  epochs: 250               # +50 over 8 GB config — cheap, slightly tighter fit
   lr: 0.0001
   batch_size: 256
   curriculum_levels: 5
   hidden_dim: 128
 
 zero_shot:
-  n_candidates: 100000      # 100k pool — comparator forward is cheap, ranking
-                            # quality saturates well below the 3×10^12 space
-  top_k: 20                 # 20 fully-trained finalists on the target
-  tournament_rounds: 20     # +5 over default for tighter ranking
+  n_candidates: 200000      # 200k pool — comparator forward is nearly free on 4090
+  top_k: 30                 # 30 fully-trained finalists on the target
+  tournament_rounds: 25     # +5 for tighter Swiss-system ranking
 
 encoder_default:
   n_layers: 10

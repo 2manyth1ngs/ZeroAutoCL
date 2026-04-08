@@ -14,8 +14,9 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 DATA_DIR="${DATA_DIR:-${ROOT_DIR}/data/datasets}"
 SAVE_DIR="${SAVE_DIR:-${ROOT_DIR}/outputs/seeds}"
 CONFIG="${CONFIG:-${ROOT_DIR}/configs/default.yaml}"
-# Default sources: all forecasting datasets except the ETTh family (target).
-DATASETS="${DATASETS:-ETTm1 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate PEMS-BAY}"
+# Default sources: every forecasting dataset except ETTh1 (the target).
+# Per CLAUDE.md spec, ETTh2 is a SOURCE — only ETTh1 is held out for evaluation.
+DATASETS="${DATASETS:-ETTh2 ETTm1 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate PEMS-BAY}"
 N_PER_DATASET="${N_PER_DATASET:-30}"
 # When PRETRAIN_ITERS > 0 it overrides PRETRAIN_EPOCHS *for every dataset*.
 # Leave both empty to use the per-dataset budget from configs/default.yaml
