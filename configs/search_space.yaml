@@ -1,0 +1,17 @@
+encoder:
+  n_layers: [4, 6, 8, 10]
+  hidden_dim: [32, 64, 128]
+  output_dim: [64, 128, 320]
+
+cl_strategy:
+  p_values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+  aug_orders: 5
+  emb_norm: [none, layer_norm, l2]
+  temporal: [true, false]
+  cross_scale: [true, false]
+  kernel_size: [0, 2, 3, 5]
+  pool_op: [avg, max]
+  adj_neighbor: [true, false]
+  loss_type: [infonce, triplet]
+  sim_func: [dot, cosine, euclidean]
+  temperature: [0.01, 0.1, 1.0, 10.0, 100.0]

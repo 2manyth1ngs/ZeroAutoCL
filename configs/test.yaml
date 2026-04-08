@@ -1,0 +1,22 @@
+seed_generation:
+  n_per_dataset: 5
+  pretrain_epochs: 3
+  pretrain_lr: 0.001
+  batch_size: 64
+
+comparator:
+  epochs: 10
+  lr: 0.0001
+  batch_size: 64
+  curriculum_levels: 3
+  hidden_dim: 128
+
+zero_shot:
+  n_candidates: 1000
+  top_k: 3
+  tournament_rounds: 5
+
+encoder_default:
+  n_layers: 10
+  hidden_dim: 64
+  output_dim: 320

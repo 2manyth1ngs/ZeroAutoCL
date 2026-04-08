@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Paper-level forecasting configuration — tuned for RTX 4060 Laptop (8 GB).
+#
+# VRAM budget notes
+# -----------------
+# The dominant memory cost is the InfoNCE similarity matrix of shape (B·T,B·T)
+# where T = 201 (sliding window).  At B=32 the matrix is ~165 MB; encoder
+# activations on the worst-case multivariate source (PEMS-BAY, 325 nodes) add
+# another ~300 MB.  Peak ≈ 1.5 GB — safe headroom on 8 GB.
+# ─────────────────────────────────────────────────────────────────────────────
+
+seed_generation:
+  n_per_dataset: 150        # 150 × 7 sources = 1050 seed records (paper-grade)
+  pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
+  pretrain_lr: 0.001
+  batch_size: 32            # 8 GB-safe; halves InfoNCE matrix vs bs=64
+  max_input_length: 2000
+
+# Per-dataset training budget (Bug #003a).
+#
+# Forecasting datasets (ETT*) suffer from train→val→test distribution drift,
+# so val-based early stopping is unreliable.  Instead we fix an iter budget
+# matching TS2Vec's official recipe.  When ``pretrain_iters`` is set,
+# ``pretrain_epochs`` is ignored.
+#
+# Classification / anomaly datasets keep epoch-based training and use
+# val-best checkpointing (val signal is reliable for them).
+dataset_budgets:
+  # ── Forecasting (target pool) ──────────────────────────────────────────────
+  ETTh1:        { pretrain_iters: 600 }
+  ETTh2:        { pretrain_iters: 600 }
+  ETTm1:        { pretrain_iters: 600 }
+  # ── Forecasting (source pool) ──────────────────────────────────────────────
+  PEMS03:       { pretrain_iters: 600 }
+  PEMS04:       { pretrain_iters: 600 }
+  PEMS07:       { pretrain_iters: 600 }
+  PEMS08:       { pretrain_iters: 600 }
+  PEMS-BAY:     { pretrain_iters: 600 }
+  ExchangeRate: { pretrain_iters: 600 }
+  # ── Other tasks (epoch-based) ─────────────────────────────────────────────
+  HAR:          { pretrain_epochs: 40 }
+  Epilepsy:     { pretrain_epochs: 40 }
+  Yahoo:        { pretrain_epochs: 40 }
+  KPI:          { pretrain_epochs: 40 }
+
+comparator:
+  epochs: 200               # bumped from 100 — paper-grade comparator fit
+  lr: 0.0001
+  batch_size: 256
+  curriculum_levels: 5
+  hidden_dim: 128
+
+zero_shot:
+  n_candidates: 100000      # 100k pool — comparator forward is cheap, ranking
+                            # quality saturates well below the 3×10^12 space
+  top_k: 20                 # 20 fully-trained finalists on the target
+  tournament_rounds: 20     # +5 over default for tighter ranking
+
+encoder_default:
+  n_layers: 10
+  hidden_dim: 64
+  output_dim: 320
