@@ -20,7 +20,7 @@ from torch import Tensor
 from models.comparator.t_clsc import TCLSC
 from models.comparator.task_feature import TaskFeatureExtractor
 from data.dataset import TimeSeriesDataset, load_dataset
-from .sampler import batch_sample_candidates
+from .sampler import batch_sample_candidates, batch_sample_strategies
 
 logger = logging.getLogger(__name__)
 
@@ -240,3 +240,103 @@ def zero_shot_search(
         best_perf, best_enc,
     )
     return best_enc, best_strat, best_perf
+
+
+# ---------------------------------------------------------------------------
+# Plan B: ranking-only entry point that returns Cartesian finalists
+# ---------------------------------------------------------------------------
+
+def rank_finalists(
+    target_dataset: str,
+    data_dir: str,
+    comparator: TCLSC,
+    fixed_encoders: List[Dict[str, int]],
+    task_feature_extractor: Optional[TaskFeatureExtractor] = None,
+    n_candidates: int = 200_000,
+    top_k_strategies: int = 5,
+    tournament_rounds: int = 25,
+    device: Optional[torch.device] = None,
+) -> List[Dict]:
+    """Plan B: rank CL strategies for each fixed encoder, return finalists.
+
+    Unlike :func:`zero_shot_search`, this function does **not** retrain any
+    candidate. It only runs the comparator-based Swiss tournament and
+    bucket-orders the result so each ``fixed_encoders`` entry contributes
+    exactly ``top_k_strategies`` strategies. The caller (Phase 4) is
+    responsible for the actual retrain + test evaluation on the cartesian
+    product (``len(fixed_encoders) * top_k_strategies`` configs).
+
+    Args:
+        target_dataset: Name of the target dataset.
+        data_dir: Root data directory.
+        comparator: Pretrained :class:`TCLSC`.
+        fixed_encoders: Top-K_enc encoder configs from Stage A.
+        task_feature_extractor: Defaults to a fresh :class:`TaskFeatureExtractor`.
+        n_candidates: Size of the (encoder, strategy) candidate pool sampled
+            via :func:`batch_sample_strategies`.
+        top_k_strategies: How many strategies to keep per encoder.
+        tournament_rounds: Swiss-system tournament rounds.
+        device: Torch device.
+
+    Returns:
+        List of finalist records, length ``len(fixed_encoders) * top_k_strategies``::
+
+            [
+              {"encoder_config": {...}, "strategy": {...}, "rank": int},
+              ...
+            ]
+        Order is grouped by encoder; ``rank`` is the position within that
+        encoder's bucket (0 = best per the comparator).
+    """
+    if not fixed_encoders:
+        raise ValueError("rank_finalists: fixed_encoders must be non-empty")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    comparator = comparator.to(device)
+
+    logger.info("[plan-B] rank_finalists target=%s", target_dataset)
+    logger.info(
+        "[plan-B]  K_enc=%d  top_k_strategies=%d  pool=%d  rounds=%d",
+        len(fixed_encoders), top_k_strategies, n_candidates, tournament_rounds,
+    )
+
+    splits = load_dataset(target_dataset, data_dir)
+    train_ds = splits["train"]
+    task_type = train_ds.task_type
+
+    if task_feature_extractor is None:
+        task_feature_extractor = TaskFeatureExtractor(device=device)
+    task_feat = task_feature_extractor.extract(train_ds, task_type).to(device)
+
+    candidates = batch_sample_strategies(n_candidates, fixed_encoders)
+    ranking = tournament_rank(
+        comparator, candidates, task_feat, rounds=tournament_rounds,
+    )
+
+    # Bucket by encoder; keep at most top_k_strategies per bucket.
+    import json as _json
+    by_enc: Dict[str, List[int]] = {}
+    n_enc = len(fixed_encoders)
+    for idx in ranking:
+        enc_cfg, _ = candidates[idx]
+        key = _json.dumps(enc_cfg, sort_keys=True)
+        bucket = by_enc.setdefault(key, [])
+        if len(bucket) < top_k_strategies:
+            bucket.append(idx)
+        if len(by_enc) == n_enc and all(
+            len(b) >= top_k_strategies for b in by_enc.values()
+        ):
+            break
+
+    finalists: List[Dict] = []
+    for key, bucket in by_enc.items():
+        for local_rank, cand_idx in enumerate(bucket):
+            enc_cfg, strat_cfg = candidates[cand_idx]
+            finalists.append({
+                "encoder_config": enc_cfg,
+                "strategy": strat_cfg,
+                "rank": local_rank,
+            })
+
+    logger.info("[plan-B] selected %d finalists", len(finalists))
+    return finalists

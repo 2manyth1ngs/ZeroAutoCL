@@ -32,7 +32,7 @@ import yaml
 from models.comparator.t_clsc import TCLSC
 from models.comparator.task_feature import TaskFeatureExtractor, TASK_FEATURE_DIM
 from models.search_space.space_encoder import RAW_DIM
-from search.zero_shot_search import zero_shot_search
+from search.zero_shot_search import rank_finalists, zero_shot_search
 from utils.logging_utils import get_logger
 from utils.reproducibility import set_seed
 
@@ -53,7 +53,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",            type=int, default=42)
     p.add_argument("--device",          default=None)
     p.add_argument("--output",          default=None, help="Optional JSON output path")
+    p.add_argument("--encoder_grid",    default=None,
+                   help="(Plan B) Path to encoder_grid.json from Stage A. "
+                        "When given, switches to ranking-only mode and writes "
+                        "a finalists.json instead of running top-K retrain.")
+    p.add_argument("--top_k_enc",       type=int, default=3,
+                   help="(Plan B) How many encoders to keep from --encoder_grid.")
+    p.add_argument("--top_k_strategies", type=int, default=None,
+                   help="(Plan B) Strategies kept per encoder. "
+                        "Defaults to two_stage_search.cl_strategy_search.top_k_strategies.")
     return p.parse_args()
+
+
+def _load_top_k_encoders(path: str, k: int):
+    """Read encoder_grid.json from Stage A and return its top-K encoder configs."""
+    with open(path, encoding="utf-8") as f:
+        records = json.load(f)
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"encoder_grid file is empty or malformed: {path}")
+    return [r["encoder_config"] for r in records[:k]]
 
 
 def main() -> None:
@@ -101,6 +119,45 @@ def main() -> None:
     logger.info("Loaded comparator from %s", args.comparator_path)
 
     tfe = TaskFeatureExtractor(device=device)
+
+    # ── Plan B branch: ranking-only, write finalists.json ──────────────
+    if args.encoder_grid:
+        ts_cfg = cfg.get("two_stage_search", {}) or {}
+        cls_cfg = ts_cfg.get("cl_strategy_search", {}) or {}
+        top_k_strategies = (
+            args.top_k_strategies
+            if args.top_k_strategies is not None
+            else int(cls_cfg.get("top_k_strategies", 5))
+        )
+        n_candidates = int(cls_cfg.get("n_candidates", zs_cfg.get("n_candidates", 200_000)))
+        rounds = int(cls_cfg.get("tournament_rounds", zs_cfg.get("tournament_rounds", 25)))
+
+        fixed_encoders = _load_top_k_encoders(args.encoder_grid, args.top_k_enc)
+        logger.info(
+            "[plan-B] using top-%d encoders from %s -> %s",
+            args.top_k_enc, args.encoder_grid, fixed_encoders,
+        )
+
+        finalists = rank_finalists(
+            target_dataset=args.target_dataset,
+            data_dir=args.data_dir,
+            comparator=comparator,
+            fixed_encoders=fixed_encoders,
+            task_feature_extractor=tfe,
+            n_candidates=n_candidates,
+            top_k_strategies=top_k_strategies,
+            tournament_rounds=rounds,
+            device=device,
+        )
+
+        if args.output:
+            os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+            with open(args.output, "w") as f:
+                json.dump(finalists, f, indent=2)
+            logger.info("[plan-B] saved %d finalists to %s", len(finalists), args.output)
+        else:
+            logger.info("[plan-B] finalists: %s", finalists)
+        return
 
     logger.info(
         "Top-K full-train budget for %s: iters=%d epochs=%d",

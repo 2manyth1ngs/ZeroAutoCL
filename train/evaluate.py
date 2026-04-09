@@ -151,6 +151,7 @@ def eval_forecasting(
     horizons: Optional[List[int]] = None,
     batch_size: int = 64,
     device: Optional[torch.device] = None,
+    val_data: Optional[TimeSeriesDataset] = None,
 ) -> Dict[int, Dict[str, float]]:
     """Evaluate via Ridge regression per horizon.
 
@@ -186,16 +187,33 @@ def eval_forecasting(
     encoder = encoder.to(device)
     encoder.eval()
 
-    # Encode per-timestep (series-level: each dataset has 1 sample)
-    with torch.no_grad():
-        h_train = encoder(train_data.data.to(device)).cpu().numpy()  # (1, T_tr, D)
-        h_test  = encoder(test_data.data.to(device)).cpu().numpy()   # (1, T_te, D)
+    # ── Prefix encoding (TS2Vec / AutoCLS official protocol) ────────────
+    # Concatenate train [+ val] + test along the time axis and encode in a
+    # single forward pass, then slice the embeddings back. This eliminates
+    # the boundary effect that contaminates the first ~RF (≈2047) timesteps
+    # of h_test when train/test are encoded independently — those positions
+    # would otherwise have their receptive field extend into zero-padding
+    # instead of the true preceding context. See CLAUDE_ADV.md §10.3.
+    x_tr_t = train_data.data    # (1, T_tr, C)
+    x_te_t = test_data.data     # (1, T_te, C)
+    T_tr = x_tr_t.shape[1]
+    T_te = x_te_t.shape[1]
 
-    # Squeeze series dimension
-    h_tr = h_train[0]             # (T_tr, D)
-    h_te = h_test[0]              # (T_te, D)
-    x_tr = train_data.data[0].numpy()   # (T_tr, C)
-    x_te = test_data.data[0].numpy()    # (T_te, C)
+    if val_data is not None:
+        x_va_t = val_data.data  # (1, T_va, C)
+        T_va = x_va_t.shape[1]
+        full = torch.cat([x_tr_t, x_va_t, x_te_t], dim=1).to(device)
+    else:
+        T_va = 0
+        full = torch.cat([x_tr_t, x_te_t], dim=1).to(device)
+
+    with torch.no_grad():
+        h_full = encoder(full).cpu().numpy()[0]   # (T_tr+T_va+T_te, D)
+
+    h_tr = h_full[:T_tr]                                       # (T_tr, D)
+    h_te = h_full[T_tr + T_va : T_tr + T_va + T_te]            # (T_te, D)
+    x_tr = x_tr_t[0].numpy()
+    x_te = x_te_t[0].numpy()
 
     results: Dict[int, Dict[str, float]] = {}
 

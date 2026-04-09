@@ -102,6 +102,11 @@ def sample_cl_strategy() -> Dict:
     }
 
 
+def sample_cl_strategy_only() -> Dict:
+    """Alias of :func:`sample_cl_strategy` for explicitness in Plan B code."""
+    return sample_cl_strategy()
+
+
 def sample_encoder_config() -> Dict[str, int]:
     """Uniformly sample one encoder configuration from the 36 candidates.
 

@@ -15,7 +15,11 @@ seed_generation:
   n_per_dataset: 200        # 200 × 8 sources = 1600 seed records (paper-grade)
   pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
   pretrain_lr: 0.001
-  batch_size: 64            # 4090-safe; doubles negatives vs the 8 GB config
+  # CLAUDE_ADV.md §10.1: crop_len pulled from 201 → 2048 to match the
+  # 10-layer dilated CNN receptive field. The InfoNCE similarity matrix
+  # (B·T, B·T) at T=2048 forces a much smaller batch — 16 on 4090 (24 GB),
+  # 8 on 4060 Laptop (8 GB).
+  batch_size: 16
   max_input_length: 2000
 
 # Per-dataset training budget (Bug #003a).
@@ -61,3 +65,32 @@ encoder_default:
   n_layers: 10
   hidden_dim: 64
   output_dim: 320
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan B (CLAUDE_ADV.md §3.7) — two-stage decomposition of the joint search.
+#
+# Stage A : grid-search 36 encoders × |sources| under GGS_STRATEGY → top-K_enc
+# Stage B : seed generation + comparator + zero-shot ranking, with the encoder
+#           sub-space restricted to top-K_enc
+# Phase 4 : Cartesian retrain (K_enc × top_k_strategies) on the target dataset
+# ─────────────────────────────────────────────────────────────────────────────
+two_stage_search:
+  encoder_grid:
+    enabled: true
+    sources: [ETTm1, ETTh2, PEMS03, PEMS04, PEMS07, PEMS08, ExchangeRate, PEMS-BAY]
+    save_path: outputs/full_etth1_two_stage/encoder_grid.json
+    top_k_enc: 3                # K_enc
+
+  cl_strategy_search:
+    n_per_dataset: 200          # mirrors seed_generation.n_per_dataset
+    n_candidates: 200000
+    tournament_rounds: 25
+    top_k_strategies: 5         # CL strategies kept per encoder
+
+  # Phase 4: K_enc × top_k_strategies = 3×5 = 15 retrains.
+  # Pulled to 3000 iters per CLAUDE_ADV.md §10.2 to match TS2Vec's training
+  # budget on ETT (Stage A/B keep the cheaper 600-iter ranking budget).
+  finalists:
+    pretrain_iters: 3000
+    pretrain_lr: 0.001
+    batch_size: 16              # tracks §10.1 crop_len=2048

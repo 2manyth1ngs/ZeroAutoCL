@@ -47,7 +47,12 @@ _ETT_MINUTE_SPLITS = {
 # Sliding-window length used to slice long forecasting series into training
 # samples for contrastive pretraining.  Matches the TS2Vec default crop size.
 # See Bug #001 in CLAUDE_DEBUG.md.
-_FORECAST_WINDOW_LEN = 201
+#
+# CLAUDE_ADV.md §10.1: must be ≥ the dilated CNN receptive field
+# (10 layers → 2^11-1 = 2047 timesteps), otherwise the deep dilation layers
+# only ever see padding for inputs shorter than RF and learn no long-range
+# dependency.  TS2Vec / AutoCLS use ~3000; 2048 is the conservative floor.
+_FORECAST_WINDOW_LEN = 2048
 
 # Univariate forecasting on ETT (TS2Vec / AutoCLS protocol).
 # Both TS2Vec (Table 2 in the paper) and AutoCLS (Table 4) report the

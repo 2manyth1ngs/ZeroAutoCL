@@ -21,10 +21,11 @@ python scripts/run_generate_seeds.py \\
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
-from typing import Dict
+from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -56,7 +57,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size",      type=int,       default=64)
     p.add_argument("--seed",            type=int,       default=42)
     p.add_argument("--device",          default=None,   help="'cpu' or 'cuda'")
+    p.add_argument("--encoder_grid",    default=None,
+                   help="(Plan B) Path to encoder_grid.json from Stage A. "
+                        "When given, seed generation restricts the encoder "
+                        "sub-space to the top-K rows of this file.")
+    p.add_argument("--top_k_enc",       type=int, default=3,
+                   help="(Plan B) How many encoders to keep from --encoder_grid.")
     return p.parse_args()
+
+
+def _load_top_k_encoders(path: str, k: int) -> List[Dict[str, int]]:
+    """Read encoder_grid.json and return its top-K encoder configs.
+
+    The file is a list of records sorted by ``mean_perf`` desc, as written
+    by :func:`search.encoder_grid_search.encoder_grid_search`.
+    """
+    with open(path, encoding="utf-8") as f:
+        records = json.load(f)
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"encoder_grid file is empty or malformed: {path}")
+    return [r["encoder_config"] for r in records[:k]]
 
 
 def main() -> None:
@@ -95,6 +115,14 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device else None
 
+    fixed_encoders: Optional[List[Dict[str, int]]] = None
+    if args.encoder_grid:
+        fixed_encoders = _load_top_k_encoders(args.encoder_grid, args.top_k_enc)
+        logger.info(
+            "[plan-B] using top-%d encoders from %s -> %s",
+            args.top_k_enc, args.encoder_grid, fixed_encoders,
+        )
+
     logger.info(
         "Generating seeds: datasets=%s  n_per=%d  lr=%.4f  bs=%d",
         args.datasets, n_per_dataset, pretrain_lr, batch_size,
@@ -112,6 +140,7 @@ def main() -> None:
         device=device,
         seed=args.seed,
         dataset_budgets=dataset_budgets,
+        fixed_encoders=fixed_encoders,
     )
 
     logger.info("Done — generated %d seed records.", len(seeds))
