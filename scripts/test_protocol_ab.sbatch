@@ -13,18 +13,23 @@
 #SBATCH --error=logs/zac_protocol_ab_%j.err
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ZeroAutoCL — §10 Protocol Fix A/B test
+# ZeroAutoCL — §10 Protocol Fix A/B test (batch=64 push-the-limit run)
 #
 # Two runs of the same (encoder L=10/H=64/O=320, GGS_STRATEGY, seed=42) on
 # ETTh1 univariate forecasting:
 #
 #   baseline : crop_len=201,  batch_size=64, legacy per-split eval
-#   fixed    : crop_len=3000, batch_size=32, prefix-encoding eval (with val)
+#   fixed    : crop_len=3000, batch_size=64, prefix-encoding eval (with val)
+#
+# This run probes whether a 4090 24 GB card can sustain the §10.1 fixed
+# protocol at the original AutoCLS batch_size=64. Previous run at batch=32
+# already gave mean MSE 0.155 (see outputs/test_protocol_ab/diff.txt);
+# batch=64 doubles the negatives and *may* push performance further, but
+# may also OOM. If srun aborts with CUDA OOM, drop the fixed batch_size
+# inside scripts/test_protocol_ab.py to 48 (or back to 32) and resubmit.
 #
 # pretrain_iters is fixed at 600 for BOTH runs so that the only differences
-# are §10.1 (crop length) + §10.3 (prefix encoding).  §10.2 (3000-iter
-# Phase-4 retrain) is intentionally NOT enabled here to keep the variables
-# isolated; it will be tested separately.
+# are §10.1 (crop length) + §10.3 (prefix encoding).
 #
 # Hardware: 1× RTX 4090 (24 GB), 8 CPUs, 32 GB RAM.
 #

@@ -15,11 +15,12 @@ seed_generation:
   n_per_dataset: 200        # 200 × 8 sources = 1600 seed records (paper-grade)
   pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
   pretrain_lr: 0.001
-  # CLAUDE_ADV.md §10.1: crop_len pulled from 201 → 2048 to match the
-  # 10-layer dilated CNN receptive field. The InfoNCE similarity matrix
-  # (B·T, B·T) at T=2048 forces a much smaller batch — 16 on 4090 (24 GB),
-  # 8 on 4060 Laptop (8 GB).
-  batch_size: 16
+  # CLAUDE_ADV.md §10.1 (revised 2026-04-09): crop_len = 3000 to match
+  # TS2Vec's actual default (verified against reference AutoCTS_plusplus).
+  # batch_size=32 was validated on a 4090 (24 GB) in the protocol A/B test
+  # (outputs/test_protocol_ab/diff.txt) — pushed mean MSE from 0.41 → 0.15.
+  # Smaller cards (e.g. 4060 Laptop 8 GB) need batch_size=8.
+  batch_size: 32
   max_input_length: 2000
 
 # Per-dataset training budget (Bug #003a).
@@ -88,9 +89,12 @@ two_stage_search:
     top_k_strategies: 5         # CL strategies kept per encoder
 
   # Phase 4: K_enc × top_k_strategies = 3×5 = 15 retrains.
-  # Pulled to 3000 iters per CLAUDE_ADV.md §10.2 to match TS2Vec's training
-  # budget on ETT (Stage A/B keep the cheaper 600-iter ranking budget).
+  # CLAUDE_ADV.md §10.2 originally proposed 3000 iters, but the protocol
+  # A/B test (outputs/test_protocol_ab/diff.txt) showed §10.1 alone +
+  # 600 iters already reaches mean MSE 0.155 — close to the TS2Vec
+  # reference. The 3000-iter budget is now optional and not the default
+  # because its marginal gain is small relative to the 5× wall-clock cost.
   finalists:
-    pretrain_iters: 3000
+    pretrain_iters: 600
     pretrain_lr: 0.001
-    batch_size: 16              # tracks §10.1 crop_len=2048
+    batch_size: 32              # tracks §10.1 crop_len=3000

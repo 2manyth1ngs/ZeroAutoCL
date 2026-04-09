@@ -48,11 +48,15 @@ _ETT_MINUTE_SPLITS = {
 # samples for contrastive pretraining.  Matches the TS2Vec default crop size.
 # See Bug #001 in CLAUDE_DEBUG.md.
 #
-# CLAUDE_ADV.md §10.1: must be ≥ the dilated CNN receptive field
-# (10 layers → 2^11-1 = 2047 timesteps), otherwise the deep dilation layers
-# only ever see padding for inputs shorter than RF and learn no long-range
-# dependency.  TS2Vec / AutoCLS use ~3000; 2048 is the conservative floor.
-_FORECAST_WINDOW_LEN = 2048
+# CLAUDE_ADV.md §10.1 (revised after the 2026-04-09 A/B test): aligned to
+# the *actual* TS2Vec default `max_train_length=3000`, verified against
+# reference/AutoCTS_plusplus/exps/generate_task_feature.py:44.  Must be
+# ≥ the 10-layer dilated CNN receptive field (2^11-1=2047), otherwise the
+# deep dilation layers only ever see padding for inputs shorter than RF
+# and the model cannot learn dependencies long enough for H=336/720
+# forecasting.  3000 brought ETTh1 mean MSE from 0.41 → 0.15 in the
+# protocol-fix A/B test (outputs/test_protocol_ab/diff.txt).
+_FORECAST_WINDOW_LEN = 3000
 
 # Univariate forecasting on ETT (TS2Vec / AutoCLS protocol).
 # Both TS2Vec (Table 2 in the paper) and AutoCLS (Table 4) report the
