@@ -3,11 +3,12 @@
 Two runs of the same (encoder, GGS_STRATEGY, seed=42) on ETTh1 univariate
 forecasting:
 
-  baseline : crop_len=201,  batch_size=64, legacy per-split eval (no val)
-  fixed    : crop_len=3000, batch_size=64, prefix-encoding eval (with val)
+  baseline : crop_len=201,  batch_size=32, legacy per-split eval (no val)
+  fixed    : crop_len=3000, batch_size=32, prefix-encoding eval (with val)
 
-Both runs use ``pretrain_iters=600`` so the only differences are the §10
-protocol changes (§10.1 crop length + §10.3 prefix-encoding eval).  We
+Both runs use ``pretrain_iters=3000`` (§10.2 long-budget retrain) so the
+differences are the §10 protocol changes (§10.1 crop length + §10.3
+prefix-encoding eval) compounded with the longer training schedule.  We
 compare per-horizon MSE/MAE plus the wall-clock cost and write everything
 to ``outputs/test_protocol_ab/``.
 
@@ -43,7 +44,7 @@ logger = get_logger(__name__)
 
 ENCODER_CONFIG = {"n_layers": 10, "hidden_dim": 64, "output_dim": 320}
 HORIZONS = [24, 48, 168, 336, 720]
-PRETRAIN_ITERS = 600
+PRETRAIN_ITERS = 3000
 PRETRAIN_LR = 1e-3
 SEED = 42
 TARGET = "ETTh1"
@@ -256,9 +257,9 @@ def write_diff(baseline: Dict, fixed: Dict, path: str) -> None:
     push(f"  observed = {baseline['test_mean_mse']:.4f}  →  "
          + ("OK" if 0.30 <= baseline['test_mean_mse'] <= 0.45 else "OUT OF RANGE — investigate"))
     push("")
-    push("Reference (outputs/test_protocol_ab/diff.txt, 2026-04-09 batch=32 run):")
-    push("  fixed.test_mean_mse = 0.1546  (crop=3000, batch=32, prefix eval)")
-    push("  This batch=64 push-the-limit run is expected to land near or below 0.155.")
+    push("Reference (prior 4090 runs, batch=32, prefix eval):")
+    push("  600  iters : fixed.test_mean_mse = 0.1546")
+    push("  3000 iters : (this run) — testing whether §10.2 long-budget compounds.")
 
     text = "\n".join(lines) + "\n"
     with open(path, "w", encoding="utf-8") as f:
@@ -291,16 +292,16 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Push-the-limit fixed group: crop=3000 (TS2Vec actual default) with
-    # batch=64 (the original AutoCLS batch). The previous 4090 run at
-    # batch=32 used <12 GB and finished in 98 s; doubling the batch may
-    # still fit in 24 GB thanks to the kernel_size=5 hierarchical pooling
-    # in GGS_STRATEGY shrinking the InfoNCE matrix. If this OOMs, drop
-    # to 48 (or back to 32) and resubmit.
+    # Long-budget fixed group: crop=3000 (TS2Vec actual default) with
+    # batch=32 (validated on 4090, ~98 s/run at 600 iters). The previous
+    # batch=64 attempt regressed (negatives crowded the InfoNCE matrix),
+    # so we keep bs=32 and instead push pretrain_iters 600 → 3000 (§10.2
+    # long-budget retrain) to test whether the extra training compounds
+    # with the §10.1/§10.3 fixes.
     fixed = run_group(
         label="fixed",
         window_len=3000,
-        batch_size=64,
+        batch_size=32,
         use_prefix_eval=True,
         device=device,
     )
