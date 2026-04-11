@@ -78,7 +78,7 @@ encoder_default:
 two_stage_search:
   encoder_grid:
     enabled: true
-    sources: [ETTm1, ETTh2, PEMS03, PEMS04, PEMS07, PEMS08, ExchangeRate]
+    sources: [PEMS03, PEMS04, PEMS07, PEMS08, ExchangeRate, ETTm1]
     save_path: outputs/full_etth1_two_stage/encoder_grid.json
     top_k_enc: 3                # K_enc
 

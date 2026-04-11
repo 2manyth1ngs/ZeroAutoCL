@@ -142,8 +142,11 @@ class CLPipeline(nn.Module):
               - ``total_loss``: Mean of all active contrast losses (scalar).
               - ``loss_dict``:  Dict mapping contrast-type name → scalar loss.
         """
-        # ── Step 1: Augmentation ─────────────────────────────────────────
-        x1, x2 = self.aug_pipeline(x)
+        # ── Step 1: Augmentation (no grad — no learnable params) ─────────
+        with torch.no_grad():
+            x1, x2 = self.aug_pipeline(x)
+        x1 = x1.detach()
+        x2 = x2.detach()
 
         # ── Step 2: Encoding ─────────────────────────────────────────────
         h1 = self.encoder(x1)   # (B, T, D)

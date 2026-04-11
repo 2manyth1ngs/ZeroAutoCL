@@ -2,6 +2,8 @@
 #SBATCH --job-name=zac_full_etth1
 #SBATCH --partition=gpu_spot
 #SBATCH --gpus=nvidia_geforce_rtx_4090:1
+#SBATCH --gpu-bind=closest
+#SBATCH --exclusive
 #SBATCH --constraint=vram24g&cc8.9
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -88,7 +90,7 @@ nvidia-smi
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available(), '| dev:', torch.cuda.get_device_name(0), '| vram_gb:', round(torch.cuda.get_device_properties(0).total_memory/1e9, 1))"
 
 # Source datasets for Stage A and Stage B.1 (target ETTh1 is excluded).
-SOURCES=(ETTm1 ETTh2 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate)
+SOURCES=(PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate ETTm1)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage A — encoder grid search (36 encoders × 8 sources, GGS fixed)
@@ -104,7 +106,7 @@ else
         --config   "${CONFIG}" \
         --datasets "${SOURCES[@]}" \
         --seed     "${SEED}" \
-        2>&1 | tee -a "${OUT_DIR}/run.log"
+        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ else
         --encoder_grid   "${ENCODER_GRID}" \
         --top_k_enc      "${TOP_K_ENC}" \
         --seed           "${SEED}" \
-        2>&1 | tee -a "${OUT_DIR}/run.log"
+        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,7 +148,7 @@ else
         --save_path  "${COMPARATOR}" \
         --config     "${CONFIG}" \
         --seed       "${SEED}" \
-        2>&1 | tee -a "${OUT_DIR}/run.log"
+        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +173,7 @@ else
         --top_k_strategies "${TOP_K_STR}" \
         --output          "${FINALISTS}" \
         --seed            "${SEED}" \
-        2>&1 | tee -a "${OUT_DIR}/run.log"
+        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,7 +191,7 @@ else
         --config    "${CONFIG}" \
         --save_dir  "${OUT_DIR}" \
         --seed      "${SEED}" \
-        2>&1 | tee -a "${OUT_DIR}/run.log"
+        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi
 
 echo "================================================================="
