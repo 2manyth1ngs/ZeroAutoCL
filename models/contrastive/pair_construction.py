@@ -177,15 +177,20 @@ class ContrastivePairConstructor(nn.Module):
                 'pool_op':     str,         # 'avg' | 'max'
                 'adj_neighbor':bool,
             }
+        max_temporal_len: When the sequence length T exceeds this value,
+            randomly subsample time positions for temporal and cross-scale
+            contrast to avoid OOM from (B, T, T) similarity matrices.
+            Default 200 keeps peak VRAM under ~1 GB for these losses.
     """
 
-    def __init__(self, config: Dict) -> None:
+    def __init__(self, config: Dict, max_temporal_len: int = 200) -> None:
         super().__init__()
         self.temporal: bool = bool(config.get("temporal", False))
         self.cross_scale: bool = bool(config.get("cross_scale", False))
         self.kernel_size: int = int(config.get("kernel_size", 0))
         self.pool_op: str = str(config.get("pool_op", "avg"))
         self.adj_neighbor: bool = bool(config.get("adj_neighbor", False))
+        self.max_temporal_len: int = max_temporal_len
 
     # ------------------------------------------------------------------
     # Instance contrast
@@ -260,11 +265,18 @@ class ContrastivePairConstructor(nn.Module):
         if T < 3:
             return h1.new_zeros(1).squeeze().requires_grad_(False)
 
+        # ── Subsample time positions to cap VRAM at O(B·T'·T') ───────
+        if T > self.max_temporal_len:
+            idx = torch.randperm(T, device=h1.device)[:self.max_temporal_len].sort().values
+            h1 = h1[:, idx, :]   # (B, T', D)
+            h2 = h2[:, idx, :]
+            T = self.max_temporal_len
+
         if isinstance(loss_fn, InfoNCELoss):
             sim_func = loss_fn.sim_func
             temp = loss_fn.temperature
 
-            # ── Similarity matrices (B, T, T) ─────────────────────────
+            # ── Similarity matrices (B, T', T') ──────────────────────
             sim_12 = _batch_sim_matrix(h1, h2, sim_func, temp)  # h1→h2
             sim_21 = _batch_sim_matrix(h2, h1, sim_func, temp)  # h2→h1
 
@@ -324,6 +336,12 @@ class ContrastivePairConstructor(nn.Module):
             return h1.new_zeros(1).squeeze().requires_grad_(False)
 
         B, T, D = h1.shape
+
+        # ── Subsample before hierarchical pooling to cap memory ──────
+        if T > self.max_temporal_len:
+            idx = torch.randperm(T, device=h1.device)[:self.max_temporal_len].sort().values
+            h1 = h1[:, idx, :]
+            h2 = h2[:, idx, :]
 
         scales1 = hierarchical_pooling(h1, self.kernel_size, self.pool_op)
         scales2 = hierarchical_pooling(h2, self.kernel_size, self.pool_op)

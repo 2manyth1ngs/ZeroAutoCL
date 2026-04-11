@@ -190,12 +190,19 @@ def contrastive_pretrain(
         for x_batch, _ in loader:
             x_batch = x_batch.to(device)
 
-            # OOM guard: retry with halved batch size.
+            # OOM guard: covers both forward and backward passes.
+            loss = None
             try:
                 loss, _ = cl_pipeline(x_batch)
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(cl_pipeline.parameters(), max_norm=1.0)
+                optimizer.step()
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower():
                     raise
+                # Free tensors from the failed forward/backward before retrying.
+                del loss
                 torch.cuda.empty_cache()
                 batch_size = max(2, batch_size // 2)
                 loader = DataLoader(
@@ -204,11 +211,6 @@ def contrastive_pretrain(
                 )
                 logger.warning("OOM — reducing batch_size to %d", batch_size)
                 break
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(cl_pipeline.parameters(), max_norm=1.0)
-            optimizer.step()
 
             epoch_loss += loss.item()
             n_batches += 1

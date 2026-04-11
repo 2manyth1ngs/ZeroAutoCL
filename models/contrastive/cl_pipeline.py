@@ -77,7 +77,12 @@ class CLPipeline(nn.Module):
             sub-dicts fall back to GGS defaults.
     """
 
-    def __init__(self, encoder: nn.Module, strategy_config: Dict) -> None:
+    def __init__(
+        self,
+        encoder: nn.Module,
+        strategy_config: Dict,
+        max_temporal_len: int = 200,
+    ) -> None:
         super().__init__()
 
         aug_cfg  = strategy_config.get("augmentation",       _DEFAULT_AUG_CFG)
@@ -108,7 +113,7 @@ class CLPipeline(nn.Module):
         # Ensure instance=True (not searched).
         pair_cfg = dict(pair_cfg)
         pair_cfg["instance"] = True
-        self.pair_constructor = ContrastivePairConstructor(pair_cfg)
+        self.pair_constructor = ContrastivePairConstructor(pair_cfg, max_temporal_len)
 
         # ── Loss function ─────────────────────────────────────────────────
         loss_type = str(loss_cfg.get("type", "infonce")).lower()

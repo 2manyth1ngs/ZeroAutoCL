@@ -88,7 +88,7 @@ nvidia-smi
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available(), '| dev:', torch.cuda.get_device_name(0), '| vram_gb:', round(torch.cuda.get_device_properties(0).total_memory/1e9, 1))"
 
 # Source datasets for Stage A and Stage B.1 (target ETTh1 is excluded).
-SOURCES=(ETTm1 ETTh2 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate PEMS-BAY)
+SOURCES=(ETTm1 ETTh2 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage A — encoder grid search (36 encoders × 8 sources, GGS fixed)

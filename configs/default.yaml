@@ -3,25 +3,25 @@
 #
 # VRAM budget notes
 # -----------------
-# The dominant memory cost is the InfoNCE similarity matrix of shape (B·T,B·T)
-# where T = 201 (sliding window).  At B=64 the matrix is ~660 MB; encoder
-# activations on the worst-case multivariate source (PEMS-BAY, 325 nodes) add
-# another ~600 MB.  Peak ≈ 3 GB — comfortable headroom on 24 GB.
+# The dominant memory cost comes from temporal / cross-scale contrast, which
+# build (B, T', T') similarity matrices.  With max_temporal_len=200 and
+# B=32, each matrix is 32×200×200×4 = 5 MB — safe on any modern GPU.
+# Without subsampling, T=3000 (crop_len) would create 32×3000×3000×4 = 1.1 GB
+# per matrix, causing OOM on 24 GB cards after adding gradients + encoder
+# activations.
 #
-# For an 8 GB card use batch_size=32 instead.
+# Instance contrast (time-pools to (B, D) first) is unaffected by T.
 # ─────────────────────────────────────────────────────────────────────────────
 
 seed_generation:
   n_per_dataset: 200        # 200 × 8 sources = 1600 seed records (paper-grade)
   pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
   pretrain_lr: 0.001
-  # CLAUDE_ADV.md §10.1 (revised 2026-04-09): crop_len = 3000 to match
-  # TS2Vec's actual default (verified against reference AutoCTS_plusplus).
-  # batch_size=32 was validated on a 4090 (24 GB) in the protocol A/B test
-  # (outputs/test_protocol_ab/diff.txt) — pushed mean MSE from 0.41 → 0.15.
-  # Smaller cards (e.g. 4060 Laptop 8 GB) need batch_size=8.
   batch_size: 32
   max_input_length: 2000
+  # Cap sequence length for temporal/cross-scale similarity matrices.
+  # Keeps peak VRAM well under 24 GB even when temporal=True is sampled.
+  max_temporal_len: 200
 
 # Per-dataset training budget (Bug #003a).
 #
@@ -78,7 +78,7 @@ encoder_default:
 two_stage_search:
   encoder_grid:
     enabled: true
-    sources: [ETTm1, ETTh2, PEMS03, PEMS04, PEMS07, PEMS08, ExchangeRate, PEMS-BAY]
+    sources: [ETTm1, ETTh2, PEMS03, PEMS04, PEMS07, PEMS08, ExchangeRate]
     save_path: outputs/full_etth1_two_stage/encoder_grid.json
     top_k_enc: 3                # K_enc
 
