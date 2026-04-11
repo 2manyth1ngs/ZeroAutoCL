@@ -105,11 +105,12 @@ class TimeSeriesDataset(Dataset):
         max_len: If provided, sequences longer than this are truncated to the
             last *max_len* time steps.
         window_len: If provided and ``data`` is a single long series of shape
-            ``(1, T, C)`` with ``T > window_len``, build a sliding-window view
-            ``self._windows`` of shape ``(N_windows, window_len, C)``.  The
-            DataLoader iterates over these windows, while ``self.data`` still
-            points at the full original series so that downstream evaluation
-            (e.g. Ridge forecasting on continuous embeddings) keeps working.
+            ``(1, T, C)`` with ``T > window_len``, enable lazy sliding-window
+            access: ``__getitem__`` slices windows on the fly from
+            ``self.data``.  The DataLoader iterates over these windows, while
+            ``self.data`` still points at the full original series so that
+            downstream evaluation (e.g. Ridge forecasting on continuous
+            embeddings) keeps working.
         window_stride: Stride between window starts.  Defaults to 1.
     """
 
@@ -140,35 +141,39 @@ class TimeSeriesDataset(Dataset):
         # Bug #001 fix: ETT-style datasets are stored as (1, T, C); without
         # windowing, ``len(self) == 1`` and the DataLoader (with drop_last=True
         # and a large batch size) yields zero batches per epoch — encoder is
-        # never trained.  Building windows here gives the DataLoader real
-        # samples to iterate over.
-        self._windows: Optional[torch.Tensor] = None
+        # never trained.
+        #
+        # Bug #005b fix: windows are computed lazily in ``__getitem__`` instead
+        # of pre-materialised.  For PEMS07 (883ch, stride=1, T_train≈16k) the
+        # old approach needed ~148 GB CPU RAM; lazy slicing uses O(1) extra.
+        self._window_len: Optional[int] = None
+        self._window_stride: int = 1
+        self._n_windows: int = 0
         if (
             window_len is not None
             and self.data.shape[0] == 1
             and self.data.shape[1] > window_len
         ):
-            series = self.data[0]  # (T, C)
-            T = series.shape[0]
+            T = self.data.shape[1]
             stride = max(1, int(window_stride))
-            starts = range(0, T - window_len + 1, stride)
-            self._windows = torch.stack(
-                [series[s : s + window_len] for s in starts], dim=0
-            )  # (N_windows, window_len, C)
+            self._window_len = window_len
+            self._window_stride = stride
+            self._n_windows = (T - window_len) // stride + 1
             logger.info(
-                "Built sliding windows: %d windows of length %d (stride=%d) "
+                "Lazy sliding windows: %d windows of length %d (stride=%d) "
                 "from series of length %d",
-                self._windows.shape[0], window_len, stride, T,
+                self._n_windows, window_len, stride, T,
             )
 
     def __len__(self) -> int:
-        if self._windows is not None:
-            return self._windows.shape[0]
+        if self._n_windows > 0:
+            return self._n_windows
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self._windows is not None:
-            x = self._windows[idx]
+        if self._n_windows > 0:
+            start = idx * self._window_stride
+            x = self.data[0, start : start + self._window_len]  # (window_len, C)
             return x, torch.tensor(-1)
         x = self.data[idx]
         y = self.labels[idx] if self.labels is not None else torch.tensor(-1)
