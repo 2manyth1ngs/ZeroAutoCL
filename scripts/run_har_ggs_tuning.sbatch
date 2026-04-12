@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-$HOME/ZeroAutoCL}"
+PROJECT_ROOT="${PROJECT_ROOT:-$HOME/ZeroAutoCL1/ZeroAutoCL}"
 cd "$PROJECT_ROOT"
 
 SEED=42
