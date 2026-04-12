@@ -33,7 +33,8 @@
 #
 # Hyperparameters live in configs/default.yaml::two_stage_search.
 # Defaults (verified on a 4090 24 GB by the §10 protocol A/B test):
-#   crop_len      = 3000   (data/dataset.py::_FORECAST_WINDOW_LEN)
+#   crop_len      = 1024   (seed gen, configs/default.yaml::seed_generation.crop_len)
+#                   3000   (Phase 4 retrain, data/dataset.py::_FORECAST_WINDOW_LEN)
 #   batch_size    = 32     (seed_generation.batch_size)
 #   pretrain_iters= 600    (dataset_budgets.* and finalists.pretrain_iters)
 #   K_enc         = 3      (two_stage_search.encoder_grid.top_k_enc)

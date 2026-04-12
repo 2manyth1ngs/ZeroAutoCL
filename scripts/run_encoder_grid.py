@@ -62,6 +62,9 @@ def main() -> None:
 
     pretrain_lr = float(sg_cfg.get("pretrain_lr", 1e-3))
     batch_size  = int(sg_cfg.get("batch_size",   32))
+    crop_len    = sg_cfg.get("crop_len")
+    if crop_len is not None:
+        crop_len = int(crop_len)
 
     # Per-dataset budgets exactly as resolved by run_generate_seeds.py.
     dataset_budgets: Dict[str, Dict[str, int]] = {
@@ -71,7 +74,7 @@ def main() -> None:
     device = torch.device(args.device) if args.device else None
 
     logger.info("[stage-A] sources=%s", sources)
-    logger.info("[stage-A] lr=%.4f  batch=%d", pretrain_lr, batch_size)
+    logger.info("[stage-A] lr=%.4f  batch=%d  crop_len=%s", pretrain_lr, batch_size, crop_len)
     logger.info("[stage-A] budgets=%s", dataset_budgets)
 
     encoder_grid_search(
@@ -83,6 +86,7 @@ def main() -> None:
         save_dir=args.save_dir,
         device=device,
         seed=args.seed,
+        crop_len=crop_len,
     )
 
 

@@ -208,6 +208,7 @@ def generate_seeds(
     seed: int = 42,
     dataset_budgets: Optional[Dict[str, Dict[str, int]]] = None,
     fixed_encoders: Optional[List[Dict[str, int]]] = None,
+    crop_len: Optional[int] = None,
 ) -> List[SeedRecord]:
     """Generate seed data across source datasets.
 
@@ -227,6 +228,10 @@ def generate_seeds(
             sampled via :func:`batch_sample_strategies` rather than the full
             joint sampler — every seed record's ``encoder_config`` field will
             be drawn from this list.
+        crop_len: Optional sliding-window crop length override for
+            forecasting training splits.  When given, passed as
+            ``window_len_override`` to :func:`load_dataset` so that
+            seed generation uses a shorter crop than Phase 4.
 
     Returns:
         List of all :class:`SeedRecord` objects.
@@ -250,7 +255,7 @@ def generate_seeds(
             "[dataset %d/%d] Generating seeds for: %s",
             ds_idx + 1, n_datasets, ds_name,
         )
-        splits = load_dataset(ds_name, data_dir)
+        splits = load_dataset(ds_name, data_dir, window_len_override=crop_len)
         train_ds = splits["train"]
         val_ds   = splits.get("val") or splits["test"]
         task_type = train_ds.task_type

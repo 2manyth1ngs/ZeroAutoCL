@@ -49,6 +49,7 @@ def encoder_grid_search(
     save_dir: Optional[str] = None,
     device: Optional[torch.device] = None,
     seed: int = 42,
+    crop_len: Optional[int] = None,
 ) -> List[Dict]:
     """Run Stage A: every encoder × every source dataset under ``GGS_STRATEGY``.
 
@@ -62,6 +63,8 @@ def encoder_grid_search(
         save_dir: If given, persist results to ``{save_dir}/encoder_grid.json``.
         device: Torch device. ``None`` → auto-detect.
         seed: Global random seed.
+        crop_len: Optional sliding-window crop length override for
+            forecasting training splits (passed to :func:`load_dataset`).
 
     Returns:
         List of records sorted by ``mean_perf`` desc::
@@ -91,7 +94,7 @@ def encoder_grid_search(
         logger.info(
             "[stage-A] dataset %d/%d: %s", ds_idx + 1, n_ds, ds_name,
         )
-        splits = load_dataset(ds_name, data_dir)
+        splits = load_dataset(ds_name, data_dir, window_len_override=crop_len)
         train_ds = splits["train"]
         val_ds   = splits.get("val") or splits["test"]
         task_type = train_ds.task_type

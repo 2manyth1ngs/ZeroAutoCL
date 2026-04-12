@@ -96,6 +96,9 @@ def main() -> None:
     pretrain_epochs = sg_cfg.get("pretrain_epochs", 40)
     pretrain_lr     = sg_cfg.get("pretrain_lr",     1e-3)
     batch_size      = sg_cfg.get("batch_size",      args.batch_size)
+    crop_len        = sg_cfg.get("crop_len")
+    if crop_len is not None:
+        crop_len = int(crop_len)
 
     # ── Per-dataset budget resolution ─────────────────────────────────────
     # Priority for each source dataset:
@@ -129,6 +132,8 @@ def main() -> None:
     )
     logger.info("Per-dataset budgets: %s", dataset_budgets)
 
+    logger.info("crop_len=%s", crop_len)
+
     seeds = generate_seeds(
         source_datasets=args.datasets,
         data_dir=args.data_dir,
@@ -141,6 +146,7 @@ def main() -> None:
         seed=args.seed,
         dataset_budgets=dataset_budgets,
         fixed_encoders=fixed_encoders,
+        crop_len=crop_len,
     )
 
     logger.info("Done — generated %d seed records.", len(seeds))

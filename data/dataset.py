@@ -2,9 +2,9 @@
 
 Supported datasets
 ------------------
-Classification   : HAR, Epilepsy
+Classification   : HAR, Epilepsy, SleepEEG, Gesture, NATOPS
 Anomaly detection: Yahoo, KPI
-Forecasting      : ETTh1, ETTh2, ETTm1
+Forecasting      : ETTh1, ETTh2, ETTm1, PEMS series, exchange rate, electricity
 
 All returned data arrays have shape (N, T, C) where:
   N — number of samples / time-series instances
@@ -192,60 +192,103 @@ class TimeSeriesDataset(Dataset):
 # Loaders per dataset
 # ---------------------------------------------------------------------------
 
-def _load_har(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load HAR dataset (WISDM / UCI format).
+def _load_pt_classification(
+    data_dir: str,
+    name: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load a classification dataset stored as ``{name}/{{train,val,test}}.pt``.
 
-    Expects ``{data_dir}/HAR/train_x.npy``, ``train_y.npy``,
-    ``test_x.npy``, ``test_y.npy``.
+    Each ``.pt`` file is a dict with keys ``'samples'`` (N, C, T) and
+    ``'labels'`` (N,).  This is the format produced by the TS-TCC / TS2Vec
+    preprocessing scripts.
+
+    Returns:
+        train_x, train_y, val_x, val_y, test_x, test_y — arrays with
+        x in **(N, T, C)** layout (transposed from the on-disk (N, C, T)).
+    """
+    base = os.path.join(data_dir, name)
+    splits_out: List[Tuple[np.ndarray, np.ndarray]] = []
+    for split in ("train", "val", "test"):
+        d = torch.load(os.path.join(base, f"{split}.pt"), weights_only=False)
+        x = d["samples"].numpy().astype(np.float32)  # (N, C, T)
+        y = d["labels"].numpy().astype(np.int64)
+        # Transpose to (N, T, C) — the project-wide convention.
+        x = np.transpose(x, (0, 2, 1))
+        splits_out.append((x, y))
+
+    (train_x, train_y), (val_x, val_y), (test_x, test_y) = splits_out
+
+    # z-score normalise per-channel using training statistics.
+    N_tr, T, C = train_x.shape
+    scaler = StandardScaler()
+    train_x = scaler.fit_transform(train_x.reshape(-1, C)).reshape(N_tr, T, C)
+    val_x = scaler.transform(val_x.reshape(-1, C)).reshape(val_x.shape[0], T, C)
+    test_x = scaler.transform(test_x.reshape(-1, C)).reshape(test_x.shape[0], T, C)
+
+    # Remap labels to contiguous 0-based integers.
+    unique_labels = np.sort(np.unique(np.concatenate([train_y, val_y, test_y])))
+    label_map = {int(old): new for new, old in enumerate(unique_labels)}
+    train_y = np.array([label_map[int(v)] for v in train_y], dtype=np.int64)
+    val_y = np.array([label_map[int(v)] for v in val_y], dtype=np.int64)
+    test_y = np.array([label_map[int(v)] for v in test_y], dtype=np.int64)
+
+    return train_x, train_y, val_x, val_y, test_x, test_y
+
+
+def _load_natops(
+    data_dir: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load NATOPS dataset from UEA ``.ts`` archive format.
 
     Returns:
         train_x (N_tr, T, C), train_y (N_tr,), test_x (N_te, T, C), test_y (N_te,)
     """
-    base = os.path.join(data_dir, "HAR")
-    train_x = np.load(os.path.join(base, "train_x.npy")).astype(np.float32)
-    train_y = np.load(os.path.join(base, "train_y.npy")).astype(np.int64)
-    test_x = np.load(os.path.join(base, "test_x.npy")).astype(np.float32)
-    test_y = np.load(os.path.join(base, "test_y.npy")).astype(np.int64)
 
-    # Ensure shape (N, T, C)
-    if train_x.ndim == 2:
-        train_x = train_x[:, :, np.newaxis]
-        test_x = test_x[:, :, np.newaxis]
+    def _parse_ts_file(path: str) -> Tuple[np.ndarray, np.ndarray]:
+        samples: List[np.ndarray] = []
+        labels: List[int] = []
+        in_data = False
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower() == "@data":
+                    in_data = True
+                    continue
+                if line.startswith("@"):
+                    continue
+                if not in_data:
+                    continue
+                # Each line: ch1_vals:ch2_vals:...:chN_vals:label
+                parts = line.split(":")
+                label = float(parts[-1])
+                channels = []
+                for ch_str in parts[:-1]:
+                    channels.append(
+                        [float(v) for v in ch_str.split(",") if v.strip()]
+                    )
+                # channels list of C arrays → (C, T), transpose → (T, C)
+                samples.append(np.array(channels, dtype=np.float32).T)
+                labels.append(int(label))
+        return np.stack(samples), np.array(labels, dtype=np.int64)
 
-    # Normalise per-channel using training statistics.
-    N, T, C = train_x.shape
+    base = os.path.join(data_dir, "NATOPS")
+    train_x, train_y = _parse_ts_file(os.path.join(base, "NATOPS_TRAIN.ts"))
+    test_x, test_y = _parse_ts_file(os.path.join(base, "NATOPS_TEST.ts"))
+
+    # z-score normalise per-channel using training statistics.
+    N_tr, T, C = train_x.shape
     scaler = StandardScaler()
-    train_x = scaler.fit_transform(train_x.reshape(-1, C)).reshape(N, T, C)
+    train_x = scaler.fit_transform(train_x.reshape(-1, C)).reshape(N_tr, T, C)
     N_te = test_x.shape[0]
     test_x = scaler.transform(test_x.reshape(-1, C)).reshape(N_te, T, C)
 
-    return train_x, train_y, test_x, test_y
-
-
-def _load_epilepsy(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load Epilepsy dataset.
-
-    Expects ``{data_dir}/Epilepsy/train_x.npy``, ``train_y.npy``,
-    ``test_x.npy``, ``test_y.npy``.
-
-    Returns:
-        train_x (N_tr, T, C), train_y (N_tr,), test_x (N_te, T, C), test_y (N_te,)
-    """
-    base = os.path.join(data_dir, "Epilepsy")
-    train_x = np.load(os.path.join(base, "train_x.npy")).astype(np.float32)
-    train_y = np.load(os.path.join(base, "train_y.npy")).astype(np.int64)
-    test_x = np.load(os.path.join(base, "test_x.npy")).astype(np.float32)
-    test_y = np.load(os.path.join(base, "test_y.npy")).astype(np.int64)
-
-    if train_x.ndim == 2:
-        train_x = train_x[:, :, np.newaxis]
-        test_x = test_x[:, :, np.newaxis]
-
-    N, T, C = train_x.shape
-    scaler = StandardScaler()
-    train_x = scaler.fit_transform(train_x.reshape(-1, C)).reshape(N, T, C)
-    N_te = test_x.shape[0]
-    test_x = scaler.transform(test_x.reshape(-1, C)).reshape(N_te, T, C)
+    # Remap labels to 0-based.
+    unique_labels = np.sort(np.unique(np.concatenate([train_y, test_y])))
+    label_map = {int(old): new for new, old in enumerate(unique_labels)}
+    train_y = np.array([label_map[int(v)] for v in train_y], dtype=np.int64)
+    test_y = np.array([label_map[int(v)] for v in test_y], dtype=np.int64)
 
     return train_x, train_y, test_x, test_y
 
@@ -529,6 +572,9 @@ def _load_anomaly(
 _SUPPORTED_DATASETS: Dict[str, str] = {
     "HAR": "classification",
     "Epilepsy": "classification",
+    "SleepEEG": "classification",
+    "Gesture": "classification",
+    "NATOPS": "classification",
     "Yahoo": "anomaly_detection",
     "KPI": "anomaly_detection",
     "ETTh1": "forecasting",
@@ -548,6 +594,7 @@ def load_dataset(
     name: str,
     data_dir: str,
     max_len: int = 2000,
+    window_len_override: Optional[int] = None,
 ) -> Dict[str, TimeSeriesDataset]:
     """Load a named dataset and return train/val/test splits.
 
@@ -556,6 +603,11 @@ def load_dataset(
             ``_SUPPORTED_DATASETS``.
         data_dir: Root directory that contains per-dataset subdirectories.
         max_len: Maximum sequence length (longer sequences are truncated).
+        window_len_override: If given, use this instead of
+            ``_FORECAST_WINDOW_LEN`` for the sliding-window length of
+            forecasting training splits.  Useful for seed generation where
+            a shorter crop (e.g. 1024) speeds up training ~3× without
+            affecting the relative ranking of CL strategies.
 
     Returns:
         Dict with keys 'train', 'val' (if available), 'test', each mapping to
@@ -572,6 +624,9 @@ def load_dataset(
 
     task_type = _SUPPORTED_DATASETS[name]
 
+    # Resolve the sliding-window length for forecasting training splits.
+    forecast_wl = window_len_override if window_len_override is not None else _FORECAST_WINDOW_LEN
+
     # Forecasting tasks benefit from using the full series; only truncate
     # classification / anomaly-detection samples.
     if task_type == "forecasting":
@@ -581,16 +636,18 @@ def load_dataset(
 
     splits: Dict[str, TimeSeriesDataset] = {}
 
-    if name == "HAR":
-        train_x, train_y, test_x, test_y = _load_har(data_dir)
-        # Use 10 % of training set as validation.
-        n_val = max(1, int(0.1 * len(train_x)))
-        splits["train"] = TimeSeriesDataset(train_x[:-n_val], train_y[:-n_val], task_type, max_len)
-        splits["val"] = TimeSeriesDataset(train_x[-n_val:], train_y[-n_val:], task_type, max_len)
+    # ── Classification datasets with pre-split .pt files ────────────────
+    if name in ("HAR", "Epilepsy", "SleepEEG", "Gesture"):
+        train_x, train_y, val_x, val_y, test_x, test_y = (
+            _load_pt_classification(data_dir, name)
+        )
+        splits["train"] = TimeSeriesDataset(train_x, train_y, task_type, max_len)
+        splits["val"] = TimeSeriesDataset(val_x, val_y, task_type, max_len)
         splits["test"] = TimeSeriesDataset(test_x, test_y, task_type, max_len)
 
-    elif name == "Epilepsy":
-        train_x, train_y, test_x, test_y = _load_epilepsy(data_dir)
+    elif name == "NATOPS":
+        train_x, train_y, test_x, test_y = _load_natops(data_dir)
+        # No pre-existing val split; carve 10% from train.
         n_val = max(1, int(0.1 * len(train_x)))
         splits["train"] = TimeSeriesDataset(train_x[:-n_val], train_y[:-n_val], task_type, max_len)
         splits["val"] = TimeSeriesDataset(train_x[-n_val:], train_y[-n_val:], task_type, max_len)
@@ -607,7 +664,7 @@ def load_dataset(
         train_data, val_data, test_data = _load_ett(data_dir, name)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
-            window_len=_FORECAST_WINDOW_LEN, window_stride=1,
+            window_len=forecast_wl, window_stride=1,
         )
         splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
         splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
@@ -616,7 +673,7 @@ def load_dataset(
         train_data, val_data, test_data = _load_pems(data_dir, name)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
-            window_len=_FORECAST_WINDOW_LEN, window_stride=1,
+            window_len=forecast_wl, window_stride=1,
         )
         splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
         splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
@@ -625,7 +682,7 @@ def load_dataset(
         train_data, val_data, test_data = _load_pems_bay(data_dir)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
-            window_len=_FORECAST_WINDOW_LEN, window_stride=1,
+            window_len=forecast_wl, window_stride=1,
         )
         splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
         splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
@@ -634,7 +691,7 @@ def load_dataset(
         train_data, val_data, test_data = _load_exchange_rate(data_dir)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
-            window_len=_FORECAST_WINDOW_LEN, window_stride=1,
+            window_len=forecast_wl, window_stride=1,
         )
         splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
         splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
@@ -643,7 +700,7 @@ def load_dataset(
         train_data, val_data, test_data = _load_electricity(data_dir)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
-            window_len=_FORECAST_WINDOW_LEN, window_stride=1,
+            window_len=forecast_wl, window_stride=1,
         )
         splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
         splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
