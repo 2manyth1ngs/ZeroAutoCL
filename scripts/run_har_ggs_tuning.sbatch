@@ -9,7 +9,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=02:00:00
+#SBATCH --time=10:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/har_ggs_tune_%j.out
 #SBATCH --error=logs/har_ggs_tune_%j.err

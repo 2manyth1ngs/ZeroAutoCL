@@ -25,7 +25,7 @@ DEFAULT_ENC = {"n_layers": 10, "hidden_dim": 64, "output_dim": 320}
 
 # ── Configurations to test ───────────────────────────────────────────────
 CONFIGS = {
-    # baseline (上次跑的)
+'''    # baseline (上次跑的)
     "A_baseline": {
         "pretrain_epochs": 40, "pretrain_lr": 1e-3,
         "batch_size": 64, "eval_every": 10, "val_best": True,
@@ -34,10 +34,10 @@ CONFIGS = {
     "B_longer": {
         "pretrain_epochs": 200, "pretrain_lr": 1e-3,
         "batch_size": 64, "eval_every": 10, "val_best": True,
-    },
+    },'''
     # 不用 val_best，直接用 last checkpoint（避免 val/test 分布偏差）
     "C_no_valbest": {
-        "pretrain_epochs": 200, "pretrain_lr": 1e-3,
+        "pretrain_epochs": 50, "pretrain_lr": 1e-3,
         "batch_size": 64, "eval_every": 0, "val_best": False,
     },
     # 小 batch + 低 lr + 长训练
