@@ -77,7 +77,9 @@ class EmbeddingTransform(nn.Module):
                         dtype=h.dtype,
                     )
                 )
-                h = h * mask
+                # Inverted dropout: scale by 1/keep_prob so that the expected
+                # value of each feature is preserved between train and eval.
+                h = h * mask / keep_prob
 
         # ── Normalisation (always active) ───────────────────────────────────
         if self.norm_type == "layer_norm":

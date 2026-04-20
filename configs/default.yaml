@@ -51,12 +51,17 @@ dataset_budgets:
   PEMS08:       { pretrain_iters: 600 }
   PEMS-BAY:     { pretrain_iters: 600 }
   ExchangeRate: { pretrain_iters: 600 }
-  # ── Classification (epoch-based) ───────────────────────────────────────────
-  HAR:          { pretrain_epochs: 40 }
-  Epilepsy:     { pretrain_epochs: 40 }
-  SleepEEG:     { pretrain_epochs: 40 }
-  Gesture:      { pretrain_epochs: 40 }
-  NATOPS:       { pretrain_epochs: 40 }
+  # ── Classification (iter-based for Stage A / B, epoch-based only in Phase 4) ─
+  # SleepEEG has ~23k train samples vs Epilepsy's ~250; epoch-based budgets
+  # cause 90× iteration disparity (Bug #006).  Iter-based budgets normalise
+  # wall-clock cost across datasets.  Phase 4 (run_phase4_finalists_cls.py)
+  # reads only pretrain_epochs and ignores pretrain_iters, so it still uses
+  # epoch-based training with val-best checkpointing as intended.
+  HAR:          { pretrain_iters: 600, pretrain_epochs: 40 }
+  Epilepsy:     { pretrain_iters: 600, pretrain_epochs: 40 }
+  SleepEEG:     { pretrain_iters: 600, pretrain_epochs: 40 }
+  Gesture:      { pretrain_iters: 600, pretrain_epochs: 40 }
+  NATOPS:       { pretrain_iters: 600, pretrain_epochs: 40 }
   # ── Anomaly detection (epoch-based) ──────────────────────────────────────
   Yahoo:        { pretrain_epochs: 40 }
   KPI:          { pretrain_epochs: 40 }

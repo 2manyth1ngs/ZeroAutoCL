@@ -1,13 +1,25 @@
 """Contrastive pair construction and loss computation.
 
-Three contrast types are supported (following AutoCLS):
+Three contrast types are supported (following AutoCLS, which itself follows
+TS2Vec for the multi-scale mechanism):
 
-  Instance   — same sample, different views; in-batch negatives (always on)
-  Temporal   — same time step across views; within-sample time negatives
-  Cross-scale— fine-resolution embeddings vs. their pooled coarse versions
+  Instance    — same-time-step, cross-batch contrast (always on). At each
+                time step t the anchor z1[i,t] is pulled towards z2[i,t] and
+                pushed away from every other sample in both views
+                (2B-2 negatives — TS2Vec formulation).
+  Temporal    — same-sample, cross-time contrast. For each time step t the
+                anchor z1[b,t] is pulled towards z2[b,t] and pushed away
+                from every other time step in both views of the same sample
+                (2T-2 negatives — TS2Vec formulation).
+  Cross-scale — fine-resolution embeddings vs. their pooled coarse versions.
 
-``ContrastivePairConstructor`` orchestrates all active contrast types given
-the strategy config and returns a per-type loss dict.
+Following AutoCLS §2.2 ("We follow [TS2Vec] and apply hierarchical pooling
+over h1, h2 ... The above instance contrast and temporal contrast are
+applied for all the scales"), when ``kernel_size > 0`` the instance and
+temporal losses are additionally computed at every hierarchical scale
+produced by recursive pooling with the given ``kernel_size`` / ``pool_op``,
+and averaged across scales.  ``kernel_size = 0`` disables the hierarchical
+loop (single-scale instance/temporal only).
 """
 
 from __future__ import annotations
@@ -48,10 +60,9 @@ def hierarchical_pooling(
         return [h]
 
     scales: List[Tensor] = [h]
-    current = h  # (B, T, D)
+    current = h
 
     while current.shape[1] >= kernel_size:
-        # F.avg_pool1d / max_pool1d expect (B, C, T)
         x_t = current.permute(0, 2, 1)  # (B, D, T)
         if pool_op == "avg":
             pooled_t = F.avg_pool1d(x_t, kernel_size=kernel_size, stride=kernel_size)
@@ -63,7 +74,6 @@ def hierarchical_pooling(
             break
         scales.append(current)
 
-        # Stop early if we only have 1 time step left — no meaningful pooling.
         if current.shape[1] < kernel_size:
             break
 
@@ -71,87 +81,186 @@ def hierarchical_pooling(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Similarity helpers
 # ---------------------------------------------------------------------------
 
-def _batch_sim_matrix(
-    a: Tensor,
-    b: Tensor,
-    sim_func: str,
-    temperature: float,
-) -> Tensor:
-    """Compute pairwise similarity matrix between all (i,j) pairs.
+def _pairwise_sim(x: Tensor, y: Tensor, sim_func: str) -> Tensor:
+    """Pairwise similarity between every row of *x* and every row of *y*.
 
     Args:
-        a: Shape (B, M, D).
-        b: Shape (B, N, D).
+        x: Shape (..., N, D).
+        y: Shape (..., M, D). Leading dims must match.
         sim_func: ``'dot'``, ``'cosine'``, or ``'euclidean'``.
-        temperature: Divides the raw similarity scores.
 
     Returns:
-        Shape (B, M, N).
+        Tensor of shape (..., N, M). Higher = more similar for all funcs
+        (euclidean returns negative L2 distance).
     """
     if sim_func == "dot":
-        sim = torch.bmm(a, b.transpose(1, 2))
-    elif sim_func == "cosine":
-        a_n = F.normalize(a, dim=-1)
-        b_n = F.normalize(b, dim=-1)
-        sim = torch.bmm(a_n, b_n.transpose(1, 2))
-    elif sim_func == "euclidean":
-        # -||a_i - b_j||_2 via expanded squared distance
-        a2 = (a ** 2).sum(-1, keepdim=True)          # (B, M, 1)
-        b2 = (b ** 2).sum(-1).unsqueeze(1)            # (B, 1, N)
-        ab = torch.bmm(a, b.transpose(1, 2))          # (B, M, N)
-        dist = torch.sqrt((a2 + b2 - 2.0 * ab).clamp(min=0.0))
-        sim = -dist
-    else:
-        raise ValueError(f"Unknown sim_func: {sim_func!r}")
-
-    return sim / temperature
+        return torch.matmul(x, y.transpose(-1, -2))
+    if sim_func == "cosine":
+        xn = F.normalize(x, dim=-1)
+        yn = F.normalize(y, dim=-1)
+        return torch.matmul(xn, yn.transpose(-1, -2))
+    if sim_func == "euclidean":
+        x2 = (x ** 2).sum(-1, keepdim=True)
+        y2 = (y ** 2).sum(-1, keepdim=True).transpose(-1, -2)
+        xy = torch.matmul(x, y.transpose(-1, -2))
+        # +1e-12 keeps sqrt's argument strictly positive so autograd
+        # does not produce NaN gradients on the (zero-valued) diagonal
+        # when x is y (per-timestep instance contrast).
+        dist = (x2 + y2 - 2.0 * xy).clamp(min=0.0).add(1e-12).sqrt()
+        return -dist
+    raise ValueError(f"Unknown sim_func: {sim_func!r}")
 
 
 def _adj_positive_mask(T: int, device: torch.device) -> Tensor:
-    """Build a (T, T) boolean mask for adjacent positive pairs.
-
-    Positions t and t' are positive when |t - t'| <= 1.
-
-    Args:
-        T: Sequence length.
-        device: Target device.
-
-    Returns:
-        Boolean tensor of shape (T, T).
-    """
+    """(T, T) bool mask with True where |t - t'| <= 1."""
     idx = torch.arange(T, device=device)
-    dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()  # (T, T)
+    dist = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
     return dist <= 1
 
 
-def _multi_pos_nce(sim: Tensor, pos_mask: Tensor) -> Tensor:
-    """Supervised / multi-positive InfoNCE loss.
+# ---------------------------------------------------------------------------
+# TS2Vec-style InfoNCE primitives
+# ---------------------------------------------------------------------------
 
-    For each row (anchor), all positions where ``pos_mask`` is True are
-    treated as positives using the ``log(sum_pos / sum_all)`` formulation.
+def _ts2vec_instance_infonce(
+    z1: Tensor,
+    z2: Tensor,
+    sim_func: str,
+    temperature: float,
+) -> Tensor:
+    """Per-timestep instance contrast with 2B-2 in-batch negatives.
+
+    Follows TS2Vec's ``instance_contrastive_loss`` but parameterised by
+    similarity function and temperature as in AutoCLS Table 1.
 
     Args:
-        sim: Logits of shape (B, T, T) (already divided by temperature).
-        pos_mask: Boolean mask of shape (T, T) or (B, T, T).
+        z1: Shape (B, T, D).
+        z2: Shape (B, T, D).
+        sim_func: ``'dot'`` | ``'cosine'`` | ``'euclidean'``.
+        temperature: τ > 0.
 
     Returns:
-        Scalar loss.
+        Scalar loss. Returns 0 when B < 2.
     """
+    B, T, _ = z1.shape
+    if B < 2:
+        return z1.new_zeros(())
+
+    # (T, 2B, D): stack both views along batch, swap batch↔time.
+    z = torch.cat([z1, z2], dim=0).transpose(0, 1)
+    sim = _pairwise_sim(z, z, sim_func) / temperature  # (T, 2B, 2B)
+
+    # Drop the diagonal (self-similarity) via tril/triu trick → (T, 2B, 2B-1).
+    logits = torch.tril(sim, diagonal=-1)[:, :, :-1]
+    logits = logits + torch.triu(sim, diagonal=1)[:, :, 1:]
+    logits = logits.clamp(-100.0, 100.0)
+    neg_log_p = -F.log_softmax(logits, dim=-1)
+
+    i = torch.arange(B, device=z1.device)
+    # Row i (view-1 anchor, sample i): positive = row index B+i in original,
+    # column index after diagonal removal = B+i-1.
+    # Row B+i (view-2 anchor, sample i): positive col = i.
+    loss = (neg_log_p[:, i, B + i - 1].mean() + neg_log_p[:, B + i, i].mean()) / 2
+    return loss
+
+
+def _ts2vec_temporal_infonce(
+    z1: Tensor,
+    z2: Tensor,
+    sim_func: str,
+    temperature: float,
+) -> Tensor:
+    """Per-sample temporal contrast with 2T-2 within-sample negatives.
+
+    Follows TS2Vec's ``temporal_contrastive_loss``. Same-view time steps
+    other than the anchor act as negatives (in addition to cross-view
+    non-matching time steps).
+
+    Args:
+        z1: Shape (B, T, D).
+        z2: Shape (B, T, D).
+        sim_func: ``'dot'`` | ``'cosine'`` | ``'euclidean'``.
+        temperature: τ > 0.
+
+    Returns:
+        Scalar loss. Returns 0 when T < 2.
+    """
+    B, T, _ = z1.shape
+    if T < 2:
+        return z1.new_zeros(())
+
+    z = torch.cat([z1, z2], dim=1)  # (B, 2T, D)
+    sim = _pairwise_sim(z, z, sim_func) / temperature  # (B, 2T, 2T)
+
+    logits = torch.tril(sim, diagonal=-1)[:, :, :-1]
+    logits = logits + torch.triu(sim, diagonal=1)[:, :, 1:]
+    logits = logits.clamp(-100.0, 100.0)
+    neg_log_p = -F.log_softmax(logits, dim=-1)
+
+    t = torch.arange(T, device=z1.device)
+    loss = (neg_log_p[:, t, T + t - 1].mean() + neg_log_p[:, T + t, t].mean()) / 2
+    return loss
+
+
+def _ts2vec_temporal_infonce_adj(
+    z1: Tensor,
+    z2: Tensor,
+    sim_func: str,
+    temperature: float,
+) -> Tensor:
+    """Temporal contrast with adjacent-neighbour multi-positive (AutoCLS).
+
+    In the 2T structure, positives for an anchor at time t are the same
+    time step in the other view *and* ``t ± 1`` in the same view (when
+    they exist). Negatives are all remaining 2T-1 positions. Uses the
+    multi-positive log-sum formulation.
+
+    Args:
+        z1: Shape (B, T, D).
+        z2: Shape (B, T, D).
+        sim_func: ``'dot'`` | ``'cosine'`` | ``'euclidean'``.
+        temperature: τ > 0.
+
+    Returns:
+        Scalar loss. Returns 0 when T < 2.
+    """
+    B, T, _ = z1.shape
+    if T < 2:
+        return z1.new_zeros(())
+
+    device = z1.device
+    z = torch.cat([z1, z2], dim=1)  # (B, 2T, D)
+    sim = _pairwise_sim(z, z, sim_func) / temperature  # (B, 2T, 2T)
+
+    # Mask self on the diagonal so it is excluded from both positive and
+    # negative sets via logsumexp.
+    diag_idx = torch.arange(2 * T, device=device)
+    sim = sim.clone()
+    sim[:, diag_idx, diag_idx] = -1e9
     sim = sim.clamp(-100.0, 100.0)
 
-    if pos_mask.dim() == 2:
-        pos_mask = pos_mask.unsqueeze(0)  # (1, T, T)
+    # Build (2T, 2T) positive mask.
+    t = torch.arange(T, device=device)
+    pos_mask = torch.zeros(2 * T, 2 * T, dtype=torch.bool, device=device)
+    # Cross-view same-t positives (both directions).
+    pos_mask[t, T + t] = True
+    pos_mask[T + t, t] = True
+    # Same-view adjacent positives in view 1.
+    if T >= 2:
+        pos_mask[t[:-1], t[:-1] + 1] = True
+        pos_mask[t[1:], t[1:] - 1] = True
+        # Same-view adjacent positives in view 2.
+        pos_mask[T + t[:-1], T + t[:-1] + 1] = True
+        pos_mask[T + t[1:], T + t[1:] - 1] = True
 
-    log_sum_all = torch.logsumexp(sim, dim=-1)              # (B, T)
-    # Sum of exp over positives
-    pos_sim = sim.masked_fill(~pos_mask, -1e9)
-    log_sum_pos = torch.logsumexp(pos_sim, dim=-1)          # (B, T)
+    log_sum_all = torch.logsumexp(sim, dim=-1)  # (B, 2T)
+    pos_sim = sim.masked_fill(~pos_mask.unsqueeze(0), -1e9)
+    log_sum_pos = torch.logsumexp(pos_sim, dim=-1)  # (B, 2T)
 
-    # Normalise by the number of positives per row to avoid scale issues
-    n_pos = pos_mask.float().sum(dim=-1).clamp(min=1.0)     # (B, T) or (1, T)
+    n_pos = pos_mask.float().sum(dim=-1).clamp(min=1.0).unsqueeze(0)
     loss = -(log_sum_pos - log_sum_all) / n_pos
     return loss.mean()
 
@@ -163,8 +272,8 @@ def _multi_pos_nce(sim: Tensor, pos_mask: Tensor) -> Tensor:
 class ContrastivePairConstructor(nn.Module):
     """Construct contrastive pairs and compute losses from (h1, h2).
 
-    This module holds no trainable parameters; it is an ``nn.Module`` purely
-    for consistent device/state management.
+    Holds no trainable parameters; it is an ``nn.Module`` purely for
+    consistent device/state management.
 
     Args:
         config: Pair-construction sub-dict of the strategy config::
@@ -177,10 +286,8 @@ class ContrastivePairConstructor(nn.Module):
                 'pool_op':     str,         # 'avg' | 'max'
                 'adj_neighbor':bool,
             }
-        max_temporal_len: When the sequence length T exceeds this value,
-            randomly subsample time positions for temporal and cross-scale
-            contrast to avoid OOM from (B, T, T) similarity matrices.
-            Default 200 keeps peak VRAM under ~1 GB for these losses.
+        max_temporal_len: Cap time length for the temporal and cross-scale
+            similarity matrices to keep VRAM bounded.
     """
 
     def __init__(self, config: Dict, max_temporal_len: int = 200) -> None:
@@ -193,7 +300,7 @@ class ContrastivePairConstructor(nn.Module):
         self.max_temporal_len: int = max_temporal_len
 
     # ------------------------------------------------------------------
-    # Instance contrast
+    # Single-scale instance / temporal losses
     # ------------------------------------------------------------------
 
     def instance_loss(
@@ -202,43 +309,33 @@ class ContrastivePairConstructor(nn.Module):
         h2: Tensor,
         loss_fn: Union[InfoNCELoss, TripletLoss],
     ) -> Tensor:
-        """Compute instance-level contrastive loss.
+        """Per-timestep instance contrast at a single scale.
 
-        Time-pool both views and contrast the resulting (B, D) vectors.
-        Positive: (h1[i], h2[i]).  Negatives: h2[j] for j ≠ i.
+        InfoNCE path follows TS2Vec (2B-2 negatives). Triplet path uses a
+        rolled batch as a per-timestep hard negative.
 
         Args:
-            h1: Shape (B, T, D).
-            h2: Shape (B, T, D).
+            h1, h2: Shape (B, T, D).
             loss_fn: Configured loss function.
 
         Returns:
             Scalar loss.
         """
-        B = h1.shape[0]
-        anchor = h1.mean(dim=1)    # (B, D)
-        positive = h2.mean(dim=1)  # (B, D)
+        B, T, D = h1.shape
+        if B < 2:
+            return h1.new_zeros(())
 
         if isinstance(loss_fn, InfoNCELoss):
-            if B < 2:
-                return torch.tensor(0.0, device=h1.device, requires_grad=True)
-            # Build (B, B-1, D) negatives by excluding each sample's own positive
-            D = anchor.shape[-1]
-            pos_exp = positive.unsqueeze(0).expand(B, B, D)              # (B, B, D)
-            mask = ~torch.eye(B, dtype=torch.bool, device=h1.device)     # (B, B)
-            negatives = pos_exp[mask].reshape(B, B - 1, D)               # (B, B-1, D)
-            return loss_fn(anchor, positive, negatives)
+            return _ts2vec_instance_infonce(
+                h1, h2, loss_fn.sim_func, loss_fn.temperature
+            )
 
-        else:  # TripletLoss
-            if B < 2:
-                return torch.tensor(0.0, device=h1.device, requires_grad=True)
-            # Use the next sample in the batch as the hard negative.
-            negative = torch.roll(positive, shifts=1, dims=0)            # (B, D)
-            return loss_fn(anchor, positive, negative)
-
-    # ------------------------------------------------------------------
-    # Temporal contrast
-    # ------------------------------------------------------------------
+        # TripletLoss: per-timestep anchor/pos/neg, neg = next sample in batch.
+        neg = torch.roll(h2, shifts=1, dims=0)
+        anchor = h1.reshape(B * T, D)
+        positive = h2.reshape(B * T, D)
+        negative = neg.reshape(B * T, D)
+        return loss_fn(anchor, positive, negative)
 
     def temporal_loss(
         self,
@@ -246,66 +343,47 @@ class ContrastivePairConstructor(nn.Module):
         h2: Tensor,
         loss_fn: Union[InfoNCELoss, TripletLoss],
     ) -> Tensor:
-        """Compute temporal contrastive loss.
+        """Per-sample temporal contrast at a single scale.
 
-        For each time step t, the positive is the same t in the other view.
-        Negatives are all other time steps within the same sample.
-
-        Uses vectorised batch matrix multiplication for efficiency.
+        InfoNCE path follows TS2Vec (2T-2 negatives, same-view included).
+        ``adj_neighbor=True`` expands the positive set to include ±1
+        neighbours in the same view.
 
         Args:
-            h1: Shape (B, T, D).
-            h2: Shape (B, T, D).
+            h1, h2: Shape (B, T, D).
             loss_fn: Configured loss function.
 
         Returns:
-            Scalar loss, or zero if T < 3.
+            Scalar loss, or zero if T < 2.
         """
         B, T, D = h1.shape
-        if T < 3:
-            return h1.new_zeros(1).squeeze().requires_grad_(False)
+        if T < 2:
+            return h1.new_zeros(())
 
-        # ── Subsample time positions to cap VRAM at O(B·T'·T') ───────
+        # Subsample time to cap O(B·T²) memory.
         if T > self.max_temporal_len:
-            idx = torch.randperm(T, device=h1.device)[:self.max_temporal_len].sort().values
-            h1 = h1[:, idx, :]   # (B, T', D)
+            idx = torch.randperm(T, device=h1.device)[: self.max_temporal_len]
+            idx = idx.sort().values
+            h1 = h1[:, idx, :]
             h2 = h2[:, idx, :]
             T = self.max_temporal_len
 
         if isinstance(loss_fn, InfoNCELoss):
-            sim_func = loss_fn.sim_func
-            temp = loss_fn.temperature
-
-            # ── Similarity matrices (B, T', T') ──────────────────────
-            sim_12 = _batch_sim_matrix(h1, h2, sim_func, temp)  # h1→h2
-            sim_21 = _batch_sim_matrix(h2, h1, sim_func, temp)  # h2→h1
-
             if self.adj_neighbor:
-                pos_mask = _adj_positive_mask(T, h1.device)     # (T, T)
-                loss_12 = _multi_pos_nce(sim_12, pos_mask)
-                loss_21 = _multi_pos_nce(sim_21, pos_mask)
-            else:
-                # Standard: positive = diagonal
-                labels = torch.arange(T, device=h1.device)           # (T,)
-                labels = labels.unsqueeze(0).expand(B, T).reshape(B * T)  # (B*T,)
+                return _ts2vec_temporal_infonce_adj(
+                    h1, h2, loss_fn.sim_func, loss_fn.temperature
+                )
+            return _ts2vec_temporal_infonce(
+                h1, h2, loss_fn.sim_func, loss_fn.temperature
+            )
 
-                logits_12 = sim_12.reshape(B * T, T).clamp(-100.0, 100.0)
-                logits_21 = sim_21.reshape(B * T, T).clamp(-100.0, 100.0)
-
-                loss_12 = F.cross_entropy(logits_12, labels)
-                loss_21 = F.cross_entropy(logits_21, labels)
-
-            return (loss_12 + loss_21) * 0.5
-
-        else:  # TripletLoss
-            # anchor: h1[b, t]; positive: h2[b, t]; negative: h1[b, t shifted]
-            shift = max(1, T // 2)
-            neg = torch.roll(h1, shifts=shift, dims=1)       # (B, T, D)
-
-            anchor   = h1.reshape(B * T, D)
-            positive = h2.reshape(B * T, D)
-            negative = neg.reshape(B * T, D)
-            return loss_fn(anchor, positive, negative)
+        # TripletLoss: anchor=h1[b,t], positive=h2[b,t], negative=h1[b, t shifted].
+        shift = max(1, T // 2)
+        neg = torch.roll(h1, shifts=shift, dims=1)
+        anchor = h1.reshape(B * T, D)
+        positive = h2.reshape(B * T, D)
+        negative = neg.reshape(B * T, D)
+        return loss_fn(anchor, positive, negative)
 
     # ------------------------------------------------------------------
     # Cross-scale contrast
@@ -317,96 +395,75 @@ class ContrastivePairConstructor(nn.Module):
         h2: Tensor,
         loss_fn: Union[InfoNCELoss, TripletLoss],
     ) -> Tensor:
-        """Compute cross-scale contrastive loss via hierarchical pooling.
+        """Cross-scale contrast between fine and pooled coarse embeddings.
 
-        For each consecutive pair of scales (fine h^s, coarse h^(s+1)):
-          - Every fine position t_s is an anchor.
-          - Its positive is the corresponding coarse position t_s // k.
-          - Negatives are all other coarse positions in the same sample.
+        For each consecutive scale pair (fine, coarse), every fine position
+        t is contrasted against all coarse positions in the same sample;
+        the positive is ``t // kernel_size``.
 
         Args:
-            h1: Shape (B, T, D).
-            h2: Shape (B, T, D).
+            h1, h2: Shape (B, T, D).
             loss_fn: Configured loss function.
 
         Returns:
-            Scalar loss, or zero when no valid scale pairs exist.
+            Scalar loss, or zero when no valid scale pair exists.
         """
         if self.kernel_size == 0:
-            return h1.new_zeros(1).squeeze().requires_grad_(False)
+            return h1.new_zeros(())
 
         B, T, D = h1.shape
-
-        # ── Subsample before hierarchical pooling to cap memory ──────
         if T > self.max_temporal_len:
-            idx = torch.randperm(T, device=h1.device)[:self.max_temporal_len].sort().values
+            idx = torch.randperm(T, device=h1.device)[: self.max_temporal_len]
+            idx = idx.sort().values
             h1 = h1[:, idx, :]
             h2 = h2[:, idx, :]
 
         scales1 = hierarchical_pooling(h1, self.kernel_size, self.pool_op)
         scales2 = hierarchical_pooling(h2, self.kernel_size, self.pool_op)
 
-        # Need at least 2 scales for cross-scale contrast.
         if len(scales1) < 2:
-            return h1.new_zeros(1).squeeze().requires_grad_(False)
+            return h1.new_zeros(())
 
-        # Limit to 2 scale levels for short sequences (T < 100) to avoid
-        # degenerate coarse representations.
         max_pairs = 2 if T < 100 else len(scales1) - 1
         n_pairs = min(max_pairs, len(scales1) - 1)
 
-        loss_total = h1.new_zeros(1).squeeze()
+        loss_total = h1.new_zeros(())
         n_valid = 0
 
         for s in range(n_pairs):
-            h_fine1   = scales1[s]       # (B, T_s, D)
-            h_coarse1 = scales1[s + 1]   # (B, T_c, D)  T_c = T_s // k
-            h_fine2   = scales2[s]
-            h_coarse2 = scales2[s + 1]
+            h_fine1, h_coarse1 = scales1[s], scales1[s + 1]
+            h_fine2, h_coarse2 = scales2[s], scales2[s + 1]
 
-            T_fine  = h_fine1.shape[1]
+            T_fine = h_fine1.shape[1]
             T_coarse = h_coarse1.shape[1]
-
             if T_coarse < 2:
-                # Cross-scale contrast is ill-defined with only 1 coarse step.
                 continue
 
-            # Labels: fine position t maps to coarse position t // kernel_size
-            labels_np = torch.arange(T_fine, device=h1.device) // self.kernel_size
-            labels_np = labels_np.clamp(max=T_coarse - 1)  # safety clamp
+            labels = torch.arange(T_fine, device=h1.device) // self.kernel_size
+            labels = labels.clamp(max=T_coarse - 1)
 
             if isinstance(loss_fn, InfoNCELoss):
-                sim_func = loss_fn.sim_func
-                temp = loss_fn.temperature
+                sim_12 = _pairwise_sim(h_fine1, h_coarse2, loss_fn.sim_func) / loss_fn.temperature
+                sim_21 = _pairwise_sim(h_fine2, h_coarse1, loss_fn.sim_func) / loss_fn.temperature
 
-                # sim[b, t_fine, t_coarse] shape: (B, T_fine, T_coarse)
-                sim_12 = _batch_sim_matrix(h_fine1, h_coarse2, sim_func, temp)
-                sim_21 = _batch_sim_matrix(h_fine2, h_coarse1, sim_func, temp)
-
-                lbl = labels_np.unsqueeze(0).expand(B, T_fine).reshape(B * T_fine)
+                lbl = labels.unsqueeze(0).expand(B, T_fine).reshape(B * T_fine)
                 log12 = sim_12.reshape(B * T_fine, T_coarse).clamp(-100.0, 100.0)
                 log21 = sim_21.reshape(B * T_fine, T_coarse).clamp(-100.0, 100.0)
 
                 loss_s = 0.5 * (F.cross_entropy(log12, lbl) + F.cross_entropy(log21, lbl))
-
-            else:  # TripletLoss
-                # For each fine position pick the correct coarse positive and a
-                # shifted coarse negative.
-                pos1 = h_coarse1[:, labels_np, :]   # (B, T_fine, D)
-                pos2 = h_coarse2[:, labels_np, :]
-
-                neg_idx = (labels_np + T_coarse // 2) % T_coarse
-                neg1 = h_coarse1[:, neg_idx, :]     # (B, T_fine, D)
+            else:
+                pos1 = h_coarse1[:, labels, :]
+                pos2 = h_coarse2[:, labels, :]
+                neg_idx = (labels + T_coarse // 2) % T_coarse
+                neg1 = h_coarse1[:, neg_idx, :]
                 neg2 = h_coarse2[:, neg_idx, :]
 
-                anchor1   = h_fine1.reshape(B * T_fine, D)
+                anchor1 = h_fine1.reshape(B * T_fine, D)
                 positive1 = pos2.reshape(B * T_fine, D)
                 negative1 = neg2.reshape(B * T_fine, D)
-
-                anchor2   = h_fine2.reshape(B * T_fine, D)
+                anchor2 = h_fine2.reshape(B * T_fine, D)
                 positive2 = pos1.reshape(B * T_fine, D)
                 negative2 = neg1.reshape(B * T_fine, D)
-
                 loss_s = 0.5 * (
                     loss_fn(anchor1, positive1, negative1)
                     + loss_fn(anchor2, positive2, negative2)
@@ -416,12 +473,11 @@ class ContrastivePairConstructor(nn.Module):
             n_valid += 1
 
         if n_valid == 0:
-            return h1.new_zeros(1).squeeze().requires_grad_(False)
-
+            return h1.new_zeros(())
         return loss_total / n_valid
 
     # ------------------------------------------------------------------
-    # Unified dispatch
+    # Unified dispatch with hierarchical loop
     # ------------------------------------------------------------------
 
     def compute_all_losses(
@@ -432,23 +488,46 @@ class ContrastivePairConstructor(nn.Module):
     ) -> Dict[str, Tensor]:
         """Compute all active contrast losses.
 
-        Instance contrast is always active.
+        Following AutoCLS §2.2 / TS2Vec, when ``kernel_size > 0`` instance
+        and temporal losses are averaged over all hierarchical scales
+        produced by recursive pooling. ``kernel_size = 0`` disables the
+        loop (single-scale only). Cross-scale contrast is additive and
+        independent.
 
         Args:
-            h1: Shape (B, T, D).
-            h2: Shape (B, T, D).
+            h1, h2: Shape (B, T, D).
             loss_fn: Configured loss function.
 
         Returns:
-            Dict mapping contrast type name to scalar loss.
+            Dict mapping contrast type name → scalar loss. Always contains
+            ``'instance'``; optionally ``'temporal'`` / ``'cross_scale'``.
         """
-        losses: Dict[str, Tensor] = {}
+        # ── Build hierarchical scales ────────────────────────────────────
+        if self.kernel_size > 0:
+            scales1 = hierarchical_pooling(h1, self.kernel_size, self.pool_op)
+            scales2 = hierarchical_pooling(h2, self.kernel_size, self.pool_op)
+        else:
+            scales1, scales2 = [h1], [h2]
 
-        losses["instance"] = self.instance_loss(h1, h2, loss_fn)
+        # ── Instance + temporal at every scale, TS2Vec-style averaging ───
+        # Following TS2Vec: sum (alpha*instance + (1-alpha)*temporal) per
+        # scale, then divide by the total number of scales d.  This ensures
+        # temporal loss weight naturally decreases when some scales lack it
+        # (T < 2), rather than being independently averaged.
+        alpha = 0.5 if self.temporal else 1.0
+        n_scales = len(scales1)
+        hierarchical_loss = h1.new_zeros(())
 
-        if self.temporal:
-            losses["temporal"] = self.temporal_loss(h1, h2, loss_fn)
+        for s1, s2 in zip(scales1, scales2):
+            hierarchical_loss = hierarchical_loss + alpha * self.instance_loss(s1, s2, loss_fn)
+            if self.temporal and s1.shape[1] >= 2:
+                hierarchical_loss = hierarchical_loss + (1 - alpha) * self.temporal_loss(s1, s2, loss_fn)
 
+        hierarchical_loss = hierarchical_loss / n_scales
+
+        losses: Dict[str, Tensor] = {"hierarchical": hierarchical_loss}
+
+        # ── Cross-scale contrast (independent, not part of the loop) ────
         if self.cross_scale:
             losses["cross_scale"] = self.cross_scale_loss(h1, h2, loss_fn)
 

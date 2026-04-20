@@ -1,13 +1,21 @@
 """Parameterised Dilated CNN Encoder for ZeroAutoCL.
 
-Architecture (TS2Vec / AutoCLS style)
---------------------------------------
-input_proj   : Conv1d(input_dim  → hidden_dim, kernel=1)
-layers[0..n) : DilatedConvBlock with dilation = 2^i, i = 0 … n_layers-1
-output_proj  : Conv1d(hidden_dim → output_dim, kernel=1)
+Architecture aligned with the TS2Vec reference implementation
+(``reference/ts2vec/models/dilated_conv.py`` + ``models/encoder.py``),
+with the three coarse-grained hyperparameters (n_layers, hidden_dim,
+output_dim) remaining searchable.
 
-Each DilatedConvBlock uses ``SamePadConv`` so the sequence length T is
-preserved throughout.  A residual connection is added around the block.
+TS2Vec architecture
+-------------------
+input_fc          : Linear(input_dim → hidden_dim)
+blocks[0..n]      : ConvBlock with dilation = 2^i, i = 0 … n_layers
+                     — blocks 0..n_layers-1 : hidden_dim → hidden_dim
+                     — block  n_layers      : hidden_dim → output_dim (final)
+repr_dropout      : Dropout(0.1) applied once after the entire conv stack
+
+Each ConvBlock contains **two** ``SamePadConv`` layers with GELU
+pre-activation and a residual skip.  When in_channels ≠ out_channels
+(or ``final=True``), a 1×1 projector is added on the residual path.
 
 Input  shape: (B, T, C)   — batch, time, channels
 Output shape: (B, T, output_dim)
@@ -22,7 +30,7 @@ from .encoder_config import EncoderConfig
 
 
 # ---------------------------------------------------------------------------
-# Building blocks
+# Building blocks  (mirrors reference/ts2vec/models/dilated_conv.py)
 # ---------------------------------------------------------------------------
 
 class SamePadConv1d(nn.Module):
@@ -68,43 +76,58 @@ class SamePadConv1d(nn.Module):
         return out
 
 
-class DilatedConvBlock(nn.Module):
-    """Single residual dilated-conv block.
+class ConvBlock(nn.Module):
+    """Pre-activation residual block with two dilated convolutions.
 
-    Structure::
+    Structure (matches TS2Vec ``ConvBlock``)::
 
-        x  →  SamePadConv(d) → ReLU → Dropout(0.1)  → + x  →  out
+        residual = projector(x) if needed else x
+        x → GELU → conv1 → GELU → conv2 → + residual → out
 
-    The residual branch is a plain identity connection; both branches operate
-    on tensors of shape (B, hidden_dim, T) throughout.
+    A 1×1 projector is added on the residual path when ``in_channels !=
+    out_channels`` or when ``final=True`` (the last block in the stack).
 
     Args:
-        hidden_dim: Number of channels (same for input and output).
-        dilation: Dilation factor for the convolution.
-        dropout: Dropout probability applied after ReLU.
+        in_channels: Input channel count.
+        out_channels: Output channel count.
+        kernel_size: Convolution kernel size (default 3).
+        dilation: Dilation factor for both conv1 and conv2.
+        final: If True, force a projector on the residual path even
+            when in_channels == out_channels.
     """
 
     def __init__(
         self,
-        hidden_dim: int,
-        dilation: int,
-        dropout: float = 0.1,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        final: bool = False,
     ) -> None:
         super().__init__()
-        self.conv = SamePadConv1d(hidden_dim, hidden_dim, kernel_size=3, dilation=dilation)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
+        self.conv1 = SamePadConv1d(in_channels, out_channels, kernel_size, dilation=dilation)
+        self.conv2 = SamePadConv1d(out_channels, out_channels, kernel_size, dilation=dilation)
+        self.projector = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels or final
+            else None
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply dilated conv with residual skip.
+        """Apply pre-activation residual block.
 
         Args:
-            x: Shape (B, hidden_dim, T).
+            x: Shape (B, C_in, T).
 
         Returns:
-            Shape (B, hidden_dim, T).
+            Shape (B, C_out, T).
         """
-        return x + self.dropout(self.relu(self.conv(x)))
+        residual = x if self.projector is None else self.projector(x)
+        x = F.gelu(x)
+        x = self.conv1(x)
+        x = F.gelu(x)
+        x = self.conv2(x)
+        return x + residual
 
 
 # ---------------------------------------------------------------------------
@@ -112,17 +135,19 @@ class DilatedConvBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DilatedCNNEncoder(nn.Module):
-    """Parameterised Dilated CNN encoder.
+    """Parameterised Dilated CNN encoder aligned with TS2Vec.
 
     The encoder maps a multivariate time series of shape (B, T, C) to a
     sequence of embeddings of shape (B, T, output_dim).
 
     Architecture::
 
-        input_proj   : Conv1d(input_dim  → hidden_dim, kernel=1)
-        blocks[i]    : DilatedConvBlock(hidden_dim, dilation=2^i)
-                       for i in range(n_layers)
-        output_proj  : Conv1d(hidden_dim → output_dim, kernel=1)
+        input_fc        : Linear(input_dim → hidden_dim)
+        blocks[0..n-1]  : ConvBlock(hidden_dim → hidden_dim, dilation=2^i)
+        blocks[n]       : ConvBlock(hidden_dim → output_dim, dilation=2^n, final)
+        repr_dropout    : Dropout(0.1)
+
+    Total n_layers+1 ConvBlocks, each containing 2 SamePadConv layers.
 
     Args:
         input_dim: Number of input channels C (dataset-dependent).
@@ -144,14 +169,27 @@ class DilatedCNNEncoder(nn.Module):
         hidden_dim = config.hidden_dim
         output_dim = config.output_dim
 
-        self.input_proj = nn.Conv1d(input_dim, hidden_dim, kernel_size=1)
+        # ── Input projection (Linear, matches TS2Vec input_fc) ───────────
+        self.input_fc = nn.Linear(input_dim, hidden_dim)
 
-        self.blocks = nn.ModuleList([
-            DilatedConvBlock(hidden_dim, dilation=2 ** i)
-            for i in range(n_layers)
+        # ── Convolutional stack ──────────────────────────────────────────
+        # channels[i] defines the output dim of block i.
+        # Blocks 0..n_layers-1 : hidden_dim → hidden_dim
+        # Block  n_layers      : hidden_dim → output_dim  (final)
+        channels = [hidden_dim] * n_layers + [output_dim]
+        self.feature_extractor = nn.Sequential(*[
+            ConvBlock(
+                in_channels=channels[i - 1] if i > 0 else hidden_dim,
+                out_channels=channels[i],
+                kernel_size=3,
+                dilation=2 ** i,
+                final=(i == len(channels) - 1),
+            )
+            for i in range(len(channels))
         ])
 
-        self.output_proj = nn.Conv1d(hidden_dim, output_dim, kernel_size=1)
+        # ── Repr dropout (single, at the end — matches TS2Vec) ──────────
+        self.repr_dropout = nn.Dropout(p=0.1)
 
     def forward(self, x: Tensor) -> Tensor:
         """Encode a batch of time series.
@@ -162,13 +200,12 @@ class DilatedCNNEncoder(nn.Module):
         Returns:
             Embedding tensor of shape (B, T, output_dim).
         """
-        # Conv1d expects (B, C, T), so we transpose in/out.
-        h = x.permute(0, 2, 1)        # (B, C, T)
-        h = self.input_proj(h)         # (B, hidden_dim, T)
-        for block in self.blocks:
-            h = block(h)               # (B, hidden_dim, T)
-        h = self.output_proj(h)        # (B, output_dim, T)
-        return h.permute(0, 2, 1)      # (B, T, output_dim)
+        h = self.input_fc(x)              # (B, T, hidden_dim)
+        h = h.transpose(1, 2)             # (B, hidden_dim, T)
+        h = self.repr_dropout(
+            self.feature_extractor(h)
+        )                                  # (B, output_dim, T)
+        return h.transpose(1, 2)           # (B, T, output_dim)
 
     @classmethod
     def from_config_dict(cls, input_dim: int, config_dict: dict) -> "DilatedCNNEncoder":

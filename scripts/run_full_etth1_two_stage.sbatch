@@ -9,7 +9,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/zac_full_etth1_%j.out
 #SBATCH --error=logs/zac_full_etth1_%j.err

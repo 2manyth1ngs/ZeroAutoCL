@@ -134,14 +134,15 @@ def _quick_eval(
     """Lightweight downstream evaluation for seed generation.
 
     For classification: SVM accuracy on time-pooled embeddings.
-    For forecasting: negative MSE of a Ridge regression at horizon 24.
+    For forecasting: negative MSE under the **TS2Vec-aligned protocol**
+        (causal sliding encode + multi-step Ridge with α selected on val) at
+        horizon 24.  See Bug #006 in CLAUDE_DEBUG.md.
     For anomaly detection: F1 from neighbour-distance thresholding.
 
     Returns:
         Scalar performance (higher = better).
     """
     from sklearn.svm import SVC
-    from sklearn.linear_model import Ridge
     import numpy as np
 
     def encode_pool(ds: TimeSeriesDataset) -> np.ndarray:
@@ -166,18 +167,35 @@ def _quick_eval(
             return float(svm.score(va_repr, va_y))
 
         elif task_type == "forecasting":
-            from sklearn.linear_model import Ridge
+            from train.forecasting_eval import (
+                DEFAULT_PADDING, causal_sliding_encode,
+                fit_ridge, generate_pred_samples,
+            )
             H = 24
-            with torch.no_grad():
-                h_tr = encoder(train_dataset.data.to(device)).cpu().numpy()[0]  # (T_tr, D)
-                h_va = encoder(val_dataset.data.to(device)).cpu().numpy()[0]    # (T_va, D)
-            x_tr = train_dataset.data[0].numpy()  # (T_tr, C)
-            x_va = val_dataset.data[0].numpy()    # (T_va, C)
-            if h_tr.shape[0] <= H or h_va.shape[0] <= H:
+            padding = DEFAULT_PADDING
+
+            tr = train_dataset.data   # (1, T_tr, C)
+            va = val_dataset.data     # (1, T_va, C)
+            if tr.shape[1] <= H + padding or va.shape[1] <= H:
                 return 0.0
-            reg = Ridge(alpha=1.0)
-            reg.fit(h_tr[:-H], x_tr[H:])
-            mse = float(np.mean((reg.predict(h_va[:-H]) - x_va[H:]) ** 2))
+
+            # Prefix-encode train ‖ val so that val's early timesteps see
+            # real train context (not zero padding) in their causal window.
+            x_all = torch.cat([tr, va], dim=1)
+            h_all = causal_sliding_encode(
+                encoder, x_all, padding=padding, device=device,
+            )
+            T_tr = tr.shape[1]
+            h_tr, h_va = h_all[:T_tr], h_all[T_tr:]
+            d_tr = tr[0].numpy()
+            d_va = va[0].numpy()
+
+            tr_f, tr_y = generate_pred_samples(h_tr, d_tr, H, drop=padding)
+            va_f, va_y = generate_pred_samples(h_va, d_va, H, drop=0)
+
+            lr   = fit_ridge(tr_f, tr_y, va_f, va_y)
+            pred = lr.predict(va_f)
+            mse  = float(np.mean((pred - va_y) ** 2))
             return -mse
 
         elif task_type == "anomaly_detection":
@@ -265,7 +283,7 @@ def generate_seeds(
         ds_iters  = int(ds_budget.get("pretrain_iters", 0))
         ds_epochs = int(ds_budget.get("pretrain_epochs", pretrain_epochs))
         if ds_iters > 0:
-            logger.info("  budget: pretrain_iters=%d (forecasting)", ds_iters)
+            logger.info("  budget: pretrain_iters=%d", ds_iters)
         else:
             logger.info("  budget: pretrain_epochs=%d", ds_epochs)
 

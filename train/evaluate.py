@@ -153,31 +153,40 @@ def eval_forecasting(
     device: Optional[torch.device] = None,
     val_data: Optional[TimeSeriesDataset] = None,
 ) -> Dict[int, Dict[str, float]]:
-    """Evaluate via Ridge regression per horizon.
+    """Evaluate via Ridge regression per horizon, TS2Vec-aligned protocol.
 
-    For each horizon H, ``h[t]`` is used to predict ``x[t+H]``.
+    Three things differ from a naive Ridge on ``encoder(x)``:
 
-    The training series is expected to be a single long sequence
-    (as stored in ETT datasets), i.e. ``train_data.data.shape == (1, T, C)``.
+    1. **Causal sliding encode** — each timestep's repr sees only past
+       context (window ``[t-padding, t]``).  A dilated same-padding CNN
+       would otherwise leak future values into ``h[t]``, turning the Ridge
+       into a near-identity on ``x[t+H]``.
+    2. **Multi-step target** — for each timestep Ridge predicts the full
+       sequence ``x[t+1..t+H]`` (flattened), not just the single point
+       ``x[t+H]``.  This matches the numbers TS2Vec / AutoCLS papers report.
+    3. **α selected on val** — Ridge regularisation is picked from
+       ``{0.1, 0.2, …, 1000}`` by minimising ``sqrt(MSE)+MAE`` on a held-out
+       val split; if ``val_data`` is missing a 20% tail of train serves as
+       a proxy.
+
+    See Bug #006 in CLAUDE_DEBUG.md for the full rationale.
 
     Args:
-        encoder: Pre-trained encoder.
-        train_data: Training split (forecasting, shape (1, T_tr, C)).
-        test_data: Test split (forecasting, shape (1, T_te, C)).
+        encoder: Pre-trained encoder, any ``(B, T, C) → (B, T, D)`` module.
+        train_data: Training split (forecasting, shape ``(1, T_tr, C)``).
+        test_data:  Test split     (forecasting, shape ``(1, T_te, C)``).
         horizons: Prediction horizons.  Defaults to ``[24, 48, 168, 336, 720]``.
-        batch_size: Inference batch size.
+        batch_size: Sliding-window batch size for the causal encode.
         device: Torch device.
+        val_data: Optional val split used to pick Ridge α.
 
     Returns:
         Dict mapping each horizon to ``{'mse': …, 'mae': …}``.
     """
-    from sklearn.linear_model import RidgeCV
-
-    # Ridge regularisation strengths searched at evaluation time.
-    # Matches TS2Vec's official evaluation code; replaces the previous fixed
-    # ``Ridge(alpha=1.0)`` which systematically over- or under-regularised
-    # depending on horizon.  See Bug #003a in CLAUDE_DEBUG.md.
-    _RIDGE_ALPHAS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+    from train.forecasting_eval import (
+        DEFAULT_PADDING, causal_sliding_encode,
+        fit_ridge, generate_pred_samples,
+    )
 
     if horizons is None:
         horizons = _DEFAULT_HORIZONS
@@ -186,52 +195,55 @@ def eval_forecasting(
 
     encoder = encoder.to(device)
     encoder.eval()
+    padding = DEFAULT_PADDING
 
-    # ── Prefix encoding (TS2Vec / AutoCLS official protocol) ────────────
-    # Concatenate train [+ val] + test along the time axis and encode in a
-    # single forward pass, then slice the embeddings back. This eliminates
-    # the boundary effect that contaminates the first ~RF (≈2047) timesteps
-    # of h_test when train/test are encoded independently — those positions
-    # would otherwise have their receptive field extend into zero-padding
-    # instead of the true preceding context. See CLAUDE_ADV.md §10.3.
-    x_tr_t = train_data.data    # (1, T_tr, C)
-    x_te_t = test_data.data     # (1, T_te, C)
-    T_tr = x_tr_t.shape[1]
-    T_te = x_te_t.shape[1]
+    # ── Prefix encoding: concat train [+ val] + test, encode once, slice ──
+    # With a causal sliding window this ensures that val/test timesteps near
+    # the split boundaries see real preceding context rather than zero-pad.
+    x_tr_t = train_data.data          # (1, T_tr, C)
+    x_te_t = test_data.data           # (1, T_te, C)
+    T_tr, T_te = x_tr_t.shape[1], x_te_t.shape[1]
 
     if val_data is not None:
-        x_va_t = val_data.data  # (1, T_va, C)
+        x_va_t = val_data.data        # (1, T_va, C)
         T_va = x_va_t.shape[1]
-        full = torch.cat([x_tr_t, x_va_t, x_te_t], dim=1).to(device)
+        full = torch.cat([x_tr_t, x_va_t, x_te_t], dim=1)
     else:
         T_va = 0
-        full = torch.cat([x_tr_t, x_te_t], dim=1).to(device)
+        full = torch.cat([x_tr_t, x_te_t], dim=1)
 
-    with torch.no_grad():
-        h_full = encoder(full).cpu().numpy()[0]   # (T_tr+T_va+T_te, D)
+    h_full = causal_sliding_encode(
+        encoder, full, padding=padding, batch_size=256, device=device,
+    )                                 # (T_tr + T_va + T_te, D)
+    h_tr = h_full[:T_tr]
+    h_va = h_full[T_tr : T_tr + T_va] if T_va > 0 else None
+    h_te = h_full[T_tr + T_va : T_tr + T_va + T_te]
 
-    h_tr = h_full[:T_tr]                                       # (T_tr, D)
-    h_te = h_full[T_tr + T_va : T_tr + T_va + T_te]            # (T_te, D)
-    x_tr = x_tr_t[0].numpy()
-    x_te = x_te_t[0].numpy()
+    d_tr = x_tr_t[0].numpy()
+    d_te = x_te_t[0].numpy()
+    d_va = x_va_t[0].numpy() if T_va > 0 else None
 
     results: Dict[int, Dict[str, float]] = {}
-
     for H in horizons:
-        if h_tr.shape[0] <= H or h_te.shape[0] <= H:
+        if h_tr.shape[0] <= H + padding or h_te.shape[0] <= H:
             logger.warning("Horizon %d too large for series length; skipping.", H)
             continue
 
-        X_train = h_tr[:-H]     # (T_tr - H, D)
-        y_train = x_tr[H:]      # (T_tr - H, C)
-        X_test  = h_te[:-H]     # (T_te - H, D)
-        y_test  = x_te[H:]      # (T_te - H, C)
+        tr_f, tr_y = generate_pred_samples(h_tr, d_tr, H, drop=padding)
+        te_f, te_y = generate_pred_samples(h_te, d_te, H, drop=0)
 
-        reg = RidgeCV(alphas=_RIDGE_ALPHAS)
-        reg.fit(X_train, y_train)
-        y_pred = reg.predict(X_test)   # (T_te - H, C)
+        if T_va > 0 and h_va.shape[0] > H:
+            va_f, va_y = generate_pred_samples(h_va, d_va, H, drop=0)
+        else:
+            # No separate val split: use a 20% tail of train to pick α.
+            split = max(1, int(0.8 * tr_f.shape[0]))
+            va_f, va_y = tr_f[split:], tr_y[split:]
+            tr_f, tr_y = tr_f[:split], tr_y[:split]
 
-        metrics = compute_forecasting_metrics(y_test, y_pred)
+        lr   = fit_ridge(tr_f, tr_y, va_f, va_y)
+        pred = lr.predict(te_f)
+
+        metrics = compute_forecasting_metrics(te_y, pred)
         results[H] = metrics
         logger.info(
             "eval_forecasting H=%d: mse=%.4f  mae=%.4f",

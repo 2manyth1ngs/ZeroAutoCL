@@ -32,8 +32,11 @@
 #               → phase4_results.json + phase4_best.json
 #
 # Classification-specific settings vs forecasting:
-#   - Epoch-based training (40 epochs, not iter-based)
-#   - Val-best checkpointing enabled (val signal reliable for classification)
+#   - Stage A/B: iter-based budget (600 iters, same as forecasting) to
+#     normalise wall-clock across datasets of vastly different sizes
+#     (SleepEEG ~23k samples vs Epilepsy ~250 — see Bug #006)
+#   - Phase 4: epoch-based training (40 epochs) with val-best checkpointing
+#     (val signal reliable for classification)
 #   - Evaluation via SVM on pooled embeddings (not Ridge regression)
 #   - Metric: accuracy / macro-F1 (not MSE/MAE)
 #   - No crop_len windowing (classification samples are naturally discrete)
@@ -98,7 +101,8 @@ SOURCES=(Epilepsy SleepEEG Gesture NATOPS)
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage A — encoder grid search (36 encoders × 4 sources, GGS fixed)
 #
-# Classification datasets use epoch-based budgets (40 epochs each).
+# All classification datasets now use iter-based budget (600 iters each)
+# to normalise wall-clock across different dataset sizes (Bug #006).
 # No crop_len needed — classification samples are naturally discrete.
 # Estimated time: 36 × 4 = 144 runs × ~2 min each ≈ 5 hours.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +124,7 @@ fi
 # Stage B.1 — seed generation (top-K_enc encoders × random CL strategies)
 #
 # 200 candidates × 4 sources = 800 seed records.
-# Each candidate: 40 epoch CL pretrain + SVM eval.
+# Each candidate: 600 iter CL pretrain + SVM eval.
 # Estimated time: 800 × ~2 min ≈ 27 hours.
 # ─────────────────────────────────────────────────────────────────────────────
 echo
