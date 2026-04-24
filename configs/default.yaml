@@ -14,7 +14,22 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 seed_generation:
-  n_per_dataset: 200        # 200 × 8 sources = 1600 seed records (paper-grade)
+  # AutoCTS++-aligned budget (reference/AutoCTS_plusplus/exps/generate_seeds.py
+  # uses ``sample_num=20`` as default — 20 clean + 40 noisy per task, total 60).
+  # Our previous 200 was ~10× AutoCTS++'s clean-mode count and made paper-scale
+  # runs impractical (~50+ hours on one GPU).
+  #
+  # Two-stage AutoCTS++ protocol, executed as THREE CLI invocations per task:
+  #
+  #   1. --mode noisy  --n_per_dataset 20  --seed 42     # deterministic init
+  #   2. --mode noisy  --n_per_dataset 20  --randomise_init  --seed 43
+  #   3. --mode clean  --n_per_dataset 20  --seed 44
+  #
+  # Yields 60 records per task × 8 source tasks = 480 total (matching AutoCTS++
+  # paper scale).  Estimated wall-clock ~15-20 h on a single RTX 4090.
+  n_per_dataset_noisy: 20   # per ``--mode noisy`` run (run twice → 40 total)
+  n_per_dataset_clean: 20   # single ``--mode clean`` run
+  n_per_dataset: 20         # backward-compat fallback when CLI doesn't pass it
   pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
   pretrain_lr: 0.001
   batch_size: 32
@@ -67,11 +82,33 @@ dataset_budgets:
   KPI:          { pretrain_epochs: 40 }
 
 comparator:
-  epochs: 250               # +50 over 8 GB config — cheap, slightly tighter fit
+  # Stage 1 (pretrain / noisy seeds) config.  See
+  # search/pretrain_comparator.py for the full key reference.
+  #
+  # Values aligned with AutoCTS++ (random_search.py L28,29,41,538):
+  #   batch_size=64, lr=1e-4, epochs=100, tolerance=3 (we allow patience=5
+  #   because our valid sets are larger after the symmetric-pair injection).
+  epochs: 100               # upper bound — real stop is triggered by ``patience``
   lr: 0.0001
-  batch_size: 256
-  curriculum_levels: 5
+  batch_size: 64
   hidden_dim: 128
+  valid_gap_threshold: 0.02 # P0: gap used to split valid from train seeds
+  patience: 5               # P0: epochs of non-improvement → early stop
+  eval_every: 1             # P0: evaluate valid loss every N epochs
+  # NOTE: ``curriculum_levels`` is deprecated (P0 removed the gap-magnitude
+  # curriculum).  The curriculum now lives in the two-stage noisy→clean
+  # protocol; the 'comparator_clean' block below configures stage 2.
+
+# Stage 2 (fine-tune / clean seeds) config — only consulted by
+# ``run_pretrain_comparator.py`` when ``--clean_seeds_path`` is supplied.
+# Any key omitted here inherits from ``comparator:`` above; the defaults
+# when this whole block is absent are ``lr := 0.1 × comparator.lr`` and
+# ``epochs := comparator.epochs // 2``.
+#
+# comparator_clean:
+#   lr: 1.0e-5
+#   epochs: 100
+#   patience: 8
 
 zero_shot:
   n_candidates: 200000      # 200k pool — comparator forward is nearly free on 4090
@@ -99,7 +136,7 @@ two_stage_search:
     top_k_enc: 3                # K_enc
 
   cl_strategy_search:
-    n_per_dataset: 200          # mirrors seed_generation.n_per_dataset
+    n_per_dataset: 20           # mirrors seed_generation.n_per_dataset (AutoCTS++ default)
     n_candidates: 200000
     tournament_rounds: 25
     top_k_strategies: 5         # CL strategies kept per encoder
