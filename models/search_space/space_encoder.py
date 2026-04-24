@@ -1,12 +1,13 @@
 """Encode (encoder_config, cl_strategy) pairs into fixed-size vectors.
 
-The raw feature vector (dim=31) is a concatenation of normalised scalars and
+The raw feature vector (dim=34) is a concatenation of normalised scalars and
 one-hot encodings for every dimension of the joint configuration space.  An
 MLP then maps this to the comparator's hidden dimension.
 
-Layout (31-d raw vector)::
+Layout (34-d raw vector)::
 
     encoder  [3] : n_layers/10, hidden_dim/128, output_dim/320
+    mask mode[3] : one-hot over {none, binomial, continuous}
     aug probs[6] : resize, rescale, jitter, point_mask, freq_mask, crop
     aug order[5] : one-hot over 5 orders
     emb xform[5] : jitter_p, mask_p, norm_type one-hot(3)
@@ -23,7 +24,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-RAW_DIM: int = 31  # total dimension of the raw feature vector
+RAW_DIM: int = 34  # total dimension of the raw feature vector
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +34,11 @@ RAW_DIM: int = 31  # total dimension of the raw feature vector
 _NORM_TYPES: List[str]  = ["none", "layer_norm", "l2"]
 _POOL_OPS: List[str]    = ["avg", "max"]
 _LOSS_TYPES: List[str]  = ["infonce", "triplet"]
-_SIM_FUNCS: List[str]   = ["dot", "cosine", "euclidean"]
+# 'distance' is an AutoCLS-terminology alias for 'euclidean'; the encoder
+# treats them as the same slot so old and new seed records share the same
+# feature vector.
+_SIM_FUNCS: List[str]   = ["dot", "cosine", "distance"]
+_MASK_MODES: List[str]  = ["none", "binomial", "continuous"]
 
 
 def _onehot(value: str, choices: List[str]) -> List[float]:
@@ -115,10 +120,10 @@ class CandidateEncoder(nn.Module):
 
     def _to_raw_vector(
         self,
-        encoder_config: Dict[str, int],
+        encoder_config: Dict[str, object],
         strategy_config: Dict,
     ) -> Tensor:
-        """Build the 31-d raw feature vector from config dicts.
+        """Build the 34-d raw feature vector from config dicts.
 
         Returns:
             Tensor of shape ``(raw_dim,)`` on the same device as the MLP.
@@ -131,9 +136,12 @@ class CandidateEncoder(nn.Module):
         feats: List[float] = []
 
         # ── Encoder (3-d) ──────────────────────────────────────────────
-        feats.append(encoder_config.get("n_layers", 10) / 10.0)
-        feats.append(encoder_config.get("hidden_dim", 64) / 128.0)
-        feats.append(encoder_config.get("output_dim", 320) / 320.0)
+        feats.append(float(encoder_config.get("n_layers", 10)) / 10.0)
+        feats.append(float(encoder_config.get("hidden_dim", 64)) / 128.0)
+        feats.append(float(encoder_config.get("output_dim", 320)) / 320.0)
+
+        # ── Mask mode one-hot (3-d) ────────────────────────────────────
+        feats.extend(_onehot(str(encoder_config.get("mask_mode", "binomial")), _MASK_MODES))
 
         # ── Augmentation probabilities (6-d) ───────────────────────────
         for aug_name in ["resize", "rescale", "jitter", "point_mask", "freq_mask", "crop"]:
@@ -157,7 +165,12 @@ class CandidateEncoder(nn.Module):
 
         # ── Loss (6-d) ────────────────────────────────────────────────
         feats.extend(_onehot(str(loss.get("type", "infonce")), _LOSS_TYPES))
-        feats.extend(_onehot(str(loss.get("sim_func", "dot")), _SIM_FUNCS))
+        # Normalise legacy 'euclidean' to 'distance' so both land in the
+        # same one-hot slot and historic seed records stay encodable.
+        sim = str(loss.get("sim_func", "dot"))
+        if sim == "euclidean":
+            sim = "distance"
+        feats.extend(_onehot(sim, _SIM_FUNCS))
         temp = float(loss.get("temperature", 1.0))
         feats.append(math.log10(max(temp, 1e-9)) / 2.0)
 

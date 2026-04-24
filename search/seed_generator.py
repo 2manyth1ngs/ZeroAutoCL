@@ -81,12 +81,26 @@ def _evaluate_candidate(
     batch_size: int,
     device: torch.device,
     pretrain_iters: int = 0,
+    mode: str = "clean",
 ) -> float:
     """Train one candidate and return its validation performance.
 
     Delegates to :func:`train.pretrain.contrastive_pretrain` so that the
     iter-budget mechanism (Bug #003a) and the task-aware val-best gating
     are applied uniformly with the rest of the pipeline.
+
+    Modes (``mode`` parameter) — AutoCTS++-style seed generation:
+
+    - ``"clean"``  (default): the original protocol.  Run full training,
+      evaluate the final encoder via :func:`_quick_eval`.  Low noise but
+      expensive; used for the comparator's fine-tuning stage.
+
+    - ``"noisy"``: short training (budget set by caller) with a val eval
+      after every epoch.  Performance = ``max(val_score_per_epoch)``
+      (equivalent to AutoCTS++'s ``min(MAE)`` over the 5 noisy epochs at
+      ``reference/AutoCTS_plusplus/exps/random_search.py:285``).  Cheap
+      best-of-N estimator that naturally attenuates per-epoch seed noise;
+      used for the comparator's pretraining stage.
 
     Returns:
         Primary metric value (higher = better).  Returns ``-1e9`` on failure
@@ -99,12 +113,22 @@ def _evaluate_candidate(
     encoder = DilatedCNNEncoder.from_config_dict(input_dim, encoder_config).to(device)
     pipeline = CLPipeline(encoder, strategy).to(device)
 
-    cfg = {
+    cfg: Dict = {
         "pretrain_epochs": pretrain_epochs,
         "pretrain_iters":  pretrain_iters,
         "pretrain_lr":     pretrain_lr,
         "batch_size":      batch_size,
     }
+
+    # In noisy mode we need per-epoch val scores so we can return the best
+    # one as the "best-of-N" performance estimate.  val_best=False so we
+    # don't restore checkpoints (the encoder is discarded after this call).
+    history: Optional[List[Dict]] = None
+    if mode == "noisy":
+        cfg["eval_every"] = 1
+        cfg["val_best"]   = False
+        history = []
+
     try:
         contrastive_pretrain(
             encoder=encoder,
@@ -113,12 +137,30 @@ def _evaluate_candidate(
             config=cfg,
             device=device,
             task_type=task_type,
+            val_data=(val_dataset if mode == "noisy" else None),
+            # P1-A: noisy mode uses full horizons (None → default
+            # [24, 48, 168, 336, 720]) so the best-of-N val_score reflects
+            # end-to-end forecasting quality, not short-horizon bias.
+            horizons=None,
+            history=history,
         )
     except Exception as exc:                           # pragma: no cover
         logger.warning("contrastive_pretrain failed for candidate: %s", exc)
         return -1e9
 
-    # ── Validation ─────────────────────────────────────────────────────
+    # ── Noisy mode: best-of-N across training epochs ──────────────────
+    if mode == "noisy" and history is not None:
+        scores = [h["val_score"] for h in history if h.get("val_score") is not None]
+        if scores:
+            # val_score is already "higher = better" (for forecasting it is
+            # -MSE averaged over the requested horizons).  Max = best epoch.
+            return float(max(scores))
+        logger.warning(
+            "mode=noisy but no per-epoch val_scores recorded; "
+            "falling back to _quick_eval on the final encoder.",
+        )
+
+    # ── Clean mode (or noisy fallback): eval the final encoder ────────
     encoder.eval()
     performance = _quick_eval(encoder, train_dataset, val_dataset, task_type, device)
     return performance
@@ -133,14 +175,18 @@ def _quick_eval(
 ) -> float:
     """Lightweight downstream evaluation for seed generation.
 
-    For classification: SVM accuracy on time-pooled embeddings.
-    For forecasting: negative MSE under the **TS2Vec-aligned protocol**
-        (causal sliding encode + multi-step Ridge with α selected on val) at
-        horizon 24.  See Bug #006 in CLAUDE_DEBUG.md.
-    For anomaly detection: F1 from neighbour-distance thresholding.
+    Task-wise metrics (all return "higher = better"):
 
-    Returns:
-        Scalar performance (higher = better).
+    - ``classification``: SVM accuracy on time-pooled embeddings.
+    - ``forecasting``: negative mean MAE across the full horizon set
+      ``[24, 48, 168, 336, 720]`` under the TS2Vec-aligned protocol
+      (causal sliding encode + multi-step Ridge with α picked on a val
+      tail).  P1-A: switched from H=24 MSE to all-horizons MAE so the
+      comparator supervision reflects both short and long-range forecasting
+      quality and has less heavy-tail noise.  Horizons that do not fit the
+      series length are skipped automatically by :func:`eval_forecasting`.
+    - ``anomaly_detection``: mean embedding-std as a proxy (higher = more
+      structured representation).
     """
     from sklearn.svm import SVC
     import numpy as np
@@ -167,36 +213,23 @@ def _quick_eval(
             return float(svm.score(va_repr, va_y))
 
         elif task_type == "forecasting":
-            from train.forecasting_eval import (
-                DEFAULT_PADDING, causal_sliding_encode,
-                fit_ridge, generate_pred_samples,
+            # Delegate to the shared TS2Vec-protocol evaluator so the seed
+            # labels use exactly the same pipeline as run_ggs_test / Phase 4
+            # evaluation.  val_dataset is passed as ``test_data`` — Ridge's α
+            # is then picked from a train tail (default behaviour inside
+            # :func:`eval_forecasting`).
+            from train.evaluate import eval_forecasting
+            m = eval_forecasting(
+                encoder=encoder,
+                train_data=train_dataset,
+                test_data=val_dataset,
+                horizons=None,            # full [24, 48, 168, 336, 720]
+                device=device,
             )
-            H = 24
-            padding = DEFAULT_PADDING
-
-            tr = train_dataset.data   # (1, T_tr, C)
-            va = val_dataset.data     # (1, T_va, C)
-            if tr.shape[1] <= H + padding or va.shape[1] <= H:
+            if not m:
                 return 0.0
-
-            # Prefix-encode train ‖ val so that val's early timesteps see
-            # real train context (not zero padding) in their causal window.
-            x_all = torch.cat([tr, va], dim=1)
-            h_all = causal_sliding_encode(
-                encoder, x_all, padding=padding, device=device,
-            )
-            T_tr = tr.shape[1]
-            h_tr, h_va = h_all[:T_tr], h_all[T_tr:]
-            d_tr = tr[0].numpy()
-            d_va = va[0].numpy()
-
-            tr_f, tr_y = generate_pred_samples(h_tr, d_tr, H, drop=padding)
-            va_f, va_y = generate_pred_samples(h_va, d_va, H, drop=0)
-
-            lr   = fit_ridge(tr_f, tr_y, va_f, va_y)
-            pred = lr.predict(va_f)
-            mse  = float(np.mean((pred - va_y) ** 2))
-            return -mse
+            maes = [v["mae"] for v in m.values()]
+            return -float(sum(maes) / len(maes))
 
         elif task_type == "anomaly_detection":
             # Encode, compute neighbour distance → anomaly score.
@@ -227,6 +260,8 @@ def generate_seeds(
     dataset_budgets: Optional[Dict[str, Dict[str, int]]] = None,
     fixed_encoders: Optional[List[Dict[str, int]]] = None,
     crop_len: Optional[int] = None,
+    mode: str = "clean",
+    randomise_init: bool = False,
 ) -> List[SeedRecord]:
     """Generate seed data across source datasets.
 
@@ -240,7 +275,8 @@ def generate_seeds(
         save_dir: If given, serialise seed records to
             ``{save_dir}/seeds.json``.
         device: Torch device.  ``None`` → auto-detect.
-        seed: Global random seed.
+        seed: Global random seed (also used as the base for per-candidate
+            deterministic seeds when ``randomise_init=False``).
         fixed_encoders: Optional list of encoder configs to restrict the
             encoder sub-space to (Plan B Stage B). When given, candidates are
             sampled via :func:`batch_sample_strategies` rather than the full
@@ -250,13 +286,49 @@ def generate_seeds(
             forecasting training splits.  When given, passed as
             ``window_len_override`` to :func:`load_dataset` so that
             seed generation uses a shorter crop than Phase 4.
+        mode: ``"clean"`` (default) or ``"noisy"``.  Passed to
+            :func:`_evaluate_candidate`:
+
+            - ``"clean"`` runs full training and evaluates the final encoder.
+              Low-variance but expensive — intended for comparator
+              fine-tuning stage.
+            - ``"noisy"`` runs short training with per-epoch val eval and
+              records ``max(val_score)`` over epochs.  Cheap best-of-N
+              estimator; intended for comparator pretraining stage.
+
+            This matches AutoCTS++'s two-stage ``noisy_seeds`` /
+            ``clean_seeds`` recipe (``reference/AutoCTS_plusplus/exps/
+            generate_seeds.py:94-103``).
+        randomise_init: When True, every candidate gets a fresh seed from
+            system entropy (``random.SystemRandom``) rather than the
+            deterministic ``seed + i`` derivation.  Use this for a
+            complementary "random-init" half of noisy seed generation
+            (AutoCTS++ ``use_seed=False`` branch), so that the comparator
+            sees pairs from different initialisations and learns to rank
+            under seed noise.
 
     Returns:
         List of all :class:`SeedRecord` objects.
     """
+    if mode not in ("clean", "noisy"):
+        raise ValueError(f"mode must be 'clean' or 'noisy', got {mode!r}")
+
     set_seed(seed)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # AutoCTS++-style per-candidate seeding:
+    #   - randomise_init=False → deterministic ``seed + i`` (default);
+    #     runs are reproducible across invocations.
+    #   - randomise_init=True  → fresh system entropy per candidate;
+    #     teaches the comparator that the CL pipeline is noisy.
+    import random as _random_mod
+    _sys_random = _random_mod.SystemRandom()
+
+    logger.info(
+        "[generate_seeds] mode=%s  randomise_init=%s  n_per_dataset=%d",
+        mode, randomise_init, n_per_dataset,
+    )
 
     if fixed_encoders is not None:
         logger.info(
@@ -295,6 +367,21 @@ def generate_seeds(
 
         for i, (enc_cfg, strat_cfg) in enumerate(candidates):
             cand_start = time.time()
+
+            # Per-candidate seeding (AutoCTS++-style).  This controls BOTH
+            # encoder init and augmentation/loader randomness inside
+            # ``contrastive_pretrain``.  With randomise_init=True we reseed
+            # from system entropy, deliberately injecting per-candidate
+            # variance so that pairs across candidates reflect real-world
+            # run-to-run noise.
+            if randomise_init:
+                per_cand_seed = _sys_random.randint(0, 2**31 - 1)
+            else:
+                # Global offset (``ds_idx``) ensures per-dataset determinism
+                # without clashing on the same ``seed + i`` across datasets.
+                per_cand_seed = seed + ds_idx * n_per_dataset + i
+            set_seed(per_cand_seed)
+
             perf = _evaluate_candidate(
                 enc_cfg, strat_cfg,
                 train_ds, val_ds,
@@ -302,6 +389,7 @@ def generate_seeds(
                 ds_epochs, pretrain_lr, batch_size,
                 device,
                 pretrain_iters=ds_iters,
+                mode=mode,
             )
             cand_elapsed = time.time() - cand_start
 

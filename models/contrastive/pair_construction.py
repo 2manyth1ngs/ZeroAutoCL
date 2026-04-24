@@ -90,11 +90,13 @@ def _pairwise_sim(x: Tensor, y: Tensor, sim_func: str) -> Tensor:
     Args:
         x: Shape (..., N, D).
         y: Shape (..., M, D). Leading dims must match.
-        sim_func: ``'dot'``, ``'cosine'``, or ``'euclidean'``.
+        sim_func: ``'dot'``, ``'cosine'``, ``'euclidean'``, or ``'distance'``
+            (``'distance'`` is an AutoCLS-terminology alias for
+            ``'euclidean'``).
 
     Returns:
         Tensor of shape (..., N, M). Higher = more similar for all funcs
-        (euclidean returns negative L2 distance).
+        (euclidean / distance return negative L2 distance).
     """
     if sim_func == "dot":
         return torch.matmul(x, y.transpose(-1, -2))
@@ -102,7 +104,7 @@ def _pairwise_sim(x: Tensor, y: Tensor, sim_func: str) -> Tensor:
         xn = F.normalize(x, dim=-1)
         yn = F.normalize(y, dim=-1)
         return torch.matmul(xn, yn.transpose(-1, -2))
-    if sim_func == "euclidean":
+    if sim_func in ("euclidean", "distance"):
         x2 = (x ** 2).sum(-1, keepdim=True)
         y2 = (y ** 2).sum(-1, keepdim=True).transpose(-1, -2)
         xy = torch.matmul(x, y.transpose(-1, -2))

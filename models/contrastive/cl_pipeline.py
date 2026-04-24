@@ -143,14 +143,23 @@ class CLPipeline(nn.Module):
               - ``loss_dict``:  Dict mapping contrast-type name → scalar loss.
         """
         # ── Step 1: Augmentation (no grad — no learnable params) ─────────
+        # The pipeline returns two views of potentially DIFFERENT lengths
+        # together with slice objects locating the shared overlap region
+        # inside each view (TS2Vec / AutoCLS protocol).  Encoding each view
+        # independently gives the overlap positions different left / right
+        # context — the core contrastive signal.
         with torch.no_grad():
-            x1, x2 = self.aug_pipeline(x)
+            x1, x2, slice1, slice2 = self.aug_pipeline(x)
         x1 = x1.detach()
         x2 = x2.detach()
 
         # ── Step 2: Encoding ─────────────────────────────────────────────
-        h1 = self.encoder(x1)   # (B, T, D)
-        h2 = self.encoder(x2)   # (B, T, D)
+        h1 = self.encoder(x1)   # (B, L1, D)
+        h2 = self.encoder(x2)   # (B, L2, D)
+
+        # ── Step 2b: Slice to the overlap — now h1 and h2 are time-aligned ─
+        h1 = h1[:, slice1, :]   # (B, overlap_len, D)
+        h2 = h2[:, slice2, :]
 
         # ── Step 3: Embedding transform ──────────────────────────────────
         h1 = self.emb_transform(h1)

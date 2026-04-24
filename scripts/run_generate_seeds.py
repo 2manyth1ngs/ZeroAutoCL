@@ -63,6 +63,24 @@ def parse_args() -> argparse.Namespace:
                         "sub-space to the top-K rows of this file.")
     p.add_argument("--top_k_enc",       type=int, default=3,
                    help="(Plan B) How many encoders to keep from --encoder_grid.")
+    # ── AutoCTS++ two-stage seed generation ────────────────────────────
+    p.add_argument("--mode", choices=["clean", "noisy"], default="clean",
+                   help="Seed generation mode (AutoCTS++-style two-stage "
+                        "pipeline).  'clean' (default) runs full training + "
+                        "a single final eval — low-noise labels for the "
+                        "comparator fine-tuning stage.  'noisy' runs short "
+                        "training with per-epoch val eval and records "
+                        "max(val_score) over epochs (best-of-N estimator) — "
+                        "cheap labels for the comparator pretraining stage.  "
+                        "For noisy runs pair this with a small "
+                        "--pretrain_iters (e.g. 200) or a few epochs.")
+    p.add_argument("--randomise_init", action="store_true",
+                   help="Reseed every candidate from system entropy instead "
+                        "of the deterministic seed+i derivation.  Intended "
+                        "for the second half of the noisy pretraining stage "
+                        "(AutoCTS++'s use_seed=False branch) so the "
+                        "comparator's training data reflects real run-to-run "
+                        "variance.  Default OFF → reproducible seeds.")
     return p.parse_args()
 
 
@@ -127,8 +145,10 @@ def main() -> None:
         )
 
     logger.info(
-        "Generating seeds: datasets=%s  n_per=%d  lr=%.4f  bs=%d",
+        "Generating seeds: datasets=%s  n_per=%d  lr=%.4f  bs=%d  "
+        "mode=%s  randomise_init=%s",
         args.datasets, n_per_dataset, pretrain_lr, batch_size,
+        args.mode, args.randomise_init,
     )
     logger.info("Per-dataset budgets: %s", dataset_budgets)
 
@@ -147,6 +167,8 @@ def main() -> None:
         dataset_budgets=dataset_budgets,
         fixed_encoders=fixed_encoders,
         crop_len=crop_len,
+        mode=args.mode,
+        randomise_init=args.randomise_init,
     )
 
     logger.info("Done — generated %d seed records.", len(seeds))

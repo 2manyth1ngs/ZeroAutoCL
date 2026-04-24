@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.optim.swa_utils import AveragedModel
 from torch.utils.data import DataLoader
 
 from data.dataset import TimeSeriesDataset
@@ -52,8 +53,12 @@ def _val_score(
             )
             if not m:
                 return None
-            mses = [v["mse"] for v in m.values()]
-            return -float(sum(mses) / len(mses))   # negate: higher = better
+            # Primary metric: mean MAE across all evaluated horizons (P1-A).
+            # MAE is linear in errors so catastrophic outliers do not dominate
+            # the way they do with MSE — this matches AutoCTS++'s seed labels
+            # and reduces the heavy-tail load on the pairwise comparator.
+            maes = [v["mae"] for v in m.values()]
+            return -float(sum(maes) / len(maes))   # negate: higher = better
         elif task_type == "anomaly_detection":
             m = eval_anomaly_detection(encoder, train_data, val_data, device=device)
             return float(m["f1"])
@@ -104,6 +109,13 @@ def contrastive_pretrain(
               val signal points at the wrong epoch; the default is to
               return the last checkpoint and rely on a fixed iter budget
               instead.
+            - ``use_ema`` (bool, default True) — maintain an averaged copy
+              of the encoder parameters (``torch.optim.swa_utils
+              .AveragedModel`` with default simple-average ``avg_fn``) that
+              is updated every optimizer step.  When enabled, all val-eval
+              and the final returned encoder use the averaged weights, which
+              follows the TS2Vec recipe and reduces variance between
+              otherwise-equivalent seeds.
 
         device: Torch device.  ``None`` → auto-detect.
         val_data: Optional validation split.  When provided together with
@@ -130,6 +142,13 @@ def contrastive_pretrain(
     lr         = float(config.get("pretrain_lr", config.get("lr", 1e-3)))
     batch_size = int(config.get("batch_size", 64))
     eval_every = int(config.get("eval_every", 0))
+    use_ema    = bool(config.get("use_ema", True))
+    # Optimizer / gradient-clipping toggles.  Defaults preserve the original
+    # ZeroAutoCL behaviour (Adam + clip_grad_norm 1.0) so existing callers
+    # stay on rails; set ``optimizer='adamw'`` and ``grad_clip=0`` to match
+    # the TS2Vec recipe.
+    optimizer_type = str(config.get("optimizer", "adam")).lower()
+    grad_clip = float(config.get("grad_clip", 1.0))
 
     # Forecasting datasets (especially ETT) suffer from train→val→test
     # distribution drift, so val-based early stopping picks the wrong
@@ -141,18 +160,42 @@ def contrastive_pretrain(
     else:
         val_best_flag = task_type != "forecasting"
 
-    val_enabled = (
-        val_best_flag
-        and eval_every > 0
+    # Split into two gates:
+    #   - ``eval_enabled``     controls per-epoch val_score computation and
+    #                          the history-record population.  Required by
+    #                          AutoCTS++-style noisy seed generation, which
+    #                          needs max(val_score) across epochs even when
+    #                          val-best restoration is disabled.
+    #   - ``val_best_enabled`` controls whether to remember the best-by-val
+    #                          state_dict and restore it on exit.
+    eval_enabled = (
+        eval_every > 0
         and val_data is not None
         and task_type is not None
     )
+    val_best_enabled = val_best_flag and eval_enabled
 
     encoder.to(device)
     cl_pipeline.to(device)
     cl_pipeline.train()
 
-    optimizer = torch.optim.Adam(cl_pipeline.parameters(), lr=lr)
+    # EMA / SWA averaged copy of the encoder.  Mirrors TS2Vec's
+    # ``torch.optim.swa_utils.AveragedModel`` usage — parameters are updated
+    # every optimizer step and swapped in for evaluation and for the final
+    # returned encoder.  The AveragedModel deepcopies the encoder internally,
+    # so cost is one extra encoder-sized tensor set (typically <5 MB for
+    # our 10-layer / 64-hidden / 320-output config).
+    if use_ema:
+        ema_encoder: Optional[AveragedModel] = AveragedModel(encoder).to(device)
+    else:
+        ema_encoder = None
+
+    if optimizer_type == "adamw":
+        optimizer = torch.optim.AdamW(cl_pipeline.parameters(), lr=lr)
+    elif optimizer_type == "adam":
+        optimizer = torch.optim.Adam(cl_pipeline.parameters(), lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_type!r}")
     loader = DataLoader(
         train_data, batch_size=batch_size, shuffle=True, drop_last=True,
     )
@@ -196,8 +239,11 @@ def contrastive_pretrain(
                 loss, _ = cl_pipeline(x_batch)
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(cl_pipeline.parameters(), max_norm=1.0)
+                if grad_clip > 0:
+                    nn.utils.clip_grad_norm_(cl_pipeline.parameters(), max_norm=grad_clip)
                 optimizer.step()
+                if ema_encoder is not None:
+                    ema_encoder.update_parameters(encoder)
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower():
                     raise
@@ -223,14 +269,38 @@ def contrastive_pretrain(
         mean_loss = epoch_loss / n_batches if n_batches > 0 else float("nan")
 
         # ── Optional val eval + best-checkpoint tracking (Bug #003a) ──
+        # NOTE: ``eval_enabled`` only governs whether we COMPUTE val_score
+        # each epoch; ``val_best_enabled`` governs whether we remember the
+        # best state.  Noisy seed generation turns val_best off but still
+        # needs the per-epoch scores through ``history``.
         val_score: Optional[float] = None
-        if val_enabled and ((epoch + 1) % eval_every == 0 or epoch == epochs - 1):
-            val_score = _val_score(
-                encoder, train_data, val_data, task_type, horizons, device,
-            )
-            if val_score is not None and val_score > best_score:
+        if eval_enabled and ((epoch + 1) % eval_every == 0 or epoch == epochs - 1):
+            # When EMA is on, evaluate the AVERAGED weights (that's what
+            # downstream code ultimately uses).  Swap them into encoder
+            # temporarily, then restore the training weights so optimisation
+            # continues from where it left off.
+            if ema_encoder is not None:
+                train_state = copy.deepcopy(encoder.state_dict())
+                encoder.load_state_dict(ema_encoder.module.state_dict())
+                try:
+                    val_score = _val_score(
+                        encoder, train_data, val_data, task_type, horizons, device,
+                    )
+                finally:
+                    encoder.load_state_dict(train_state)
+            else:
+                val_score = _val_score(
+                    encoder, train_data, val_data, task_type, horizons, device,
+                )
+            if val_best_enabled and val_score is not None and val_score > best_score:
                 best_score = val_score
-                best_state = copy.deepcopy(encoder.state_dict())
+                # Save the EMA weights as the best checkpoint — matching
+                # what was actually evaluated.  Without EMA, fall back to
+                # the live training weights.
+                if ema_encoder is not None:
+                    best_state = copy.deepcopy(ema_encoder.module.state_dict())
+                else:
+                    best_state = copy.deepcopy(encoder.state_dict())
                 best_epoch = epoch + 1
 
         # ── Per-epoch logging (was: every 10 % of training) ──
@@ -261,8 +331,15 @@ def contrastive_pretrain(
             )
             break
 
+    # ── Copy EMA weights into the encoder for downstream use ──
+    # When val-best is also on, this happens BEFORE best_state restore so
+    # that best_state (which itself holds EMA weights) overrides correctly.
+    if ema_encoder is not None:
+        encoder.load_state_dict(ema_encoder.module.state_dict())
+        logger.info("EMA weights copied into encoder for downstream eval")
+
     # ── Restore best-by-val checkpoint if available ──
-    if val_enabled and best_state is not None:
+    if val_best_enabled and best_state is not None:
         encoder.load_state_dict(best_state)
         logger.info(
             "Restored best-by-val checkpoint from epoch %d (score=%.4f)",

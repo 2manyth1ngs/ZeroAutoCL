@@ -47,7 +47,7 @@ GGS_STRATEGY: Dict = {
         "instance": True, "temporal": False, "cross_scale": False,
         "kernel_size": 5, "pool_op": "avg", "adj_neighbor": False,
     },
-    "loss": {"type": "infonce", "sim_func": "euclidean", "temperature": 1.0},
+    "loss": {"type": "infonce", "sim_func": "distance", "temperature": 1.0},
 }
 
 DEFAULT_ENCODER: Dict[str, int] = {"n_layers": 10, "hidden_dim": 64, "output_dim": 320}
@@ -107,11 +107,13 @@ def sample_cl_strategy_only() -> Dict:
     return sample_cl_strategy()
 
 
-def sample_encoder_config() -> Dict[str, int]:
-    """Uniformly sample one encoder configuration from the 36 candidates.
+def sample_encoder_config() -> Dict[str, object]:
+    """Uniformly sample one encoder configuration from the 108 candidates.
 
     Returns:
-        Dict with keys ``'n_layers'``, ``'hidden_dim'``, ``'output_dim'``.
+        Dict with keys ``'n_layers'``, ``'hidden_dim'``, ``'output_dim'``,
+        ``'mask_mode'``.  The first three are ints; ``mask_mode`` is a string
+        in ``{'none', 'binomial', 'continuous'}``.
     """
     return {
         key: random.choice(choices)

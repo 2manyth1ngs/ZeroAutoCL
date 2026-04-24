@@ -1,6 +1,6 @@
 """Evaluation metrics for classification, forecasting, and anomaly detection tasks."""
 
-from typing import Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 from sklearn.metrics import (
@@ -33,19 +33,39 @@ def compute_classification_metrics(
 def compute_forecasting_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    scaler: Optional[Any] = None,
 ) -> Dict[str, float]:
-    """Compute forecasting metrics.
+    """Compute forecasting metrics in normalised and (optionally) raw space.
 
     Args:
-        y_true: Ground-truth values, shape (N, H) or (N,).
-        y_pred: Predicted values, same shape as y_true.
+        y_true: Ground-truth values, shape ``(N, H, C_raw)``, ``(N, H*C_raw)``
+            or any shape whose last dimension — once reshaped by the caller
+            if needed — is ``C_raw`` for scaler compatibility.
+        y_pred: Predicted values, same shape as ``y_true``.
+        scaler: Optional scikit-learn ``StandardScaler`` (or compatible) fit
+            on the raw variables.  When provided, an ``inverse_transform`` is
+            applied before computing the ``mse_raw`` / ``mae_raw`` keys.  The
+            last axis of ``y_true`` / ``y_pred`` must match
+            ``scaler.n_features_in_``; reshape externally otherwise.
 
     Returns:
-        Dict with 'mse' and 'mae' keys.
+        Dict with keys ``mse``, ``mae`` always; ``mse_raw``, ``mae_raw`` when
+        ``scaler`` is provided.
     """
     mse = float(np.mean((y_true - y_pred) ** 2))
     mae = float(np.mean(np.abs(y_true - y_pred)))
-    return {"mse": mse, "mae": mae}
+    out: Dict[str, float] = {"mse": mse, "mae": mae}
+
+    if scaler is not None:
+        C = y_true.shape[-1]
+        flat_true = y_true.reshape(-1, C)
+        flat_pred = y_pred.reshape(-1, C)
+        raw_true = scaler.inverse_transform(flat_true)
+        raw_pred = scaler.inverse_transform(flat_pred)
+        out["mse_raw"] = float(np.mean((raw_true - raw_pred) ** 2))
+        out["mae_raw"] = float(np.mean(np.abs(raw_true - raw_pred)))
+
+    return out
 
 
 def compute_anomaly_metrics(

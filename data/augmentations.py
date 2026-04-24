@@ -11,6 +11,7 @@ Augmentation ordering is based on AutoCLS Table 8 (5 pre-defined orders).
 """
 
 import math
+import random
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -163,57 +164,23 @@ class FrequencyMasking(BaseAugmentation):
 
 
 class RandomCropping(BaseAugmentation):
-    """Generate two overlapping crops of the time series.
+    """Placeholder for crop — real logic lives in :class:`AugmentationPipeline`.
 
-    The shared (overlapping) segment spans a fraction p of the total length T.
-    Two crops are drawn such that they both contain this shared segment.
-
-    ``__call__`` returns a tuple ``(crop1, crop2, overlap_start, overlap_end)``
-    instead of a single tensor so that temporal contrast can align the two
-    views correctly.
-
-    When used inside :class:`AugmentationPipeline`, only the first crop is
-    returned as the augmented view; the second crop is tracked separately.
+    Only ``p`` (the overlap fraction) is stored.  The pipeline reads this
+    directly so it can sample a **shared** overlap and two asymmetric view
+    windows (TS2Vec / AutoCLS protocol).  Calling :meth:`_apply` is a
+    programming error — the pipeline special-cases the ``'crop'`` step.
 
     Args:
-        p: Fraction of T that forms the shared (overlapping) segment.
+        p: Overlap fraction.  ``0.0`` disables cropping (both views span the
+            full input).
     """
 
-    def __call__(  # type: ignore[override]
-        self, x: Tensor
-    ) -> Tuple[Tensor, Tensor, int, int]:
-        if self.p == 0.0:
-            return x, x, 0, x.shape[1]
-        return self._apply_crop(x)
-
-    def _apply(self, x: Tensor) -> Tensor:  # used by AugmentationPipeline
-        crop1, _, _, _ = self._apply_crop(x)
-        return crop1
-
-    def _apply_crop(self, x: Tensor) -> Tuple[Tensor, Tensor, int, int]:
-        B, T, C = x.shape
-        shared_len = max(1, int(round(T * self.p)))
-        # Shared segment starts somewhere that leaves room for both crops.
-        max_start = T - shared_len
-        if max_start <= 0:
-            return x, x, 0, T
-
-        overlap_start = torch.randint(0, max_start + 1, (1,)).item()
-        overlap_end = int(overlap_start) + shared_len
-
-        crop1 = x[:, :overlap_end, :]     # prefix crop — ends at overlap_end
-        crop2 = x[:, int(overlap_start):, :]  # suffix crop — starts at overlap_start
-
-        # Pad both crops to the original length T for shape consistency.
-        def pad_to(t: Tensor, target_len: int) -> Tensor:
-            pad_needed = target_len - t.shape[1]
-            if pad_needed > 0:
-                t = F.pad(t.permute(0, 2, 1), (0, pad_needed)).permute(0, 2, 1)
-            return t
-
-        crop1 = pad_to(crop1, T)
-        crop2 = pad_to(crop2, T)
-        return crop1, crop2, int(overlap_start), overlap_end
+    def _apply(self, x: Tensor) -> Tensor:  # pragma: no cover
+        raise RuntimeError(
+            "RandomCropping._apply must not be called directly — "
+            "AugmentationPipeline handles overlap-aligned cropping."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -255,25 +222,103 @@ class AugmentationPipeline:
             for name in self.order
         }
 
-    def _apply_chain(self, x: Tensor) -> Tensor:
-        """Apply all augmentations in sequence to produce one view."""
+    def _sample_view_windows(
+        self, T: int,
+    ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+        """Sample ``(overlap, view1, view2)`` windows in the TS2Vec style.
+
+        ``overlap = [ol, or)`` is the shared segment both views must cover.
+        ``view1 = [v1l, or)`` extends **left** of the overlap; ``view2 =
+        [ol, v2r)`` extends **right**.  When the two views are encoded
+        independently the overlap positions see different left/right
+        context — this is the core contrastive signal that TS2Vec and
+        AutoCLS both rely on.
+
+        When ``crop.p == 0`` (or T is too short) both views span the full
+        input and the slices degenerate to ``slice(0, T)``.
+
+        Args:
+            T: Input time length.
+
+        Returns:
+            ``((ol, or), (v1l, v1r), (v2l, v2r))``; each element is a pair
+            of integer indices into the input time axis.
+        """
+        crop_p = self.augmentations["crop"].p
+
+        if crop_p == 0.0 or T < 4:
+            return (0, T), (0, T), (0, T)
+
+        overlap_len = max(2, int(round(T * crop_p)))
+        if overlap_len >= T:
+            return (0, T), (0, T), (0, T)
+
+        overlap_left  = random.randint(0, T - overlap_len)
+        overlap_right = overlap_left + overlap_len
+
+        # View 1: extends left of overlap, right edge = overlap_right.
+        v1l = random.randint(0, overlap_left)
+        v1r = overlap_right
+
+        # View 2: extends right of overlap, left edge = overlap_left.
+        v2l = overlap_left
+        v2r = random.randint(overlap_right, T)
+
+        return (overlap_left, overlap_right), (v1l, v1r), (v2l, v2r)
+
+    def _apply_chain_with_view(
+        self, x: Tensor, view_window: Tuple[int, int],
+    ) -> Tensor:
+        """Apply all augmentations in order for one view.
+
+        At the ``'crop'`` step the tensor is **structurally sliced** to
+        ``x[:, vl:vr, :]`` using the pre-sampled view window — no zero
+        padding.  Other augmentations operate on whatever length of tensor
+        they happen to receive (augs before crop see the full T, augs after
+        crop see ``vr - vl``).  All existing augmentations are length-
+        polymorphic so this works transparently.
+
+        Args:
+            x: Input tensor of shape (B, T, C).
+            view_window: ``(vl, vr)`` — the view's absolute-time range.
+
+        Returns:
+            Augmented tensor of shape ``(B, vr - vl, C)`` (or ``(B, T, C)``
+            when crop is disabled).
+        """
+        vl, vr = view_window
         for name in self.order:
-            aug = self.augmentations[name]
-            if isinstance(aug, RandomCropping):
-                x = aug._apply(x)
+            if name == "crop":
+                x = x[:, vl:vr, :]
             else:
-                x = aug(x)
+                x = self.augmentations[name](x)
         return x
 
-    def __call__(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        """Generate two independently augmented views of *x*.
+    def __call__(
+        self, x: Tensor,
+    ) -> Tuple[Tensor, Tensor, slice, slice]:
+        """Generate two overlap-aligned augmented views of *x*.
+
+        The two returned tensors typically have **different time lengths**
+        (each view extends asymmetrically around the shared overlap).  The
+        two ``slice`` objects locate the overlap inside each view; the
+        downstream contrastive loss should apply them to the encoder
+        output so that positives are time-aligned in the original series.
 
         Args:
             x: Input tensor of shape (B, T, C).
 
         Returns:
-            Tuple (x1, x2) of independently augmented views, each (B, T, C).
+            Tuple ``(x1, x2, slice1, slice2)`` where ``x1[:, slice1]`` and
+            ``x2[:, slice2]`` correspond to the same absolute time range
+            ``[overlap_left, overlap_right)`` of the input.
         """
-        x1 = self._apply_chain(x)
-        x2 = self._apply_chain(x)
-        return x1, x2
+        T = x.shape[1]
+        (ol, or_), view1, view2 = self._sample_view_windows(T)
+
+        x1 = self._apply_chain_with_view(x, view1)
+        x2 = self._apply_chain_with_view(x, view2)
+
+        slice1 = slice(ol - view1[0], or_ - view1[0])
+        slice2 = slice(ol - view2[0], or_ - view2[0])
+        return x1, x2, slice1, slice2

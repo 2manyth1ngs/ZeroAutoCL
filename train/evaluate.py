@@ -197,15 +197,24 @@ def eval_forecasting(
     encoder.eval()
     padding = DEFAULT_PADDING
 
+    # Forecasting protocol: the encoder consumes the full (time-covariates +
+    # raw variables) tensor, but the downstream Ridge target and all metric
+    # computations operate on the raw variables only.  ``scaler`` — fit on
+    # the raw variables during data loading — lets us additionally report
+    # raw-space MSE/MAE so the numbers are directly comparable to TS2Vec /
+    # AutoCLS papers which publish post-inverse-transform metrics.
+    n_cov = int(getattr(train_data, "n_covariate_cols", 0))
+    scaler = getattr(train_data, "scaler", None)
+
     # ── Prefix encoding: concat train [+ val] + test, encode once, slice ──
     # With a causal sliding window this ensures that val/test timesteps near
     # the split boundaries see real preceding context rather than zero-pad.
-    x_tr_t = train_data.data          # (1, T_tr, C)
-    x_te_t = test_data.data           # (1, T_te, C)
+    x_tr_t = train_data.data          # (1, T_tr, C_full)
+    x_te_t = test_data.data           # (1, T_te, C_full)
     T_tr, T_te = x_tr_t.shape[1], x_te_t.shape[1]
 
     if val_data is not None:
-        x_va_t = val_data.data        # (1, T_va, C)
+        x_va_t = val_data.data        # (1, T_va, C_full)
         T_va = x_va_t.shape[1]
         full = torch.cat([x_tr_t, x_va_t, x_te_t], dim=1)
     else:
@@ -219,9 +228,11 @@ def eval_forecasting(
     h_va = h_full[T_tr : T_tr + T_va] if T_va > 0 else None
     h_te = h_full[T_tr + T_va : T_tr + T_va + T_te]
 
-    d_tr = x_tr_t[0].numpy()
-    d_te = x_te_t[0].numpy()
-    d_va = x_va_t[0].numpy() if T_va > 0 else None
+    # Strip covariate prefix from the regression targets — the time-feature
+    # channels were input-only aids for the encoder, never targets.
+    d_tr = x_tr_t[0, :, n_cov:].numpy()
+    d_te = x_te_t[0, :, n_cov:].numpy()
+    d_va = x_va_t[0, :, n_cov:].numpy() if T_va > 0 else None
 
     results: Dict[int, Dict[str, float]] = {}
     for H in horizons:
@@ -243,12 +254,23 @@ def eval_forecasting(
         lr   = fit_ridge(tr_f, tr_y, va_f, va_y)
         pred = lr.predict(te_f)
 
-        metrics = compute_forecasting_metrics(te_y, pred)
+        # Reshape (N, H*C_raw) → (N, H, C_raw) so the scaler sees C_raw cols.
+        C_raw = d_te.shape[-1]
+        te_y_mat = te_y.reshape(-1, H, C_raw)
+        pred_mat = pred.reshape(-1, H, C_raw)
+        metrics = compute_forecasting_metrics(te_y_mat, pred_mat, scaler=scaler)
         results[H] = metrics
-        logger.info(
-            "eval_forecasting H=%d: mse=%.4f  mae=%.4f",
-            H, metrics["mse"], metrics["mae"],
-        )
+        if "mse_raw" in metrics:
+            logger.info(
+                "eval_forecasting H=%d: mse=%.4f mae=%.4f  raw_mse=%.4f raw_mae=%.4f",
+                H, metrics["mse"], metrics["mae"],
+                metrics["mse_raw"], metrics["mae_raw"],
+            )
+        else:
+            logger.info(
+                "eval_forecasting H=%d: mse=%.4f  mae=%.4f",
+                H, metrics["mse"], metrics["mae"],
+            )
 
     return results
 

@@ -122,6 +122,8 @@ class TimeSeriesDataset(Dataset):
         max_len: Optional[int] = 2000,
         window_len: Optional[int] = None,
         window_stride: int = 1,
+        scaler: Optional[StandardScaler] = None,
+        n_covariate_cols: int = 0,
     ) -> None:
         if data.ndim != 3:
             raise ValueError(f"Expected data with ndim=3, got {data.ndim}")
@@ -136,6 +138,8 @@ class TimeSeriesDataset(Dataset):
             else None
         )
         self.task_type = task_type
+        self.scaler = scaler
+        self.n_covariate_cols = int(n_covariate_cols)
 
         # Optional sliding-window view for contrastive pretraining on long series.
         # Bug #001 fix: ETT-style datasets are stored as (1, T, C); without
@@ -293,26 +297,66 @@ def _load_natops(
     return train_x, train_y, test_x, test_y
 
 
+def _get_time_features(dt: pd.DatetimeIndex) -> np.ndarray:
+    """Extract 7 calendar features from a DatetimeIndex.
+
+    Mirrors ``reference/ts2vec/datautils.py::_get_time_features``.  These
+    features help the encoder capture daily / weekly seasonality that is
+    otherwise invisible after z-score normalisation of the target series.
+
+    Args:
+        dt: Pandas DatetimeIndex of length T.
+
+    Returns:
+        NumPy array of shape (T, 7) with columns
+        [minute, hour, dayofweek, day, dayofyear, month, week].
+    """
+    return np.stack([
+        dt.minute.to_numpy(),
+        dt.hour.to_numpy(),
+        dt.dayofweek.to_numpy(),
+        dt.day.to_numpy(),
+        dt.dayofyear.to_numpy(),
+        dt.month.to_numpy(),
+        dt.isocalendar().week.to_numpy(),
+    ], axis=1).astype(np.float32)
+
+
 def _load_ett(
     data_dir: str,
     name: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load an ETT dataset (ETTh1, ETTh2, ETTm1).
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler, int]:
+    """Load an ETT dataset (ETTh1, ETTh2, ETTm1) with time covariates.
+
+    The returned series are packed as ``(1, T, 7 + C_raw)`` where the first 7
+    channels are z-scored calendar features (minute/hour/dayofweek/day/
+    dayofyear/month/week) and the remaining channels are the raw variables.
+    This matches the TS2Vec / AutoCLS protocol (see
+    ``reference/ts2vec/datautils.py::load_forecast_csv``).
+
+    The returned scaler operates on the **raw variable columns only**, so it
+    can be used directly to inverse-transform Ridge predictions for raw-space
+    MSE/MAE reporting.
 
     Args:
         data_dir: Root data directory.
         name: One of 'ETTh1', 'ETTh2', 'ETTm1'.
 
     Returns:
-        train_data (1, T_tr, C), val_data (1, T_val, C), test_data (1, T_te, C)
-        Each is a single multivariate time series packed as (N=1, T, C).
+        ``(train_data, val_data, test_data, raw_scaler, n_covariate_cols)``
+        — the three arrays each have shape ``(1, T_split, 7 + C_raw)``,
+        ``raw_scaler`` is a :class:`StandardScaler` fit on the raw training
+        variables (shape ``(C_raw,)``), and ``n_covariate_cols == 7``.
     """
     csv_path = os.path.join(data_dir, f"{name}.csv")
-    df = pd.read_csv(csv_path)
-    if "date" in df.columns:
-        df = df.drop(columns=["date"])
+    df = pd.read_csv(csv_path, index_col="date", parse_dates=True)
 
-    data = df.values.astype(np.float32)  # (T_total, C)
+    # Time features come from the original DatetimeIndex, before any column
+    # manipulation.  They are always 7-wide regardless of univariate mode.
+    dt_feats = _get_time_features(df.index)             # (T_total, 7)
+    n_covariate_cols = dt_feats.shape[1]
+
+    data = df.values.astype(np.float32)                  # (T_total, C_raw_full)
 
     # Univariate protocol: keep only the OT column (last column of every ETT
     # CSV — the canonical target used by TS2Vec / AutoCLS for the headline
@@ -329,15 +373,23 @@ def _load_ett(
     else:
         splits = _ETT_HOURLY_SPLITS
 
-    scaler = StandardScaler().fit(data[splits["train"]])
-    data = scaler.transform(data)  # (T_total, C)
+    # Separate scalers: one for raw variables (used by inverse_transform in
+    # eval_forecasting), one for time features (internal only).
+    raw_scaler = StandardScaler().fit(data[splits["train"]])
+    tf_scaler = StandardScaler().fit(dt_feats[splits["train"]])
+    data_scaled = raw_scaler.transform(data)             # (T_total, C_raw)
+    dt_scaled = tf_scaler.transform(dt_feats)            # (T_total, 7)
 
-    # Wrap as (1, T, C) for consistency with the rest of the pipeline.
-    train_data = data[splits["train"]][np.newaxis]   # (1, T_tr, C)
-    val_data = data[splits["val"]][np.newaxis]        # (1, T_val, C)
-    test_data = data[splits["test"]][np.newaxis]      # (1, T_te, C)
+    # Concatenate: time features come FIRST, raw variables LAST — matches
+    # TS2Vec's convention so downstream code can select raw cols via
+    # ``data[:, :, n_covariate_cols:]``.
+    full = np.concatenate([dt_scaled, data_scaled], axis=-1).astype(np.float32)
 
-    return train_data, val_data, test_data
+    train_data = full[splits["train"]][np.newaxis]       # (1, T_tr, 7+C_raw)
+    val_data = full[splits["val"]][np.newaxis]
+    test_data = full[splits["test"]][np.newaxis]
+
+    return train_data, val_data, test_data, raw_scaler, n_covariate_cols
 
 
 def _ratio_split(
@@ -362,7 +414,7 @@ def _ratio_split(
 def _load_pems(
     data_dir: str,
     name: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
     """Load a PEMS traffic dataset (PEMS03, PEMS04, PEMS07, PEMS08).
 
     Expects ``{data_dir}/{name}.npz`` with a ``'data'`` key of shape
@@ -371,7 +423,9 @@ def _load_pems(
     multivariate time series, yielding shape ``(1, T, N)``.
 
     Returns:
-        train_data, val_data, test_data — each of shape ``(1, T_split, N)``.
+        ``(train_data, val_data, test_data, scaler)`` — each array has shape
+        ``(1, T_split, N)``.  ``scaler`` is fit on the training split and can
+        be used to inverse-transform raw-space predictions.
     """
     npz_path = os.path.join(data_dir, f"{name}.npz")
     raw = np.load(npz_path)["data"].astype(np.float32)  # (T, N, C)
@@ -391,12 +445,13 @@ def _load_pems(
         train_data[np.newaxis],
         val_data[np.newaxis],
         test_data[np.newaxis],
+        scaler,
     )
 
 
 def _load_pems_bay(
     data_dir: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
     """Load PEMS-BAY traffic speed dataset (325 sensors).
 
     Supports two common file formats:
@@ -406,7 +461,8 @@ def _load_pems_bay(
         ``(T, N, C)``.
 
     Returns:
-        train_data, val_data, test_data — each of shape ``(1, T_split, 325)``.
+        ``(train_data, val_data, test_data, scaler)`` — each array has shape
+        ``(1, T_split, 325)``.
     """
     h5_path  = os.path.join(data_dir, "pems-bay.h5")
     npz_path = os.path.join(data_dir, "PEMS-BAY.npz")
@@ -433,12 +489,13 @@ def _load_pems_bay(
         train_data[np.newaxis],
         val_data[np.newaxis],
         test_data[np.newaxis],
+        scaler,
     )
 
 
 def _load_exchange_rate(
     data_dir: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
     """Load Exchange Rate dataset.
 
     Expects ``{data_dir}/exchange_rates.csv`` (CSV with date column + 8 feature
@@ -497,12 +554,13 @@ def _load_exchange_rate(
         train_data[np.newaxis],
         val_data[np.newaxis],
         test_data[np.newaxis],
+        scaler,
     )
 
 
 def _load_electricity(
     data_dir: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
     """Load Electricity (ECL) dataset.
 
     Expects ``{data_dir}/electricity.csv`` with a date/timestamp column and
@@ -529,6 +587,7 @@ def _load_electricity(
         train_data[np.newaxis],
         val_data[np.newaxis],
         test_data[np.newaxis],
+        scaler,
     )
 
 
@@ -661,49 +720,76 @@ def load_dataset(
         splits["test"] = TimeSeriesDataset(test_x, test_y, task_type, max_len)
 
     elif name in ("ETTh1", "ETTh2", "ETTm1"):
-        train_data, val_data, test_data = _load_ett(data_dir, name)
+        train_data, val_data, test_data, scaler, n_cov = _load_ett(data_dir, name)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
             window_len=forecast_wl, window_stride=1,
+            scaler=scaler, n_covariate_cols=n_cov,
         )
-        splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
-        splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len,
+            scaler=scaler, n_covariate_cols=n_cov,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len,
+            scaler=scaler, n_covariate_cols=n_cov,
+        )
 
     elif name in ("PEMS03", "PEMS04", "PEMS07", "PEMS08"):
-        train_data, val_data, test_data = _load_pems(data_dir, name)
+        train_data, val_data, test_data, scaler = _load_pems(data_dir, name)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
             window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
         )
-        splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
-        splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
 
     elif name == "PEMS-BAY":
-        train_data, val_data, test_data = _load_pems_bay(data_dir)
+        train_data, val_data, test_data, scaler = _load_pems_bay(data_dir)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
             window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
         )
-        splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
-        splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
 
     elif name == "ExchangeRate":
-        train_data, val_data, test_data = _load_exchange_rate(data_dir)
+        train_data, val_data, test_data, scaler = _load_exchange_rate(data_dir)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
             window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
         )
-        splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
-        splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
 
     elif name == "Electricity":
-        train_data, val_data, test_data = _load_electricity(data_dir)
+        train_data, val_data, test_data, scaler = _load_electricity(data_dir)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
             window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
         )
-        splits["val"] = TimeSeriesDataset(val_data, None, task_type, max_len)
-        splits["test"] = TimeSeriesDataset(test_data, None, task_type, max_len)
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
 
     logger.info(
         "Loaded %s — train=%d, val=%d, test=%d",

@@ -22,11 +22,14 @@ def compute_similarity(a: Tensor, b: Tensor, method: str) -> Tensor:
     Args:
         a: Tensor of shape (..., D).
         b: Tensor of shape (..., D), same shape as *a*.
-        method: One of ``'dot'``, ``'cosine'``, ``'euclidean'``.
+        method: One of ``'dot'``, ``'cosine'``, ``'euclidean'``, ``'distance'``.
+            ``'distance'`` is an alias for ``'euclidean'`` — both return the
+            negated L2 distance so "higher = more similar" holds uniformly.
+            The alias matches AutoCLS Table 1 terminology.
 
     Returns:
         Similarity scores of shape (...).  Higher values indicate greater
-        similarity for all three methods (euclidean returns negative distance).
+        similarity for all methods.
 
     Raises:
         ValueError: If *method* is not recognised.
@@ -35,8 +38,8 @@ def compute_similarity(a: Tensor, b: Tensor, method: str) -> Tensor:
         return (a * b).sum(dim=-1)
     elif method == "cosine":
         return F.cosine_similarity(a, b, dim=-1)
-    elif method == "euclidean":
-        # Return negative distance so that "higher = more similar" holds.
+    elif method in ("euclidean", "distance"):
+        # Negated L2 so "higher = more similar" is consistent with dot/cosine.
         return -torch.norm(a - b, dim=-1)
     else:
         raise ValueError(f"Unknown similarity method: {method!r}")

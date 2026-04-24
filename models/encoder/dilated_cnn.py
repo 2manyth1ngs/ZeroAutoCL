@@ -143,6 +143,7 @@ class DilatedCNNEncoder(nn.Module):
     Architecture::
 
         input_fc        : Linear(input_dim → hidden_dim)
+        [training only] binomial / continuous timestamp mask on the latent
         blocks[0..n-1]  : ConvBlock(hidden_dim → hidden_dim, dilation=2^i)
         blocks[n]       : ConvBlock(hidden_dim → output_dim, dilation=2^n, final)
         repr_dropout    : Dropout(0.1)
@@ -152,7 +153,7 @@ class DilatedCNNEncoder(nn.Module):
     Args:
         input_dim: Number of input channels C (dataset-dependent).
         config: :class:`EncoderConfig` specifying n_layers, hidden_dim,
-            output_dim.  If omitted the default config is used.
+            output_dim, mask_mode.  If omitted the default config is used.
     """
 
     def __init__(
@@ -168,6 +169,7 @@ class DilatedCNNEncoder(nn.Module):
         n_layers = config.n_layers
         hidden_dim = config.hidden_dim
         output_dim = config.output_dim
+        self.mask_mode: str = config.mask_mode
 
         # ── Input projection (Linear, matches TS2Vec input_fc) ───────────
         self.input_fc = nn.Linear(input_dim, hidden_dim)
@@ -191,6 +193,35 @@ class DilatedCNNEncoder(nn.Module):
         # ── Repr dropout (single, at the end — matches TS2Vec) ──────────
         self.repr_dropout = nn.Dropout(p=0.1)
 
+    # ------------------------------------------------------------------
+    # Timestamp-level mask helpers (training only)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _gen_binomial_mask(B: int, T: int, device: torch.device, p: float = 0.5) -> Tensor:
+        """Per-(b, t) Bernoulli(p) mask: True keeps, False zeros out."""
+        return torch.bernoulli(torch.full((B, T), p, device=device)).bool()
+
+    @staticmethod
+    def _gen_continuous_mask(
+        B: int, T: int, device: torch.device,
+        n_spans: int = 5, span_frac: float = 0.1,
+    ) -> Tensor:
+        """Mask several short consecutive spans (TS2Vec-style)."""
+        span_len = max(int(span_frac * T), 1)
+        n = max(min(n_spans, T // 2), 1)
+        mask = torch.ones(B, T, dtype=torch.bool, device=device)
+        if T - span_len + 1 <= 0:
+            return mask
+        # Vectorised: sample n random start indices per batch row.
+        starts = torch.randint(0, T - span_len + 1, (B, n), device=device)
+        # Build (B, n, span_len) absolute indices and scatter False.
+        offsets = torch.arange(span_len, device=device).view(1, 1, -1)
+        idx = (starts.unsqueeze(-1) + offsets).reshape(B, -1)  # (B, n*span_len)
+        rows = torch.arange(B, device=device).unsqueeze(-1).expand_as(idx)
+        mask[rows, idx] = False
+        return mask
+
     def forward(self, x: Tensor) -> Tensor:
         """Encode a batch of time series.
 
@@ -200,12 +231,39 @@ class DilatedCNNEncoder(nn.Module):
         Returns:
             Embedding tensor of shape (B, T, output_dim).
         """
-        h = self.input_fc(x)              # (B, T, hidden_dim)
-        h = h.transpose(1, 2)             # (B, hidden_dim, T)
+        # ── NaN handling (aligned with TS2Vec TSEncoder) ────────────────
+        # Timesteps with any NaN feature get a "missing" flag so the
+        # mask interaction is correct.  No-op on clean data.
+        nan_mask: Tensor | None = None
+        if torch.isnan(x).any():
+            nan_mask = ~torch.isnan(x).any(dim=-1)   # (B, T), True = real
+            x = torch.where(nan_mask.unsqueeze(-1), x, torch.zeros_like(x))
+
+        h = self.input_fc(x)                          # (B, T, hidden_dim)
+
+        # ── Training-time timestamp-level mask ──────────────────────────
+        if self.training and self.mask_mode != "none":
+            B, T, _ = h.shape
+            if self.mask_mode == "binomial":
+                mask = self._gen_binomial_mask(B, T, h.device, p=0.5)
+            elif self.mask_mode == "continuous":
+                mask = self._gen_continuous_mask(B, T, h.device)
+            else:
+                raise ValueError(f"Unknown mask_mode: {self.mask_mode!r}")
+            if nan_mask is not None:
+                mask = mask & nan_mask
+            h = torch.where(mask.unsqueeze(-1), h, torch.zeros_like(h))
+        elif nan_mask is not None:
+            # Even at eval, propagate NaN positions as zeros (they already
+            # were zeroed above; this branch keeps parity with TS2Vec which
+            # zero-masks before the conv stack).
+            h = torch.where(nan_mask.unsqueeze(-1), h, torch.zeros_like(h))
+
+        h = h.transpose(1, 2)                         # (B, hidden_dim, T)
         h = self.repr_dropout(
             self.feature_extractor(h)
-        )                                  # (B, output_dim, T)
-        return h.transpose(1, 2)           # (B, T, output_dim)
+        )                                              # (B, output_dim, T)
+        return h.transpose(1, 2)                      # (B, T, output_dim)
 
     @classmethod
     def from_config_dict(cls, input_dim: int, config_dict: dict) -> "DilatedCNNEncoder":
@@ -213,7 +271,8 @@ class DilatedCNNEncoder(nn.Module):
 
         Args:
             input_dim: Number of input channels.
-            config_dict: Dict with keys 'n_layers', 'hidden_dim', 'output_dim'.
+            config_dict: Dict with keys 'n_layers', 'hidden_dim', 'output_dim',
+                and optionally 'mask_mode'.
 
         Returns:
             Initialised :class:`DilatedCNNEncoder`.
