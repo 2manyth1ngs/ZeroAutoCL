@@ -42,15 +42,31 @@
 # This matches AutoCTS++ ``sample_num=20`` (reference/AutoCTS_plusplus/
 # exps/generate_seeds.py L94-103).  Across 6 source tasks → 360 records.
 #
+# Mode-specific iter budget (CLAUDE_ADV §12 calibration, 2026-04-25):
+# YAML ``dataset_budgets[*].noisy_pretrain_iters: 200`` cuts the noisy
+# stages (B.1a + B.1b) to 1/3 of the clean budget without crossing the
+# calibrated ranking-quality cliff (Spearman ρ=0.905 / pairwise
+# concordance=0.947 already at ≈1 epoch ≈ 240 iters on ETTh2).
+# Override via ``--noisy_pretrain_iters N`` if you re-calibrate per-dataset.
+#
 # Wall-clock estimate (RTX 4090, 24 GB):
-#   Stage A     : 36 encoders × 6 sources × ~3 min  ≈ 11 h
-#   Stage B.1a  : 20 × 6 × ~5  min  ≈ 10 h
-#   Stage B.1b  : 20 × 6 × ~5  min  ≈ 10 h
-#   Stage B.1c  : 20 × 6 × ~6  min  ≈ 12 h
+#   Stage A     : 27 encoders × 3 sources × ~1.6 min ≈  2.2 h *
+#   Stage B.1a  : 20 × 6 × ~1.7 min ≈ 3.4 h         **(was 10 h @ 600 iters)**
+#   Stage B.1b  : 20 × 6 × ~1.7 min ≈ 3.4 h         **(was 10 h @ 600 iters)**
+#   Stage B.1c  : 20 × 6 × ~6   min ≈ 12 h
 #   Stage B.2+3 : ≤ 1 h
 #   Phase 4     : 15 finalists × ~45 min ≈ 11 h
 #                                          -------
-#                                           ≈ 55 h  (headroom under 72 h)
+#                                          ≈ 33 h  (was 46 h before §12 fix)
+#
+# * Stage A speedups (vs. previous 11 h estimate):
+#     - n_layers=4 dropped from ENCODER_CHOICES   (36 → 27 encoders, -25%)
+#     - STAGE_A_SOURCES reduced from 6 → 3        (representative split, -50%)
+#     - YAML two_stage_search.encoder_grid.pretrain_iters: 300  (-50% train)
+#     - YAML two_stage_search.encoder_grid.eval_horizons: [24,168,336]
+#       drops H=720 + H=48                        (cheaper Ridge fits)
+#   Seed gen (B.1c clean) and Phase 4 still use full 6-source set + 600-iter
+#   budget; only the noisy stages (B.1a/b) consume the 200-iter knob.
 #
 # Resume mode: every stage skips itself if its output file exists.  Delete
 # the specific file (or the whole ``${OUT_DIR}``) to force a re-run.
@@ -115,8 +131,17 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 nvidia-smi
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available(), '| dev:', torch.cuda.get_device_name(0), '| vram_gb:', round(torch.cuda.get_device_properties(0).total_memory/1e9, 1))"
 
-# Source datasets for Stages A and B.1 (target ETTh1 is excluded — strict zero-shot).
+# Source datasets for Stage B.1 (target ETTh1 is excluded — strict zero-shot).
 SOURCES=(ETTh2 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate)
+
+# Stage A only needs a coarse encoder ranking, so we use a 3-source
+# representative subset instead of all 6:
+#   PEMS04        → wide multivariate (307 vars, traffic)
+#   ExchangeRate  → narrow multivariate (8 vars, finance)
+#   ETTh2         → ETT-style (7 vars, energy; closest to target ETTh1)
+# These three span the channel-count and domain-distribution diversity of
+# the full source pool. Seed generation (B.1*) keeps the full 6-source set.
+STAGE_A_SOURCES=(PEMS04 ExchangeRate ETTh2)
 
 # Read CLI-driven scalars from YAML once.
 N_PER_DATASET=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['two_stage_search']['cl_strategy_search']['n_per_dataset'])")
@@ -125,7 +150,9 @@ TOP_K_STR=$(python -c    "import yaml; c=yaml.safe_load(open('${CONFIG}', encodi
 echo "YAML scalars   : n_per_dataset=${N_PER_DATASET}  top_k_enc=${TOP_K_ENC}  top_k_strategies=${TOP_K_STR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage A — encoder grid search (36 encoders × |SOURCES| under GGS_STRATEGY)
+# Stage A — encoder grid search (27 encoders × |STAGE_A_SOURCES| under
+# GGS_STRATEGY; pretrain_iters / eval_horizons overridden via YAML
+# ``two_stage_search.encoder_grid``).
 # ─────────────────────────────────────────────────────────────────────────────
 echo
 echo "═══════ Stage A: encoder grid search ═══════"
@@ -136,7 +163,7 @@ else
         --data_dir "${DATA_DIR}" \
         --save_dir "${OUT_DIR}" \
         --config   "${CONFIG}" \
-        --datasets "${SOURCES[@]}" \
+        --datasets "${STAGE_A_SOURCES[@]}" \
         --seed     "${SEED}" \
         > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi

@@ -45,6 +45,49 @@ seed_generation:
   # Keeps peak VRAM well under 24 GB even when temporal=True is sampled.
   max_temporal_len: 200
 
+# AutoCTS++ §3.2.4 task-enrichment knobs for forecasting source datasets.
+# Two complementary axes:
+#
+#   • n_time_windows  — slice each source's full series into N non-overlapping
+#                       temporal segments (each segment becomes its own
+#                       sub-task with a fresh 80/20 train/val split).
+#                       Each window costs one CL pre-training run, so total
+#                       compute scales linearly.  Default 1 = no slicing.
+#
+#   • horizon_groups  — list of horizon sets used at downstream eval time.
+#                       Each group emits its own seed record but shares the
+#                       CL pre-train, so this axis is essentially free.
+#                       null = single canonical [24,48,168,336,720] eval.
+#
+# Total sub-tasks per source = n_time_windows × len(horizon_groups).
+# Total CL pre-trainings per source = n_time_windows × n_per_dataset
+# (horizon groups reuse the trained encoder).
+forecasting_task_variants:
+  n_time_windows: 1
+  horizon_groups: null
+  min_window_len: 1000        # skip slicing when window < this many timesteps
+
+  # Variable-subsampling axis (mirrors AutoCTS++ dataset_slice.py rate buckets,
+  # minus the adjacency-matrix reconstruction — ZeroAutoCL's dilated CNN
+  # encoder doesn't consume adjacency).  Wide datasets (PEMS series, 170-883
+  # vars) benefit most.  Narrow datasets (ETT in univariate mode = 1 raw var,
+  # ExchangeRate = 8) silently skip subsampling when raw_var_count <
+  # ``min_var_count``.  Per-source variable indices are deterministic (seeded
+  # by ``--seed`` + base dataset name) so seed-gen and comparator pretrain
+  # see identical sub-task definitions.
+  n_variable_subsets: 1                # 1 = disabled; ≥2 enables subsampling
+  var_size_rates: [0.25, 0.5, 0.75]    # fractional bucket centres
+  min_var_count: 4                     # skip sources with fewer raw vars
+
+  # Example: 3 windows × 3 var-subsets × 2 horizon-groups = 18 sub-tasks
+  # per *wide* source (PEMS), 3 × 1 × 2 = 6 sub-tasks per *narrow* source
+  # (ETT univariate, ExchangeRate).
+  # n_time_windows: 3
+  # n_variable_subsets: 3
+  # horizon_groups:
+  #   - [24, 48, 168]           # short / mid horizons
+  #   - [336, 720]               # long horizons
+
 # Per-dataset training budget (Bug #003a).
 #
 # Forecasting datasets (ETT*) suffer from train→val→test distribution drift,
@@ -54,30 +97,50 @@ seed_generation:
 #
 # Classification / anomaly datasets keep epoch-based training and use
 # val-best checkpointing (val signal is reliable for them).
+#
+# Mode-specific budget (AutoCTS++ §3.2.4 cheaper-noisy stage; CLAUDE_ADV
+# §12 calibration anchor):
+#
+#   - ``noisy_pretrain_iters``  : iter budget when ``mode='noisy'``.
+#   - ``noisy_pretrain_epochs`` : epoch budget when ``mode='noisy'``.
+#
+# Either alone is sufficient.  When both keys are absent, noisy mode falls
+# back to the base ``pretrain_iters`` / ``pretrain_epochs`` (preserves
+# legacy behaviour where noisy and clean shared the same budget).
+#
+# The 200-iter default is calibrated on ETTh2 (CLAUDE_ADV §12.4):
+# Spearman ρ=0.905 / pairwise concordance=0.947 already at ~1 epoch
+# (≈ 240 iters).  200 iters is a 3× cost cut vs the 600-iter clean budget
+# while staying inside the calibrated regime for ETT-scale data.
+# **Per-dataset tuning may still be required for PEMS-scale data** —
+# 200 iters at batch 32 on PEMS04 (~10k train samples) is only ~0.6 epoch.
+# If a re-calibration shows ρ < 0.6 there, raise to 300-400.
 dataset_budgets:
   # ── Forecasting (target pool) ──────────────────────────────────────────────
-  ETTh1:        { pretrain_iters: 600 }
-  ETTm1:        { pretrain_iters: 600 }
+  ETTh1:        { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  ETTm1:        { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   # ── Forecasting (source pool) ──────────────────────────────────────────────
-  ETTh2:        { pretrain_iters: 600 }
-  PEMS03:       { pretrain_iters: 600 }
-  PEMS04:       { pretrain_iters: 600 }
-  PEMS07:       { pretrain_iters: 600 }
-  PEMS08:       { pretrain_iters: 600 }
-  PEMS-BAY:     { pretrain_iters: 600 }
-  ExchangeRate: { pretrain_iters: 600 }
+  ETTh2:        { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  PEMS03:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  PEMS04:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  PEMS07:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  PEMS08:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  PEMS-BAY:     { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  ExchangeRate: { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   # ── Classification (iter-based for Stage A / B, epoch-based only in Phase 4) ─
   # SleepEEG has ~23k train samples vs Epilepsy's ~250; epoch-based budgets
   # cause 90× iteration disparity (Bug #006).  Iter-based budgets normalise
   # wall-clock cost across datasets.  Phase 4 (run_phase4_finalists_cls.py)
   # reads only pretrain_epochs and ignores pretrain_iters, so it still uses
   # epoch-based training with val-best checkpointing as intended.
-  HAR:          { pretrain_iters: 600, pretrain_epochs: 40 }
-  Epilepsy:     { pretrain_iters: 600, pretrain_epochs: 40 }
-  SleepEEG:     { pretrain_iters: 600, pretrain_epochs: 40 }
-  Gesture:      { pretrain_iters: 600, pretrain_epochs: 40 }
-  NATOPS:       { pretrain_iters: 600, pretrain_epochs: 40 }
+  HAR:          { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
+  Epilepsy:     { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
+  SleepEEG:     { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
+  Gesture:      { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
+  NATOPS:       { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
   # ── Anomaly detection (epoch-based) ──────────────────────────────────────
+  # Calibration didn't cover anomaly detection; leaving noisy at base budget
+  # until a separate calibration anchors the 1/3-cut decision.
   Yahoo:        { pretrain_epochs: 40 }
   KPI:          { pretrain_epochs: 40 }
 
@@ -134,6 +197,20 @@ two_stage_search:
     sources: [PEMS03, PEMS04, PEMS07, PEMS08, ExchangeRate, ETTm1]
     save_path: outputs/full_etth1_two_stage/encoder_grid.json
     top_k_enc: 3                # K_enc
+    # ── Stage-A-specific cost knobs (used ONLY by run_encoder_grid.py) ──
+    # Stage A only needs a stable top-K rank, not full convergence.
+    # ``pretrain_iters`` overrides each source's ``dataset_budgets`` value
+    # for Stage A only — seed generation (B.1a/b/c) keeps its full budget.
+    # 300 iters ≈ half of the 600-iter seed budget; NAS literature shows
+    # ranks stabilise well before full convergence.
+    pretrain_iters: 300
+    # ``eval_horizons`` overrides the canonical [24, 48, 168, 336, 720]
+    # used by ``train.evaluate.eval_forecasting``. Dropping H=720 saves
+    # the most expensive Ridge fit (target dim H × C_raw is largest there);
+    # dropping H=48 removes redundancy with H=24. The remaining
+    # [24, 168, 336] still spans short / mid / long range, preserving rank
+    # discrimination across encoder capacities.
+    eval_horizons: [24, 168, 336]
 
   cl_strategy_search:
     n_per_dataset: 20           # mirrors seed_generation.n_per_dataset (AutoCTS++ default)

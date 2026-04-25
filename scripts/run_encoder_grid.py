@@ -1,9 +1,16 @@
 """Stage A of Plan B: encoder grid search under fixed GGS strategy.
 
-For every encoder configuration in ``ENCODER_CHOICES`` (36 total) and every
-source dataset listed in ``two_stage_search.encoder_grid.sources``, train
-under :data:`GGS_STRATEGY` and write the aggregated ranking to
-``encoder_grid.json``.
+For every encoder configuration in ``ENCODER_GRID_CHOICES`` (27 total) and
+every source dataset listed in ``two_stage_search.encoder_grid.sources`` (or
+the ``--datasets`` CLI override), train under :data:`GGS_STRATEGY` and write
+the aggregated ranking to ``encoder_grid.json``.
+
+YAML overrides honoured (under ``two_stage_search.encoder_grid``):
+  * ``pretrain_iters``  — replaces every source's per-dataset iter budget
+    for Stage A only (seed generation keeps the original budget).
+  * ``eval_horizons``   — list of forecasting horizons used at the
+    per-candidate ``_quick_eval``.  ``None`` keeps the canonical
+    ``[24, 48, 168, 336, 720]``.
 
 Usage
 -----
@@ -71,6 +78,25 @@ def main() -> None:
         ds: dict(yaml_budgets.get(ds, {"pretrain_iters": 600})) for ds in sources
     }
 
+    # Stage-A-specific overrides from `two_stage_search.encoder_grid`.
+    # When set, ``pretrain_iters`` replaces every source's per-dataset
+    # iter budget (Stage A only — seed generation reads the original
+    # ``dataset_budgets`` block). ``eval_horizons`` is forwarded directly
+    # to the per-candidate forecasting eval.
+    grid_iters_override = grid_cfg.get("pretrain_iters")
+    if grid_iters_override is not None:
+        grid_iters_override = int(grid_iters_override)
+        for ds in dataset_budgets:
+            dataset_budgets[ds]["pretrain_iters"] = grid_iters_override
+        logger.info(
+            "[stage-A] pretrain_iters override: %d (applied to all sources)",
+            grid_iters_override,
+        )
+
+    eval_horizons = grid_cfg.get("eval_horizons")
+    if eval_horizons is not None:
+        eval_horizons = [int(h) for h in eval_horizons]
+
     device = torch.device(args.device) if args.device else None
 
     logger.info("[stage-A] sources=%s", sources)
@@ -87,6 +113,7 @@ def main() -> None:
         device=device,
         seed=args.seed,
         crop_len=crop_len,
+        eval_horizons=eval_horizons,
     )
 
 

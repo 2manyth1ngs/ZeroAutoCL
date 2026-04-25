@@ -20,6 +20,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from data.dataset import TimeSeriesDataset, load_dataset
+from data.dataset_slicer import (
+    ForecastingSubTask,
+    build_task_id,
+    make_forecasting_subtasks,
+)
 from models.encoder.encoder_config import EncoderConfig
 from models.encoder.dilated_cnn import DilatedCNNEncoder
 from models.contrastive.cl_pipeline import CLPipeline
@@ -43,6 +48,67 @@ def _fmt_hms(seconds: float) -> str:
     if h > 0:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _resolve_mode_budget(
+    ds_budget: Dict,
+    mode: str,
+    default_epochs: int,
+) -> Tuple[int, int]:
+    """Pick the (pretrain_iters, pretrain_epochs) pair for a (dataset, mode).
+
+    AutoCTS++'s ``noisy_seeds`` stage runs a 20× shorter training schedule
+    than ``clean_seeds`` (5 vs 100 epochs, ``reference/AutoCTS_plusplus/
+    exps/generate_seeds.py:94-103``).  ZeroAutoCL mirrors this via two
+    optional keys in the per-dataset budget dict:
+
+      - ``noisy_pretrain_iters``:  iter budget when ``mode == 'noisy'``
+      - ``noisy_pretrain_epochs``: epoch budget when ``mode == 'noisy'``
+
+    Resolution rule (in order):
+
+      1. If ``mode != 'noisy'`` → use base ``pretrain_iters`` /
+         ``pretrain_epochs``.
+      2. If ``mode == 'noisy'`` AND at least one ``noisy_*`` key is set →
+         compose the noisy budget.  ``noisy_pretrain_iters`` (when set)
+         drives iter mode; ``noisy_pretrain_epochs`` (when set) is the
+         epoch fallback.  Either alone is sufficient — the missing axis
+         falls back to its base counterpart so downstream
+         ``contrastive_pretrain`` still has a meaningful epoch count for
+         logging even in iter mode.
+      3. ``mode == 'noisy'`` with no ``noisy_*`` keys → fall back to base
+         budget (preserves backward compatibility with old YAML files).
+
+    Args:
+        ds_budget: One source's budget dict (may contain ``pretrain_iters``,
+            ``pretrain_epochs``, ``noisy_pretrain_iters``,
+            ``noisy_pretrain_epochs``).
+        mode: ``'noisy'`` or ``'clean'``.
+        default_epochs: Fallback epoch count (the seed_generator-level
+            default) when neither base nor mode-specific epochs are given.
+
+    Returns:
+        ``(pretrain_iters, pretrain_epochs)`` — pass directly to
+        :func:`_evaluate_candidate`.  ``pretrain_iters > 0`` engages
+        iter-budget mode inside :func:`contrastive_pretrain`; otherwise
+        the call runs ``pretrain_epochs`` epochs.
+    """
+    base_iters  = int(ds_budget.get("pretrain_iters", 0))
+    base_epochs = int(ds_budget.get("pretrain_epochs", default_epochs))
+
+    if mode != "noisy":
+        return base_iters, base_epochs
+
+    has_noisy = (
+        "noisy_pretrain_iters"  in ds_budget
+        or "noisy_pretrain_epochs" in ds_budget
+    )
+    if not has_noisy:
+        return base_iters, base_epochs
+
+    noisy_iters  = int(ds_budget.get("noisy_pretrain_iters",  0))
+    noisy_epochs = int(ds_budget.get("noisy_pretrain_epochs", base_epochs))
+    return noisy_iters, noisy_epochs
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +148,9 @@ def _evaluate_candidate(
     device: torch.device,
     pretrain_iters: int = 0,
     mode: str = "clean",
-) -> float:
-    """Train one candidate and return its validation performance.
+    horizon_groups: Optional[List[Optional[List[int]]]] = None,
+) -> List[float]:
+    """Train one candidate and return its validation performance(s).
 
     Delegates to :func:`train.pretrain.contrastive_pretrain` so that the
     iter-budget mechanism (Bug #003a) and the task-aware val-best gating
@@ -102,11 +169,25 @@ def _evaluate_candidate(
       best-of-N estimator that naturally attenuates per-epoch seed noise;
       used for the comparator's pretraining stage.
 
+    Args:
+        horizon_groups: When the task is forecasting and clean mode is
+            active, evaluate the trained encoder once per horizon list and
+            return a perf score per group.  ``None`` (or ``[None]``) keeps
+            the legacy single-eval behaviour.  In noisy mode the parameter
+            is ignored and a single value is returned (per-epoch eval inside
+            ``contrastive_pretrain`` already costs a horizon set; supporting
+            multi-group there would re-run the whole CL loop per group).
+
     Returns:
-        Primary metric value (higher = better).  Returns ``-1e9`` on failure
-        (e.g. OOM).
+        List of perf values, one per horizon group (always length 1 for
+        non-forecasting tasks or noisy mode).  Returns ``[-1e9, ...]`` of
+        the same length on training failure.
     """
     from train.pretrain import contrastive_pretrain
+
+    if not horizon_groups:
+        horizon_groups = [None]
+    n_groups = len(horizon_groups)
 
     input_dim = train_dataset.n_channels
 
@@ -146,7 +227,7 @@ def _evaluate_candidate(
         )
     except Exception as exc:                           # pragma: no cover
         logger.warning("contrastive_pretrain failed for candidate: %s", exc)
-        return -1e9
+        return [-1e9] * n_groups
 
     # ── Noisy mode: best-of-N across training epochs ──────────────────
     if mode == "noisy" and history is not None:
@@ -154,7 +235,10 @@ def _evaluate_candidate(
         if scores:
             # val_score is already "higher = better" (for forecasting it is
             # -MSE averaged over the requested horizons).  Max = best epoch.
-            return float(max(scores))
+            best = float(max(scores))
+            # Noisy mode produces a single best-of-N estimate — broadcast it
+            # to every requested horizon group so callers can stay uniform.
+            return [best] * n_groups
         logger.warning(
             "mode=noisy but no per-epoch val_scores recorded; "
             "falling back to _quick_eval on the final encoder.",
@@ -162,8 +246,14 @@ def _evaluate_candidate(
 
     # ── Clean mode (or noisy fallback): eval the final encoder ────────
     encoder.eval()
-    performance = _quick_eval(encoder, train_dataset, val_dataset, task_type, device)
-    return performance
+    perfs: List[float] = []
+    for hg in horizon_groups:
+        perf = _quick_eval(
+            encoder, train_dataset, val_dataset, task_type, device,
+            horizons=hg,
+        )
+        perfs.append(perf)
+    return perfs
 
 
 def _quick_eval(
@@ -172,21 +262,28 @@ def _quick_eval(
     val_dataset: TimeSeriesDataset,
     task_type: str,
     device: torch.device,
+    horizons: Optional[List[int]] = None,
 ) -> float:
     """Lightweight downstream evaluation for seed generation.
 
     Task-wise metrics (all return "higher = better"):
 
     - ``classification``: SVM accuracy on time-pooled embeddings.
-    - ``forecasting``: negative mean MAE across the full horizon set
-      ``[24, 48, 168, 336, 720]`` under the TS2Vec-aligned protocol
-      (causal sliding encode + multi-step Ridge with α picked on a val
-      tail).  P1-A: switched from H=24 MSE to all-horizons MAE so the
-      comparator supervision reflects both short and long-range forecasting
-      quality and has less heavy-tail noise.  Horizons that do not fit the
-      series length are skipped automatically by :func:`eval_forecasting`.
+    - ``forecasting``: negative mean MAE across the supplied horizon set
+      (``None`` → canonical ``[24, 48, 168, 336, 720]``) under the
+      TS2Vec-aligned protocol (causal sliding encode + multi-step Ridge
+      with α picked on a val tail).  P1-A: switched from H=24 MSE to
+      all-horizons MAE so the comparator supervision reflects both short
+      and long-range forecasting quality and has less heavy-tail noise.
+      Horizons that do not fit the series length are skipped automatically
+      by :func:`eval_forecasting`.
     - ``anomaly_detection``: mean embedding-std as a proxy (higher = more
       structured representation).
+
+    Args:
+        horizons: Optional explicit horizon list for forecasting eval.
+            ``None`` keeps the legacy canonical set.  Used by the horizon-
+            variation pathway (one CL pre-train, multiple downstream evals).
     """
     from sklearn.svm import SVC
     import numpy as np
@@ -223,7 +320,7 @@ def _quick_eval(
                 encoder=encoder,
                 train_data=train_dataset,
                 test_data=val_dataset,
-                horizons=None,            # full [24, 48, 168, 336, 720]
+                horizons=horizons,        # None → canonical [24,48,168,336,720]
                 device=device,
             )
             if not m:
@@ -262,6 +359,12 @@ def generate_seeds(
     crop_len: Optional[int] = None,
     mode: str = "clean",
     randomise_init: bool = False,
+    n_time_windows: int = 1,
+    horizon_groups: Optional[List[Optional[List[int]]]] = None,
+    min_window_len: int = 1000,
+    n_variable_subsets: int = 1,
+    var_size_rates: Optional[List[float]] = None,
+    min_var_count: int = 4,
 ) -> List[SeedRecord]:
     """Generate seed data across source datasets.
 
@@ -298,7 +401,11 @@ def generate_seeds(
 
             This matches AutoCTS++'s two-stage ``noisy_seeds`` /
             ``clean_seeds`` recipe (``reference/AutoCTS_plusplus/exps/
-            generate_seeds.py:94-103``).
+            generate_seeds.py:94-103``).  When ``mode='noisy'`` and the
+            per-dataset budget dict contains ``noisy_pretrain_iters`` or
+            ``noisy_pretrain_epochs``, those replace the base budget for
+            this run (see :func:`_resolve_mode_budget`).  Falls back to
+            the base budget when mode-specific keys are absent.
         randomise_init: When True, every candidate gets a fresh seed from
             system entropy (``random.SystemRandom``) rather than the
             deterministic ``seed + i`` derivation.  Use this for a
@@ -306,9 +413,39 @@ def generate_seeds(
             (AutoCTS++ ``use_seed=False`` branch), so that the comparator
             sees pairs from different initialisations and learns to rank
             under seed noise.
+        n_time_windows: Number of non-overlapping temporal windows to carve
+            out of each forecasting source dataset (AutoCTS++-style
+            subset enrichment).  ``1`` (default) preserves the original
+            single-task-per-dataset behaviour.  ``>1`` multiplies the seed
+            count linearly because each window re-runs CL pretraining.
+        horizon_groups: List of horizon sets used at downstream eval time
+            (one seed record per group).  ``None`` or ``[None]`` keeps the
+            canonical ``[24,48,168,336,720]`` eval.  Horizon groups share
+            the CL pretrain (one fit, ``len(horizon_groups)`` evals) so
+            this axis is essentially free in compute.  Ignored for noisy
+            mode (a single best-of-N value is broadcast to all groups).
+        min_window_len: Minimum per-window length required to enable
+            time-window slicing — falls back to a single window if the
+            source dataset is too short.
+        n_variable_subsets: AutoCTS++-style variable subsampling — number of
+            random subsets of raw-variable channels per (window).  ``1``
+            (default) disables; ``≥2`` engages stratified bucket sampling.
+            Datasets with fewer than ``min_var_count`` raw variables (e.g.
+            ETT in univariate mode) silently bypass this axis.  Composes
+            multiplicatively with ``n_time_windows`` — a source produces
+            up to ``n_time_windows × n_variable_subsets`` sub-tasks, each
+            requiring its own CL pre-training run.
+        var_size_rates: Fractional bucket centres for variable-subset sizing
+            (defaults to ``[0.25, 0.5, 0.75]`` inside
+            :func:`make_forecasting_subtasks`).
+        min_var_count: Minimum raw-variable channel count required to
+            enable variable subsampling for a given source.
 
     Returns:
-        List of all :class:`SeedRecord` objects.
+        List of all :class:`SeedRecord` objects.  Length is
+        ``len(source_datasets) × n_per_dataset × n_time_windows ×
+        n_variable_subsets × len(horizon_groups)`` (modulo sub-tasks
+        skipped for being too short or having too few variables).
     """
     if mode not in ("clean", "noisy"):
         raise ValueError(f"mode must be 'clean' or 'noisy', got {mode!r}")
@@ -316,6 +453,13 @@ def generate_seeds(
     set_seed(seed)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Resolve task-variant axes once so logging and ID building stay consistent.
+    if not horizon_groups:
+        horizon_groups = [None]
+    has_windows = n_time_windows > 1
+    has_var_subsets = n_variable_subsets > 1
+    has_hg = not (len(horizon_groups) == 1 and horizon_groups[0] is None)
 
     # AutoCTS++-style per-candidate seeding:
     #   - randomise_init=False → deterministic ``seed + i`` (default);
@@ -326,9 +470,18 @@ def generate_seeds(
     _sys_random = _random_mod.SystemRandom()
 
     logger.info(
-        "[generate_seeds] mode=%s  randomise_init=%s  n_per_dataset=%d",
+        "[generate_seeds] mode=%s  randomise_init=%s  n_per_dataset=%d  "
+        "n_time_windows=%d  n_variable_subsets=%d  n_horizon_groups=%d",
         mode, randomise_init, n_per_dataset,
+        n_time_windows, n_variable_subsets, len(horizon_groups),
     )
+    if has_hg:
+        logger.info("[generate_seeds] horizon_groups=%s", horizon_groups)
+    if has_var_subsets:
+        logger.info(
+            "[generate_seeds] var_size_rates=%s  min_var_count=%d",
+            var_size_rates, min_var_count,
+        )
 
     if fixed_encoders is not None:
         logger.info(
@@ -339,93 +492,155 @@ def generate_seeds(
     all_seeds: List[SeedRecord] = []
     n_datasets = len(source_datasets)
     overall_start = time.time()
+    # Global candidate seed offset, incremented per (source × sub-task) so
+    # that determinism holds across the full sub-task fan-out without
+    # collisions on ``seed + i``.
+    global_subtask_idx = 0
 
     for ds_idx, ds_name in enumerate(source_datasets):
         logger.info(
             "[dataset %d/%d] Generating seeds for: %s",
             ds_idx + 1, n_datasets, ds_name,
         )
-        splits = load_dataset(ds_name, data_dir, window_len_override=crop_len)
-        train_ds = splits["train"]
-        val_ds   = splits.get("val") or splits["test"]
-        task_type = train_ds.task_type
 
-        # Per-dataset budget override (Bug #003a).
+        # Expand the source into one or more sub-tasks (time-window axis
+        # × variable-subset axis).  Horizon-group axis is handled inside
+        # ``_evaluate_candidate`` (one CL pre-train, multiple Ridge evals).
+        sub_tasks: List[ForecastingSubTask] = make_forecasting_subtasks(
+            ds_name,
+            data_dir,
+            n_time_windows=n_time_windows,
+            horizon_groups=horizon_groups,
+            crop_len=crop_len,
+            min_window_len=min_window_len,
+            n_variable_subsets=n_variable_subsets,
+            var_size_rates=var_size_rates,
+            min_var_count=min_var_count,
+            var_subset_seed=seed,
+        )
+        logger.info(
+            "[dataset %d/%d] %s expanded into %d sub-task(s)",
+            ds_idx + 1, n_datasets, ds_name, len(sub_tasks),
+        )
+
+        # Per-dataset budget override (Bug #003a).  Sub-tasks of the same
+        # source share the same budget — they are different windows of the
+        # same time series, not different datasets.
+        # Mode-aware resolution (AutoCTS++ §3.2.4 cheaper-noisy stage):
+        # when ``mode='noisy'`` and the YAML provides ``noisy_pretrain_*``
+        # keys, those replace the base budget for this run only.  The
+        # fall-back to base keys keeps every existing YAML file working
+        # without modification.  See :func:`_resolve_mode_budget`.
         ds_budget = (dataset_budgets or {}).get(ds_name, {}) or {}
-        ds_iters  = int(ds_budget.get("pretrain_iters", 0))
-        ds_epochs = int(ds_budget.get("pretrain_epochs", pretrain_epochs))
+        ds_iters, ds_epochs = _resolve_mode_budget(
+            ds_budget, mode, default_epochs=pretrain_epochs,
+        )
         if ds_iters > 0:
-            logger.info("  budget: pretrain_iters=%d", ds_iters)
+            logger.info(
+                "  budget [mode=%s]: pretrain_iters=%d", mode, ds_iters,
+            )
         else:
-            logger.info("  budget: pretrain_epochs=%d", ds_epochs)
+            logger.info(
+                "  budget [mode=%s]: pretrain_epochs=%d", mode, ds_epochs,
+            )
 
+        # Sample candidates ONCE per source dataset and reuse them across
+        # every sub-task — this mirrors AutoCTS++'s "shared L candidates"
+        # trick (random_search.py L26-44), which lets the comparator learn
+        # how the same configuration ranks differently across windows /
+        # horizons of the same underlying source.
         if fixed_encoders is not None:
             candidates = batch_sample_strategies(n_per_dataset, fixed_encoders)
         else:
             candidates = batch_sample_candidates(n_per_dataset)
-        ds_start = time.time()
 
-        for i, (enc_cfg, strat_cfg) in enumerate(candidates):
-            cand_start = time.time()
-
-            # Per-candidate seeding (AutoCTS++-style).  This controls BOTH
-            # encoder init and augmentation/loader randomness inside
-            # ``contrastive_pretrain``.  With randomise_init=True we reseed
-            # from system entropy, deliberately injecting per-candidate
-            # variance so that pairs across candidates reflect real-world
-            # run-to-run noise.
-            if randomise_init:
-                per_cand_seed = _sys_random.randint(0, 2**31 - 1)
-            else:
-                # Global offset (``ds_idx``) ensures per-dataset determinism
-                # without clashing on the same ``seed + i`` across datasets.
-                per_cand_seed = seed + ds_idx * n_per_dataset + i
-            set_seed(per_cand_seed)
-
-            perf = _evaluate_candidate(
-                enc_cfg, strat_cfg,
-                train_ds, val_ds,
-                task_type,
-                ds_epochs, pretrain_lr, batch_size,
-                device,
-                pretrain_iters=ds_iters,
-                mode=mode,
-            )
-            cand_elapsed = time.time() - cand_start
-
-            record = SeedRecord(
-                encoder_config=enc_cfg,
-                strategy=strat_cfg,
-                task_id=ds_name,
-                performance=perf,
-            )
-            all_seeds.append(record)
-
-            # Progress + ETA based on average per-candidate time so far.
-            done = i + 1
-            avg_per_cand = (time.time() - ds_start) / done
-            ds_eta = avg_per_cand * (n_per_dataset - done)
+        for sub_idx, sub in enumerate(sub_tasks):
+            task_type = sub.train.task_type
+            sub_start = time.time()
             logger.info(
-                "  [%s] %d/%d  perf=%.6f  (enc L%d H%d O%d)  "
-                "took %s  avg %s/cand  ds-ETA %s",
-                ds_name, done, n_per_dataset, perf,
-                enc_cfg["n_layers"], enc_cfg["hidden_dim"], enc_cfg["output_dim"],
-                _fmt_hms(cand_elapsed),
-                _fmt_hms(avg_per_cand),
-                _fmt_hms(ds_eta),
+                "  [%s] sub-task %d/%d  window_id=%s  horizon_groups=%d",
+                ds_name, sub_idx + 1, len(sub_tasks),
+                sub.window_id, len(sub.horizon_groups),
             )
 
-        ds_total = time.time() - ds_start
-        # Coarse overall ETA: assume remaining datasets cost roughly the
-        # same as the current one (best signal we have without per-dataset
-        # cost models).
+            for i, (enc_cfg, strat_cfg) in enumerate(candidates):
+                cand_start = time.time()
+
+                if randomise_init:
+                    per_cand_seed = _sys_random.randint(0, 2**31 - 1)
+                else:
+                    per_cand_seed = seed + global_subtask_idx * n_per_dataset + i
+                set_seed(per_cand_seed)
+
+                perfs = _evaluate_candidate(
+                    enc_cfg, strat_cfg,
+                    sub.train, sub.val,
+                    task_type,
+                    ds_epochs, pretrain_lr, batch_size,
+                    device,
+                    pretrain_iters=ds_iters,
+                    mode=mode,
+                    horizon_groups=sub.horizon_groups,
+                )
+                cand_elapsed = time.time() - cand_start
+
+                # One seed record per horizon group.  Encoder pre-train
+                # cost is paid once per (sub-task, candidate); horizon
+                # variation just re-runs the cheap Ridge eval.  The
+                # (tw_idx, vs_idx) come from the sub-task itself — they
+                # may be ``None`` even when the parent run enables the
+                # axis (e.g. a too-narrow source falls back to vs_idx=None).
+                for hg_idx, perf in enumerate(perfs):
+                    tid = build_task_id(
+                        ds_name,
+                        tw_idx=sub.tw_idx,
+                        vs_idx=sub.vs_idx,
+                        hg_idx=hg_idx if has_hg else None,
+                        has_windows=has_windows,
+                        has_variable_subsets=has_var_subsets,
+                        has_horizon_groups=has_hg,
+                    )
+                    all_seeds.append(
+                        SeedRecord(
+                            encoder_config=enc_cfg,
+                            strategy=strat_cfg,
+                            task_id=tid,
+                            performance=perf,
+                        )
+                    )
+
+                # Progress / ETA reporting at the sub-task granularity.
+                done = i + 1
+                avg_per_cand = (time.time() - sub_start) / done
+                sub_eta = avg_per_cand * (n_per_dataset - done)
+                logger.info(
+                    "    [%s] %d/%d  perfs=[%s]  (enc L%d H%d O%d)  "
+                    "took %s  avg %s/cand  sub-ETA %s",
+                    sub.window_id, done, n_per_dataset,
+                    ", ".join(f"{p:.4f}" for p in perfs),
+                    enc_cfg["n_layers"], enc_cfg["hidden_dim"], enc_cfg["output_dim"],
+                    _fmt_hms(cand_elapsed),
+                    _fmt_hms(avg_per_cand),
+                    _fmt_hms(sub_eta),
+                )
+
+            global_subtask_idx += 1
+            sub_total = time.time() - sub_start
+            logger.info(
+                "  [%s] sub-task %d/%d done in %s",
+                ds_name, sub_idx + 1, len(sub_tasks), _fmt_hms(sub_total),
+            )
+
+        ds_total = time.time() - overall_start
+        # Coarse overall ETA: assume remaining datasets cost like the
+        # current one's average per-sub-task wall time × remaining sub-tasks.
         remaining_ds = n_datasets - (ds_idx + 1)
-        overall_eta = ds_total * remaining_ds
+        overall_eta = (ds_total / (ds_idx + 1)) * remaining_ds
         logger.info(
-            "[dataset %d/%d] %s done in %s  | remaining datasets: %d  | "
+            "[dataset %d/%d] %s done  | remaining datasets: %d  | "
             "rough overall-ETA: %s",
             ds_idx + 1, n_datasets, ds_name,
-            _fmt_hms(ds_total), remaining_ds, _fmt_hms(overall_eta),
+            remaining_ds, _fmt_hms(overall_eta),
         )
 
     logger.info(

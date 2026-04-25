@@ -1,4 +1,4 @@
-from .encoder_config import EncoderConfig, ENCODER_CHOICES
+from .encoder_config import EncoderConfig, ENCODER_CHOICES, ENCODER_GRID_CHOICES
 from .dilated_cnn import DilatedCNNEncoder
 
-__all__ = ["EncoderConfig", "ENCODER_CHOICES", "DilatedCNNEncoder"]
+__all__ = ["EncoderConfig", "ENCODER_CHOICES", "ENCODER_GRID_CHOICES", "DilatedCNNEncoder"]

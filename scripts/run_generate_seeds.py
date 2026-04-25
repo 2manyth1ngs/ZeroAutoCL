@@ -54,6 +54,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pretrain_iters",  type=int,       default=None,
                    help="Override per-dataset iter budget for ALL datasets "
                         "(takes precedence over --pretrain_epochs)")
+    # Mode-specific budget — CLAUDE_ADV §12 calibrated 1/3 cut for noisy.
+    # These flags override YAML ``noisy_pretrain_iters`` /
+    # ``noisy_pretrain_epochs`` only when ``--mode noisy`` is active; they
+    # are silently ignored in clean mode.  When both --pretrain_iters and
+    # --noisy_pretrain_iters are set, the former drives clean stages and
+    # the latter drives noisy stages (no implicit equality).
+    p.add_argument("--noisy_pretrain_iters",  type=int, default=None,
+                   help="Override per-dataset noisy iter budget for ALL "
+                        "datasets (only consulted when --mode=noisy).")
+    p.add_argument("--noisy_pretrain_epochs", type=int, default=None,
+                   help="Override per-dataset noisy epoch budget for ALL "
+                        "datasets (only consulted when --mode=noisy).")
     p.add_argument("--batch_size",      type=int,       default=64)
     p.add_argument("--seed",            type=int,       default=42)
     p.add_argument("--device",          default=None,   help="'cpu' or 'cuda'")
@@ -81,6 +93,23 @@ def parse_args() -> argparse.Namespace:
                         "(AutoCTS++'s use_seed=False branch) so the "
                         "comparator's training data reflects real run-to-run "
                         "variance.  Default OFF → reproducible seeds.")
+    # ── Forecasting task-variant axes ─────────────────────────────────────
+    p.add_argument("--n_time_windows", type=int, default=None,
+                   help="Override forecasting_task_variants.n_time_windows "
+                        "from the YAML.  >1 enables AutoCTS++-style temporal "
+                        "subset enrichment.")
+    p.add_argument("--horizon_groups", default=None,
+                   help="Override forecasting_task_variants.horizon_groups. "
+                        "Format: comma-separated horizons within a group, "
+                        "semicolons between groups. "
+                        "Example: '24,48,168;336,720' "
+                        "→ [[24,48,168],[336,720]].")
+    p.add_argument("--n_variable_subsets", type=int, default=None,
+                   help="Override forecasting_task_variants.n_variable_subsets. "
+                        ">=2 engages AutoCTS++-style stratified variable "
+                        "subsampling.  Sources with fewer than min_var_count "
+                        "raw variables (e.g. univariate ETT) silently bypass "
+                        "this axis.")
     return p.parse_args()
 
 
@@ -104,11 +133,13 @@ def main() -> None:
     # ── Defaults from YAML ────────────────────────────────────────────────
     sg_cfg: Dict = {}
     yaml_dataset_budgets: Dict[str, Dict[str, int]] = {}
+    variants_cfg: Dict = {}
     if args.config:
         with open(args.config, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         sg_cfg               = cfg.get("seed_generation", {}) or {}
         yaml_dataset_budgets = cfg.get("dataset_budgets",  {}) or {}
+        variants_cfg         = cfg.get("forecasting_task_variants", {}) or {}
 
     n_per_dataset   = args.n_per_dataset
     pretrain_epochs = sg_cfg.get("pretrain_epochs", 40)
@@ -118,21 +149,55 @@ def main() -> None:
     if crop_len is not None:
         crop_len = int(crop_len)
 
+    # ── Forecasting task variants (time windows + horizon groups) ─────────
+    n_time_windows = int(variants_cfg.get("n_time_windows", 1) or 1)
+    if args.n_time_windows is not None:
+        n_time_windows = max(1, int(args.n_time_windows))
+    horizon_groups = variants_cfg.get("horizon_groups")  # may be null/None
+    if args.horizon_groups is not None:
+        # CLI override: comma-separated horizons, semicolons split groups,
+        # e.g. "24,48,168;336,720" → [[24,48,168],[336,720]].
+        horizon_groups = [
+            [int(h) for h in grp.split(",") if h.strip()]
+            for grp in args.horizon_groups.split(";") if grp.strip()
+        ]
+    min_window_len = int(variants_cfg.get("min_window_len", 1000) or 1000)
+    # ── Variable subsampling axis (AutoCTS++-style stratified buckets) ────
+    n_variable_subsets = int(variants_cfg.get("n_variable_subsets", 1) or 1)
+    if args.n_variable_subsets is not None:
+        n_variable_subsets = max(1, int(args.n_variable_subsets))
+    var_size_rates = variants_cfg.get("var_size_rates")  # may be null
+    min_var_count  = int(variants_cfg.get("min_var_count", 4) or 4)
+
     # ── Per-dataset budget resolution ─────────────────────────────────────
     # Priority for each source dataset:
-    #   1. CLI --pretrain_iters / --pretrain_epochs (global override)
+    #   1. CLI --pretrain_iters / --pretrain_epochs (global override of the
+    #      base / clean axis — same semantics as before).
     #   2. configs/default.yaml :: dataset_budgets[name]
     #   3. Fallback: pretrain_epochs from seed_generation block (epoch-based)
+    #
+    # On TOP of whichever source wins, CLI --noisy_pretrain_iters /
+    # --noisy_pretrain_epochs (when given) replace any YAML-supplied
+    # noisy_pretrain_* keys.  These only matter when --mode=noisy; in clean
+    # mode they sit unused in the budget dict.
     dataset_budgets: Dict[str, Dict[str, int]] = {}
     for ds in args.datasets:
         if args.pretrain_iters is not None and args.pretrain_iters > 0:
-            dataset_budgets[ds] = {"pretrain_iters": int(args.pretrain_iters)}
+            budget: Dict[str, int] = {"pretrain_iters": int(args.pretrain_iters)}
         elif args.pretrain_epochs is not None:
-            dataset_budgets[ds] = {"pretrain_epochs": int(args.pretrain_epochs)}
+            budget = {"pretrain_epochs": int(args.pretrain_epochs)}
         elif ds in yaml_dataset_budgets:
-            dataset_budgets[ds] = dict(yaml_dataset_budgets[ds])
+            budget = dict(yaml_dataset_budgets[ds])
         else:
-            dataset_budgets[ds] = {"pretrain_epochs": int(pretrain_epochs)}
+            budget = {"pretrain_epochs": int(pretrain_epochs)}
+
+        # CLI noisy-budget overrides — additive, not replacing.
+        if args.noisy_pretrain_iters is not None:
+            budget["noisy_pretrain_iters"] = int(args.noisy_pretrain_iters)
+        if args.noisy_pretrain_epochs is not None:
+            budget["noisy_pretrain_epochs"] = int(args.noisy_pretrain_epochs)
+
+        dataset_budgets[ds] = budget
 
     device = torch.device(args.device) if args.device else None
 
@@ -153,6 +218,13 @@ def main() -> None:
     logger.info("Per-dataset budgets: %s", dataset_budgets)
 
     logger.info("crop_len=%s", crop_len)
+    logger.info(
+        "task variants: n_time_windows=%d  n_variable_subsets=%d  "
+        "horizon_groups=%s  min_window_len=%d  var_size_rates=%s  "
+        "min_var_count=%d",
+        n_time_windows, n_variable_subsets, horizon_groups,
+        min_window_len, var_size_rates, min_var_count,
+    )
 
     seeds = generate_seeds(
         source_datasets=args.datasets,
@@ -169,6 +241,12 @@ def main() -> None:
         crop_len=crop_len,
         mode=args.mode,
         randomise_init=args.randomise_init,
+        n_time_windows=n_time_windows,
+        horizon_groups=horizon_groups,
+        min_window_len=min_window_len,
+        n_variable_subsets=n_variable_subsets,
+        var_size_rates=var_size_rates,
+        min_var_count=min_var_count,
     )
 
     logger.info("Done — generated %d seed records.", len(seeds))

@@ -1,7 +1,8 @@
 """Stage A of Plan B: encoder grid search under fixed GGS strategy.
 
 For each source dataset, every encoder configuration in
-``ENCODER_CHOICES`` (36 total) is trained with ``GGS_STRATEGY`` and
+``ENCODER_GRID_CHOICES`` (27 total — the Stage-A subset of the broader
+``ENCODER_CHOICES`` validation range) is trained with ``GGS_STRATEGY`` and
 evaluated on the held-out validation split.  Performance is then
 aggregated across source datasets (arithmetic mean, ignoring failed runs)
 to produce a global ranking that the rest of Plan B treats as a
@@ -22,7 +23,7 @@ from typing import Dict, List, Optional
 import torch
 
 from data.dataset import load_dataset
-from models.encoder.encoder_config import ENCODER_CHOICES
+from models.encoder.encoder_config import ENCODER_GRID_CHOICES
 from models.search_space.cl_strategy_space import GGS_STRATEGY
 from search.seed_generator import _evaluate_candidate, _fmt_hms
 from utils.logging_utils import get_logger
@@ -32,11 +33,11 @@ logger = get_logger(__name__)
 
 
 def enumerate_encoder_grid() -> List[Dict[str, int]]:
-    """Return all encoder configs from ``ENCODER_CHOICES`` in deterministic order."""
+    """Return all encoder configs from ``ENCODER_GRID_CHOICES`` in deterministic order."""
     keys = ["n_layers", "hidden_dim", "output_dim"]
     return [
         dict(zip(keys, vals))
-        for vals in product(*(ENCODER_CHOICES[k] for k in keys))
+        for vals in product(*(ENCODER_GRID_CHOICES[k] for k in keys))
     ]
 
 
@@ -50,6 +51,7 @@ def encoder_grid_search(
     device: Optional[torch.device] = None,
     seed: int = 42,
     crop_len: Optional[int] = None,
+    eval_horizons: Optional[List[int]] = None,
 ) -> List[Dict]:
     """Run Stage A: every encoder × every source dataset under ``GGS_STRATEGY``.
 
@@ -65,6 +67,12 @@ def encoder_grid_search(
         seed: Global random seed.
         crop_len: Optional sliding-window crop length override for
             forecasting training splits (passed to :func:`load_dataset`).
+        eval_horizons: Optional forecasting horizons used at the per-candidate
+            ``_quick_eval``. ``None`` keeps the canonical
+            ``[24, 48, 168, 336, 720]`` set; passing a shorter list (e.g.
+            ``[24, 168, 336]``) is a Stage-A speed knob — Ridge fits scale
+            with ``H × C_raw`` per horizon, so dropping H=720 on wide
+            multivariate sources is a major eval-time saving.
 
     Returns:
         List of records sorted by ``mean_perf`` desc::
@@ -86,6 +94,11 @@ def encoder_grid_search(
         "[stage-A] encoder grid: %d encoders × %d source datasets = %d runs",
         n_grid, n_ds, n_grid * n_ds,
     )
+    if eval_horizons is not None:
+        logger.info("[stage-A] eval_horizons override: %s", eval_horizons)
+    # _evaluate_candidate expects a list of horizon lists (one perf per
+    # group); Stage A only uses a single group, so wrap once here.
+    horizon_groups = [eval_horizons] if eval_horizons is not None else None
 
     per_enc: Dict[str, Dict] = {}
     overall_start = time.time()
@@ -115,12 +128,17 @@ def encoder_grid_search(
                 f"_O{enc_cfg['output_dim']}"
             )
             cand_start = time.time()
-            perf = _evaluate_candidate(
+            # _evaluate_candidate returns List[float] (one per horizon group).
+            # Stage A always passes a single group, so unwrap [0] for the
+            # scalar perf used by aggregation/logging below.
+            perfs = _evaluate_candidate(
                 enc_cfg, GGS_STRATEGY,
                 train_ds, val_ds, task_type,
                 ds_epochs, pretrain_lr, batch_size,
                 device, pretrain_iters=ds_iters,
+                horizon_groups=horizon_groups,
             )
+            perf = float(perfs[0])
             cand_elapsed = time.time() - cand_start
 
             slot = per_enc.setdefault(

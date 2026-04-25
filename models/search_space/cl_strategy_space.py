@@ -15,7 +15,7 @@ Instance contrast is **always True** and is never sampled.
 import random
 from typing import Dict, List, Tuple
 
-from models.encoder.encoder_config import ENCODER_CHOICES
+from models.encoder.encoder_config import ENCODER_GRID_CHOICES
 
 # ---------------------------------------------------------------------------
 # Space constants
@@ -108,7 +108,12 @@ def sample_cl_strategy_only() -> Dict:
 
 
 def sample_encoder_config() -> Dict[str, object]:
-    """Uniformly sample one encoder configuration from the 108 candidates.
+    """Uniformly sample one encoder configuration from ``ENCODER_GRID_CHOICES``.
+
+    Samples from the grid subset (3 × 3 × 3 × 3 = 81 candidates), not the
+    full ``ENCODER_CHOICES`` validation range — ``n_layers=4`` is excluded
+    from search because its receptive field is too small for the long
+    horizons we evaluate on.
 
     Returns:
         Dict with keys ``'n_layers'``, ``'hidden_dim'``, ``'output_dim'``,
@@ -117,7 +122,7 @@ def sample_encoder_config() -> Dict[str, object]:
     """
     return {
         key: random.choice(choices)
-        for key, choices in ENCODER_CHOICES.items()
+        for key, choices in ENCODER_GRID_CHOICES.items()
     }
 
 
