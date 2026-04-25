@@ -145,27 +145,43 @@ STAGE_A_SOURCES=(PEMS04 ExchangeRate ETTh2)
 
 # Read CLI-driven scalars from YAML once.
 N_PER_DATASET=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['two_stage_search']['cl_strategy_search']['n_per_dataset'])")
-TOP_K_ENC=$(python -c    "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['two_stage_search']['encoder_grid']['top_k_enc'])")
 TOP_K_STR=$(python -c    "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['two_stage_search']['cl_strategy_search']['top_k_strategies'])")
-echo "YAML scalars   : n_per_dataset=${N_PER_DATASET}  top_k_enc=${TOP_K_ENC}  top_k_strategies=${TOP_K_STR}"
+# Stage A is skipped; Stage B uses the GGS encoder only (n_layers=10, hidden=64,
+# output=320 — encoder_default in configs/default.yaml).  Hard-set to 1 so
+# downstream stages do not multiply over phantom encoders.
+TOP_K_ENC=1
+echo "YAML scalars   : n_per_dataset=${N_PER_DATASET}  top_k_enc=${TOP_K_ENC} (forced, GGS only)  top_k_strategies=${TOP_K_STR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage A — encoder grid search (27 encoders × |STAGE_A_SOURCES| under
-# GGS_STRATEGY; pretrain_iters / eval_horizons overridden via YAML
-# ``two_stage_search.encoder_grid``).
+# Stage A — SKIPPED.  Empirically the grid's top encoders cluster around the
+# GGS default (n_layers=10, output_dim=320).  We bypass the 2-3 h grid search
+# and write a synthetic encoder_grid.json containing only the GGS config so
+# the rest of the pipeline (which expects this file) still works unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 echo
-echo "═══════ Stage A: encoder grid search ═══════"
+echo "═══════ Stage A: SKIPPED — using GGS encoder ═══════"
 if [[ -s "${ENCODER_GRID}" ]]; then
     echo "[stage-A] ${ENCODER_GRID} exists — skipping (delete to re-run)"
 else
-    srun --unbuffered python -u scripts/run_encoder_grid.py \
-        --data_dir "${DATA_DIR}" \
-        --save_dir "${OUT_DIR}" \
-        --config   "${CONFIG}" \
-        --datasets "${STAGE_A_SOURCES[@]}" \
-        --seed     "${SEED}" \
-        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
+    python - <<EOF
+import json, yaml
+with open("${CONFIG}", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+ggs = cfg.get("encoder_default", {"n_layers": 10, "hidden_dim": 64, "output_dim": 320})
+records = [{
+    "encoder_config": {
+        "n_layers":   int(ggs["n_layers"]),
+        "hidden_dim": int(ggs["hidden_dim"]),
+        "output_dim": int(ggs["output_dim"]),
+    },
+    "mean_perf": 0.0,
+    "per_dataset": {},
+    "stage_a_skipped": True,
+}]
+with open("${ENCODER_GRID}", "w", encoding="utf-8") as f:
+    json.dump(records, f, indent=2)
+print(f"[stage-A] wrote synthetic encoder_grid.json with GGS-only encoder: {records[0]['encoder_config']}")
+EOF
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
