@@ -123,7 +123,12 @@ dataset_budgets:
   ETTh2:        { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   PEMS03:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   PEMS04:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
-  PEMS07:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  # PEMS07 has 883 sensor channels (vs PEMS03's 358, PEMS04's 307,
+  # PEMS08's 170) — the (B, T, C) input alone is ~116 MB at the global
+  # crop_len=1024, and the CL augmentations + encoder activations push
+  # peak VRAM past 24 GB on a 4090.  Halving the crop preserves rank order
+  # (a uniform bias across candidates) while cutting activation memory ~2×.
+  PEMS07:       { pretrain_iters: 600, noisy_pretrain_iters: 200, crop_len: 512 }
   PEMS08:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   PEMS-BAY:     { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   ExchangeRate: { pretrain_iters: 600, noisy_pretrain_iters: 200 }

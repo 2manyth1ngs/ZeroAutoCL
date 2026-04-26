@@ -8,7 +8,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+#SBATCH --mem=96G
 #SBATCH --time=72:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/zac_autocts_etth1_%j.out
@@ -132,7 +132,12 @@ nvidia-smi
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available(), '| dev:', torch.cuda.get_device_name(0), '| vram_gb:', round(torch.cuda.get_device_properties(0).total_memory/1e9, 1))"
 
 # Source datasets for Stage B.1 (target ETTh1 is excluded — strict zero-shot).
-SOURCES=(ETTh2 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate)
+# PEMS07 leads the list — it's the heaviest source (883 sensor channels)
+# and the most likely to OOM, so failing fast here saves us the wall-clock
+# of all the other sources before discovering a crash.  Per-dataset
+# checkpoints (`_seeds_<ds>.json` in each save_dir) make completed sources
+# resume-safe regardless of order.
+SOURCES=(PEMS07 ETTh2 PEMS03 PEMS04 PEMS08 ExchangeRate)
 
 # Stage A only needs a coarse encoder ranking, so we use a 3-source
 # representative subset instead of all 6:

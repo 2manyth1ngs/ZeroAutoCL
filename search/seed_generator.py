@@ -489,6 +489,12 @@ def generate_seeds(
             len(fixed_encoders), fixed_encoders,
         )
 
+    # Hoisted from the persist block at the bottom: per-dataset checkpoint
+    # files live in ``save_dir`` and need it to exist before the first
+    # source completes.
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+
     all_seeds: List[SeedRecord] = []
     n_datasets = len(source_datasets)
     overall_start = time.time()
@@ -503,6 +509,59 @@ def generate_seeds(
             ds_idx + 1, n_datasets, ds_name,
         )
 
+        # ── Per-dataset checkpoint resume ──────────────────────────────
+        # On crash mid-loop (e.g. PEMS07 OOM) we lose ``all_seeds`` because
+        # the bottom-of-function ``seeds.json`` write is unreached.  A
+        # sidecar ``_seeds_<ds>.json`` is written after each source
+        # completes; on the next invocation we replay it instead of re-
+        # training the source.  ``n_subtasks`` is stored alongside the
+        # records so we can advance ``global_subtask_idx`` and keep
+        # ``per_cand_seed = seed + global_subtask_idx * n_per_dataset + i``
+        # identical to a fresh contiguous run (matters in clean-mode with
+        # ``randomise_init=False``).
+        ds_ckpt = (
+            os.path.join(save_dir, f"_seeds_{ds_name}.json")
+            if save_dir is not None else None
+        )
+        if ds_ckpt and os.path.exists(ds_ckpt) and os.path.getsize(ds_ckpt) > 0:
+            try:
+                with open(ds_ckpt, encoding="utf-8") as f:
+                    payload = json.load(f)
+                cached = [SeedRecord.from_dict(d) for d in payload["records"]]
+                n_sub_cached = int(payload["n_subtasks"])
+                logger.info(
+                    "[dataset %d/%d] %s — checkpoint hit (%d records, "
+                    "%d sub-tasks); skipping re-training.",
+                    ds_idx + 1, n_datasets, ds_name,
+                    len(cached), n_sub_cached,
+                )
+                all_seeds.extend(cached)
+                global_subtask_idx += n_sub_cached
+                continue
+            except Exception as exc:                            # pragma: no cover
+                logger.warning(
+                    "Checkpoint %s unreadable (%s); re-running %s from scratch.",
+                    ds_ckpt, exc, ds_name,
+                )
+
+        # Per-dataset budget override (Bug #003a).  Sub-tasks of the same
+        # source share the same budget — they are different windows of the
+        # same time series, not different datasets.
+        # Mode-aware resolution (AutoCTS++ §3.2.4 cheaper-noisy stage):
+        # when ``mode='noisy'`` and the YAML provides ``noisy_pretrain_*``
+        # keys, those replace the base budget for this run only.  The
+        # fall-back to base keys keeps every existing YAML file working
+        # without modification.  See :func:`_resolve_mode_budget`.
+        ds_budget = (dataset_budgets or {}).get(ds_name, {}) or {}
+        # Per-dataset crop_len override.  Wide sources like PEMS07 (883 ch)
+        # blow up VRAM at the global crop_len — half the window is enough
+        # for relative ranking (the bias is uniform across candidates).
+        ds_crop_len = ds_budget.get("crop_len", crop_len)
+        if ds_crop_len != crop_len:
+            logger.info(
+                "  per-dataset crop_len override: %s → %s", crop_len, ds_crop_len,
+            )
+
         # Expand the source into one or more sub-tasks (time-window axis
         # × variable-subset axis).  Horizon-group axis is handled inside
         # ``_evaluate_candidate`` (one CL pre-train, multiple Ridge evals).
@@ -511,7 +570,7 @@ def generate_seeds(
             data_dir,
             n_time_windows=n_time_windows,
             horizon_groups=horizon_groups,
-            crop_len=crop_len,
+            crop_len=ds_crop_len,
             min_window_len=min_window_len,
             n_variable_subsets=n_variable_subsets,
             var_size_rates=var_size_rates,
@@ -523,15 +582,6 @@ def generate_seeds(
             ds_idx + 1, n_datasets, ds_name, len(sub_tasks),
         )
 
-        # Per-dataset budget override (Bug #003a).  Sub-tasks of the same
-        # source share the same budget — they are different windows of the
-        # same time series, not different datasets.
-        # Mode-aware resolution (AutoCTS++ §3.2.4 cheaper-noisy stage):
-        # when ``mode='noisy'`` and the YAML provides ``noisy_pretrain_*``
-        # keys, those replace the base budget for this run only.  The
-        # fall-back to base keys keeps every existing YAML file working
-        # without modification.  See :func:`_resolve_mode_budget`.
-        ds_budget = (dataset_budgets or {}).get(ds_name, {}) or {}
         ds_iters, ds_epochs = _resolve_mode_budget(
             ds_budget, mode, default_epochs=pretrain_epochs,
         )
@@ -553,6 +603,11 @@ def generate_seeds(
             candidates = batch_sample_strategies(n_per_dataset, fixed_encoders)
         else:
             candidates = batch_sample_candidates(n_per_dataset)
+
+        # Records produced by THIS source.  Kept separate from ``all_seeds``
+        # so we can write a per-dataset checkpoint atomically once the
+        # source finishes (see end-of-loop block).
+        ds_seeds: List[SeedRecord] = []
 
         for sub_idx, sub in enumerate(sub_tasks):
             task_type = sub.train.task_type
@@ -600,7 +655,7 @@ def generate_seeds(
                         has_variable_subsets=has_var_subsets,
                         has_horizon_groups=has_hg,
                     )
-                    all_seeds.append(
+                    ds_seeds.append(
                         SeedRecord(
                             encoder_config=enc_cfg,
                             strategy=strat_cfg,
@@ -629,6 +684,24 @@ def generate_seeds(
             logger.info(
                 "  [%s] sub-task %d/%d done in %s",
                 ds_name, sub_idx + 1, len(sub_tasks), _fmt_hms(sub_total),
+            )
+
+        # Promote this source's records into the global list and persist a
+        # sidecar checkpoint so a later crash on a different source doesn't
+        # cost us this work.  ``n_subtasks`` is recorded so the resume path
+        # can advance ``global_subtask_idx`` to match a fresh contiguous run.
+        all_seeds.extend(ds_seeds)
+        if ds_ckpt is not None:
+            payload = {
+                "ds_name": ds_name,
+                "n_subtasks": len(sub_tasks),
+                "records": [s.to_dict() for s in ds_seeds],
+            }
+            with open(ds_ckpt, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            logger.info(
+                "  [%s] checkpoint saved: %d records → %s",
+                ds_name, len(ds_seeds), ds_ckpt,
             )
 
         ds_total = time.time() - overall_start
