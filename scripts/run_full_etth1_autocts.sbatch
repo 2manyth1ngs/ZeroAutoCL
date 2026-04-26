@@ -8,7 +8,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=72G
+#SBATCH --mem=48G
 #SBATCH --time=72:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/zac_autocts_etth1_%j.out
