@@ -124,11 +124,22 @@ dataset_budgets:
   PEMS03:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   PEMS04:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   # PEMS07 has 883 sensor channels (vs PEMS03's 358, PEMS04's 307,
-  # PEMS08's 170) — the (B, T, C) input alone is ~116 MB at the global
-  # crop_len=1024, and the CL augmentations + encoder activations push
-  # peak VRAM past 24 GB on a 4090.  Halving the crop preserves rank order
-  # (a uniform bias across candidates) while cutting activation memory ~2×.
-  PEMS07:       { pretrain_iters: 600, noisy_pretrain_iters: 200, crop_len: 512 }
+  # PEMS08's 170) — two independent OOM modes:
+  #
+  #   1. GPU: (B, T, C) input alone is ~116 MB at the global crop_len=1024,
+  #      and the CL augmentations + encoder activations push peak VRAM past
+  #      24 GB on a 4090.  ``crop_len: 512`` halves activation memory while
+  #      preserving rank order (a uniform bias across candidates).
+  #
+  #   2. CPU: ``eval_forecasting`` builds an ``(N≈17000, H × 883)`` numpy
+  #      target per horizon.  At H=720 that's ~43 GB; at H=336 ~20 GB; with
+  #      Ridge α-search internal copies, the H=720 path alone OOM-kills a
+  #      96 GB SLURM allocation.  ``eval_horizons: [24, 48, 168]`` drops the
+  #      two largest targets, cutting peak CPU memory by ~60 GB while
+  #      keeping short + mid range for rank discrimination (same precedent
+  #      as ``two_stage_search.encoder_grid.eval_horizons``).
+  PEMS07:       { pretrain_iters: 600, noisy_pretrain_iters: 200,
+                  crop_len: 512, eval_horizons: [24, 48, 168] }
   PEMS08:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   PEMS-BAY:     { pretrain_iters: 600, noisy_pretrain_iters: 200 }
   ExchangeRate: { pretrain_iters: 600, noisy_pretrain_iters: 200 }

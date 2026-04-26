@@ -3,12 +3,11 @@
 #SBATCH --partition=gpu_spot
 #SBATCH --gpus=nvidia_geforce_rtx_4090:1
 #SBATCH --gpu-bind=closest
-#SBATCH --exclusive
 #SBATCH --constraint=vram24g&cc8.9
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+#SBATCH --mem=96G
 #SBATCH --time=72:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/zac_autocts_etth1_%j.out

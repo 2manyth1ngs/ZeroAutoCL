@@ -149,6 +149,7 @@ def _evaluate_candidate(
     pretrain_iters: int = 0,
     mode: str = "clean",
     horizon_groups: Optional[List[Optional[List[int]]]] = None,
+    eval_horizons: Optional[List[int]] = None,
 ) -> List[float]:
     """Train one candidate and return its validation performance(s).
 
@@ -222,7 +223,10 @@ def _evaluate_candidate(
             # P1-A: noisy mode uses full horizons (None → default
             # [24, 48, 168, 336, 720]) so the best-of-N val_score reflects
             # end-to-end forecasting quality, not short-horizon bias.
-            horizons=None,
+            # ``eval_horizons`` (when set) overrides this — used for
+            # wide-channel sources like PEMS07 (883 ch) where the H=720
+            # target matrix alone (~43 GB) blows the SLURM CPU budget.
+            horizons=eval_horizons,
             history=history,
         )
     except Exception as exc:                           # pragma: no cover
@@ -245,12 +249,18 @@ def _evaluate_candidate(
         )
 
     # ── Clean mode (or noisy fallback): eval the final encoder ────────
+    # When the dataset has a per-source ``eval_horizons`` override (e.g.
+    # PEMS07's [24, 48, 168] to dodge the H=720 CPU OOM), substitute it for
+    # the default-sentinel ``None`` group.  Explicit horizon groups from
+    # ``forecasting_task_variants.horizon_groups`` win — the user's request
+    # is always honoured.
     encoder.eval()
     perfs: List[float] = []
     for hg in horizon_groups:
+        eval_hg = hg if hg is not None else eval_horizons
         perf = _quick_eval(
             encoder, train_dataset, val_dataset, task_type, device,
-            horizons=hg,
+            horizons=eval_hg,
         )
         perfs.append(perf)
     return perfs
@@ -561,6 +571,17 @@ def generate_seeds(
             logger.info(
                 "  per-dataset crop_len override: %s → %s", crop_len, ds_crop_len,
             )
+        # Per-dataset forecasting eval horizons override.  Wide sources blow
+        # up CPU memory in ``eval_forecasting`` — each horizon allocates an
+        # (N, H × C_raw) numpy target; at H=720, C_raw=883 that's ~43 GB.
+        # Setting ``eval_horizons`` per-dataset lets PEMS07 drop H=336/720
+        # and stay inside a 96 GB SLURM mem allocation.  ``None`` keeps the
+        # default [24, 48, 168, 336, 720].
+        ds_eval_horizons = ds_budget.get("eval_horizons")
+        if ds_eval_horizons is not None:
+            logger.info(
+                "  per-dataset eval_horizons override: %s", ds_eval_horizons,
+            )
 
         # Expand the source into one or more sub-tasks (time-window axis
         # × variable-subset axis).  Horizon-group axis is handled inside
@@ -636,6 +657,7 @@ def generate_seeds(
                     pretrain_iters=ds_iters,
                     mode=mode,
                     horizon_groups=sub.horizon_groups,
+                    eval_horizons=ds_eval_horizons,
                 )
                 cand_elapsed = time.time() - cand_start
 
