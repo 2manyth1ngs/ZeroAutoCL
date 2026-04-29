@@ -14,58 +14,53 @@
 #SBATCH --error=logs/zac_autocts_etth1_%j.err
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ZeroAutoCL — AutoCTS++-aligned two-stage pipeline on ETTh1.
+# ZeroAutoCL — AutoCTS++-aligned single-stage pipeline on ETTh1.
 #
-# Differences vs scripts/run_full_etth1_two_stage.sbatch
-# -----------------------------------------------------
-# That older script runs "Plan B" (encoder_grid + single-mode seed gen).
-# This script runs the AutoCTS++ reference protocol we implemented in
-# P0 + P1 + P2:
+# P0 fix (2026-04-29): the previous two-stage noisy/clean curriculum was
+# removed because it failed to learn at ZeroAutoCL's data scale (BCE valid
+# loss stayed at ~ln 2, accuracy ≈ 0.6 — see CLAUDE_DEBUG.md analysis).
+# We now run a SINGLE full-budget seed-gen pass and rely on
+# ``forecasting_task_variants`` slicing (3 windows × 3 var-subsets) to
+# multiply effective training pairs without extra sampling.
 #
-#   Stage A    : encoder grid search (unchanged)
-#                → encoder_grid.json
-#   Stage B.1a : NOISY seeds, deterministic init      (--mode noisy)
-#                → seeds_noisy_fixed/seeds.json
-#   Stage B.1b : NOISY seeds, random init             (--mode noisy --randomise_init)
-#                → seeds_noisy_random/seeds.json
-#   Stage B.1c : CLEAN seeds, full training           (--mode clean)
-#                → seeds_clean/seeds.json
-#   Stage B.2  : T-CLSC two-stage training (noisy pretrain → clean finetune)
+# Update (2026-04-30): cross-source L-share pool added (AutoCTS++
+# generate_seeds.py L65-103 mechanism).  ``seed_generation.n_shared`` in
+# default.yaml controls how many of the per-source candidates are drawn
+# from a pool that is identical across every source (default 10 of 20).
+# Wallclock unchanged — same number of CL evaluations per (source × sub-
+# task), but each shared config now appears in (sources × sub-tasks)
+# (task, perf) cells, giving the comparator's task-feature head dense
+# task-conditional supervision.
+#
+# Stages (write into ``${OUT_DIR}``):
+#
+#   Stage A    : encoder grid (currently SKIPPED — we use the GGS-default
+#                encoder for the rest of the pipeline)
+#                → encoder_grid.json (synthetic single-row)
+#   Stage B.1  : seed generation, full training budget
+#                → seeds/seeds.json + per-source ``_seeds_<ds>.json`` checkpoints
+#   Stage B.2  : T-CLSC training (single stage, per-task z-scored gap-split)
 #                → comparator.pt
 #   Stage B.3  : zero-shot ranking on ETTh1
 #                → finalists.json
 #   Phase 4    : Cartesian retrain (K_enc × top_k_strategies) on ETTh1
 #                → phase4_results.json + phase4_best.json
 #
-# Per-task seed budget: 20 noisy-fixed + 20 noisy-random + 20 clean = 60.
-# This matches AutoCTS++ ``sample_num=20`` (reference/AutoCTS_plusplus/
-# exps/generate_seeds.py L94-103).  Across 6 source tasks → 360 records.
-#
-# Mode-specific iter budget (CLAUDE_ADV §12 calibration, 2026-04-25):
-# YAML ``dataset_budgets[*].noisy_pretrain_iters: 200`` cuts the noisy
-# stages (B.1a + B.1b) to 1/3 of the clean budget without crossing the
-# calibrated ranking-quality cliff (Spearman ρ=0.905 / pairwise
-# concordance=0.947 already at ≈1 epoch ≈ 240 iters on ETTh2).
-# Override via ``--noisy_pretrain_iters N`` if you re-calibrate per-dataset.
+# Per-source budget: ``n_per_dataset=20`` candidates × 9 sub-tasks (3 time
+# windows × 3 variable subsets, modulo min_var_count gating for narrow
+# sources) per source.  Across 6 sources → up to 6 × 20 × 9 = 1080 records.
 #
 # Wall-clock estimate (RTX 4090, 24 GB):
-#   Stage A     : 27 encoders × 3 sources × ~1.6 min ≈  2.2 h *
-#   Stage B.1a  : 20 × 6 × ~1.7 min ≈ 3.4 h         **(was 10 h @ 600 iters)**
-#   Stage B.1b  : 20 × 6 × ~1.7 min ≈ 3.4 h         **(was 10 h @ 600 iters)**
-#   Stage B.1c  : 20 × 6 × ~6   min ≈ 12 h
-#   Stage B.2+3 : ≤ 1 h
-#   Phase 4     : 15 finalists × ~45 min ≈ 11 h
-#                                          -------
-#                                          ≈ 33 h  (was 46 h before §12 fix)
+#   Stage A     :  ~0       (skipped — synthetic encoder_grid.json)
+#   Stage B.1   :  ~30–35 h (≈9× the previous single-pool clean run @ 12 h)
+#   Stage B.2+3 :  ≤ 1 h
+#   Phase 4     :  ~11 h
+#                  -------
+#                  ≈ 42–46 h
 #
-# * Stage A speedups (vs. previous 11 h estimate):
-#     - n_layers=4 dropped from ENCODER_CHOICES   (36 → 27 encoders, -25%)
-#     - STAGE_A_SOURCES reduced from 6 → 3        (representative split, -50%)
-#     - YAML two_stage_search.encoder_grid.pretrain_iters: 300  (-50% train)
-#     - YAML two_stage_search.encoder_grid.eval_horizons: [24,168,336]
-#       drops H=720 + H=48                        (cheaper Ridge fits)
-#   Seed gen (B.1c clean) and Phase 4 still use full 6-source set + 600-iter
-#   budget; only the noisy stages (B.1a/b) consume the 200-iter knob.
+# If wall-clock is tight, drop ``forecasting_task_variants.n_variable_subsets``
+# back to 1 (cuts seed gen to ~12 h at the cost of ~3× fewer training pairs
+# from wide sources).
 #
 # Resume mode: every stage skips itself if its output file exists.  Delete
 # the specific file (or the whole ``${OUT_DIR}``) to force a re-run.
@@ -85,26 +80,16 @@ DATA_DIR="data/datasets"
 CONFIG="configs/default.yaml"
 TARGET="ETTh1"
 
-# Separate RNG seeds for each seed-generation sub-run so the two noisy
-# halves and the clean run sample DIFFERENT strategies.
 SEED=42
-SEED_NOISY_FIXED=42
-SEED_NOISY_RANDOM=43
-SEED_CLEAN=44
 
 ENCODER_GRID="${OUT_DIR}/encoder_grid.json"
-SEEDS_NOISY_FIXED_DIR="${OUT_DIR}/seeds_noisy_fixed"
-SEEDS_NOISY_RANDOM_DIR="${OUT_DIR}/seeds_noisy_random"
-SEEDS_CLEAN_DIR="${OUT_DIR}/seeds_clean"
-SEEDS_NOISY_FIXED="${SEEDS_NOISY_FIXED_DIR}/seeds.json"
-SEEDS_NOISY_RANDOM="${SEEDS_NOISY_RANDOM_DIR}/seeds.json"
-SEEDS_CLEAN="${SEEDS_CLEAN_DIR}/seeds.json"
+SEEDS_DIR="${OUT_DIR}/seeds"
+SEEDS="${SEEDS_DIR}/seeds.json"
 COMPARATOR="${OUT_DIR}/comparator.pt"
 FINALISTS="${OUT_DIR}/finalists.json"
 PHASE4_BEST="${OUT_DIR}/phase4_best.json"
 
-mkdir -p logs "${OUT_DIR}" "${SEEDS_NOISY_FIXED_DIR}" \
-         "${SEEDS_NOISY_RANDOM_DIR}" "${SEEDS_CLEAN_DIR}"
+mkdir -p logs "${OUT_DIR}" "${SEEDS_DIR}"
 
 echo "================================================================="
 echo "Job ID         : ${SLURM_JOB_ID}"
@@ -189,91 +174,39 @@ EOF
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage B.1a — NOISY seeds, deterministic init
-#   AutoCTS++ analog: generate_seeds.py --mode noisy_seeds (use_seed=True branch)
+# Stage B.1 — seed generation (full training budget, sub-task slicing on)
 # ─────────────────────────────────────────────────────────────────────────────
 echo
-echo "═══════ Stage B.1a: noisy seeds (deterministic init) ═══════"
-if [[ -s "${SEEDS_NOISY_FIXED}" ]]; then
-    echo "[stage-B.1a] ${SEEDS_NOISY_FIXED} exists — skipping (delete to re-run)"
+echo "═══════ Stage B.1: seed generation ═══════"
+if [[ -s "${SEEDS}" ]]; then
+    echo "[stage-B.1] ${SEEDS} exists — skipping (delete to re-run)"
 else
     srun --unbuffered python -u scripts/run_generate_seeds.py \
         --data_dir       "${DATA_DIR}" \
-        --save_dir       "${SEEDS_NOISY_FIXED_DIR}" \
+        --save_dir       "${SEEDS_DIR}" \
         --config         "${CONFIG}" \
         --datasets       "${SOURCES[@]}" \
         --n_per_dataset  "${N_PER_DATASET}" \
         --encoder_grid   "${ENCODER_GRID}" \
         --top_k_enc      "${TOP_K_ENC}" \
-        --mode           noisy \
-        --seed           "${SEED_NOISY_FIXED}" \
+        --seed           "${SEED}" \
         > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage B.1b — NOISY seeds, random init (system entropy per candidate)
-#   AutoCTS++ analog: generate_seeds.py --mode noisy_seeds (use_seed=False branch)
+# Stage B.2 — T-CLSC comparator training (single stage, z-scored gap split)
 # ─────────────────────────────────────────────────────────────────────────────
 echo
-echo "═══════ Stage B.1b: noisy seeds (random init) ═══════"
-if [[ -s "${SEEDS_NOISY_RANDOM}" ]]; then
-    echo "[stage-B.1b] ${SEEDS_NOISY_RANDOM} exists — skipping (delete to re-run)"
-else
-    srun --unbuffered python -u scripts/run_generate_seeds.py \
-        --data_dir       "${DATA_DIR}" \
-        --save_dir       "${SEEDS_NOISY_RANDOM_DIR}" \
-        --config         "${CONFIG}" \
-        --datasets       "${SOURCES[@]}" \
-        --n_per_dataset  "${N_PER_DATASET}" \
-        --encoder_grid   "${ENCODER_GRID}" \
-        --top_k_enc      "${TOP_K_ENC}" \
-        --mode           noisy \
-        --randomise_init \
-        --seed           "${SEED_NOISY_RANDOM}" \
-        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
-fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage B.1c — CLEAN seeds (full training budget, deterministic init)
-#   AutoCTS++ analog: generate_seeds.py --mode clean_seeds
-# ─────────────────────────────────────────────────────────────────────────────
-echo
-echo "═══════ Stage B.1c: clean seeds ═══════"
-if [[ -s "${SEEDS_CLEAN}" ]]; then
-    echo "[stage-B.1c] ${SEEDS_CLEAN} exists — skipping (delete to re-run)"
-else
-    srun --unbuffered python -u scripts/run_generate_seeds.py \
-        --data_dir       "${DATA_DIR}" \
-        --save_dir       "${SEEDS_CLEAN_DIR}" \
-        --config         "${CONFIG}" \
-        --datasets       "${SOURCES[@]}" \
-        --n_per_dataset  "${N_PER_DATASET}" \
-        --encoder_grid   "${ENCODER_GRID}" \
-        --top_k_enc      "${TOP_K_ENC}" \
-        --mode           clean \
-        --seed           "${SEED_CLEAN}" \
-        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
-fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage B.2 — T-CLSC two-stage comparator training
-#   Stage 1 (pretrain) : both noisy seed pools concatenated (symmetric pairs,
-#                        gap-split valid, patience=5 early stop)
-#   Stage 2 (finetune) : clean seed pool, lr=0.1× pretrain_lr, epochs÷2
-#                        starts from best-by-noisy-valid weights
-# ─────────────────────────────────────────────────────────────────────────────
-echo
-echo "═══════ Stage B.2: T-CLSC two-stage training ═══════"
+echo "═══════ Stage B.2: T-CLSC training ═══════"
 if [[ -s "${COMPARATOR}" ]]; then
     echo "[stage-B.2] ${COMPARATOR} exists — skipping (delete to re-run)"
 else
     srun --unbuffered python -u scripts/run_pretrain_comparator.py \
-        --seeds_path       "${SEEDS_NOISY_FIXED}" "${SEEDS_NOISY_RANDOM}" \
-        --clean_seeds_path "${SEEDS_CLEAN}" \
-        --data_dir         "${DATA_DIR}" \
-        --save_path        "${COMPARATOR}" \
-        --config           "${CONFIG}" \
-        --seed             "${SEED}" \
+        --seeds_path  "${SEEDS}" \
+        --data_dir    "${DATA_DIR}" \
+        --save_path   "${COMPARATOR}" \
+        --config      "${CONFIG}" \
+        --seed        "${SEED}" \
         > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
 fi
 
@@ -325,12 +258,10 @@ echo "Finished       : $(date -Is)"
 echo "Task type      : forecasting (AutoCTS++-aligned)"
 echo "Target         : ${TARGET}"
 echo "Sources        : ${SOURCES[*]}"
-echo "Seed budget    : ${N_PER_DATASET}/mode × 3 modes × ${#SOURCES[@]} tasks = $(( N_PER_DATASET * 3 * ${#SOURCES[@]} )) records"
+echo "Seed budget    : ${N_PER_DATASET}/source × ${#SOURCES[@]} sources × n_sub_tasks (set in YAML)"
 echo "Outputs:"
 echo "  Stage A      : ${ENCODER_GRID}"
-echo "  Stage B.1a   : ${SEEDS_NOISY_FIXED}"
-echo "  Stage B.1b   : ${SEEDS_NOISY_RANDOM}"
-echo "  Stage B.1c   : ${SEEDS_CLEAN}"
+echo "  Stage B.1    : ${SEEDS}"
 echo "  Stage B.2    : ${COMPARATOR}"
 echo "  Stage B.3    : ${FINALISTS}"
 echo "  Phase 4      : ${OUT_DIR}/phase4_results.json"

@@ -1,30 +1,32 @@
-"""Pretrain the T-CLSC comparator with **gap-split valid + symmetric pairs +
-valid-loss early stopping + optional noisy→clean two-stage curriculum** —
-ported from AutoCTS++ (``random_search.py``).
+"""Pretrain the T-CLSC comparator with **per-task z-score normalisation +
+gap-split valid + symmetric pairs + valid-loss early stopping** — ported
+from AutoCTS++ (``random_search.py``) and adapted for ZeroAutoCL.
 
 Pipeline shape
 --------------
-1. **Symmetric pair injection**: each unordered pair ``{A, B}`` yields BOTH
+1. **Per-task z-score** of seed performance:  the gap-split logic uses an
+   absolute threshold, but raw performance scales differ by 50–100× across
+   sources (e.g. ExchangeRate ≈ −3 vs PEMS04 ≈ −0.27).  Without
+   normalisation a fixed ``valid_gap_threshold`` rejects almost every
+   PEMS04 seed (everything looks "too close") and accepts almost every
+   ExchangeRate seed (everything looks "far apart"), starving the
+   comparator's training pool of one task and overflowing the valid pool of
+   the other.  Z-score gives the threshold a uniform meaning across tasks.
+   Labels are unaffected because z-score is monotone (preserves rank).
+2. **Symmetric pair injection**: each unordered pair ``{A, B}`` yields BOTH
    ``(A, B, 1)`` *and* ``(B, A, 0)`` — twice as many training examples,
    teaches the comparator symmetric invariance explicitly.
-2. **Gap-based train/valid split**: per task, seeds are greedily placed into
+3. **Gap-based train/valid split**: per task, seeds are greedily placed into
    a valid pool only when they are at least ``valid_gap_threshold`` apart
-   from every already-accepted valid seed.  This forces valid pairs to have
-   clearly separated labels and keeps the valid signal clean under seed
-   noise.
-3. **Valid-loss early stopping**: training tracks BCE on the valid pool and
+   (in z-score units) from every already-accepted valid seed.
+4. **Valid-loss early stopping**: training tracks BCE on the valid pool and
    restores the best-by-valid comparator state on exit.
-4. **Two-stage curriculum** (P2): when ``clean_seeds`` is provided,
-   :func:`pretrain_comparator` first trains on the noisy set (broad but
-   noisy labels), then fine-tunes on the clean set (narrow but reliable).
-   The fine-tune stage starts from the best-by-noisy-valid weights; by
-   default it uses 0.1× the noisy lr and half the noisy epochs.  This
-   matches the AutoCTS++ ``noisy_seeds`` → ``clean_seeds`` protocol
-   (``reference/AutoCTS_plusplus/exps/generate_seeds.py:94-103``).
 
 The old gap-magnitude curriculum was removed in P0 — it relied on
 trust-worthy absolute performance numbers, which our fixed-seed seed
-records do not provide.
+records do not provide.  The previously-supported noisy→clean two-stage
+curriculum was also removed because it failed to learn beyond the
+random-guess baseline at ZeroAutoCL's data scale (see CLAUDE_DEBUG.md).
 """
 
 from __future__ import annotations
@@ -83,6 +85,35 @@ def _emit_symmetric_pairs(
                     out_gaps.append(gap)
 
 
+def _zscore_seeds(seeds: List[SeedRecord]) -> List[SeedRecord]:
+    """Return a copy of *seeds* with ``performance`` z-score normalised.
+
+    Mean and std are computed over the input list (intended use is per-task
+    so the caller is responsible for grouping first).  Std is clamped to a
+    small positive floor to keep behaviour sane when every seed in a task
+    has the same performance (degenerate but possible).
+    """
+    n = len(seeds)
+    if n == 0:
+        return []
+    perfs = [s.performance for s in seeds]
+    mean = sum(perfs) / n
+    if n > 1:
+        var = sum((p - mean) ** 2 for p in perfs) / (n - 1)
+    else:
+        var = 0.0
+    std = max(var ** 0.5, 1e-8)
+    return [
+        SeedRecord(
+            encoder_config=s.encoder_config,
+            strategy=s.strategy,
+            task_id=s.task_id,
+            performance=(s.performance - mean) / std,
+        )
+        for s in seeds
+    ]
+
+
 @torch.no_grad()
 def _split_seeds_and_pairs(
     seeds: List[SeedRecord],
@@ -92,10 +123,12 @@ def _split_seeds_and_pairs(
     """Split seeds per task into train/valid with gap-dedup, emit symmetric pairs.
 
     Algorithm (per task, matches AutoCTS++ ``random_search.py:362-371``):
+      - Z-score the task's performance values so the gap threshold has a
+        uniform meaning regardless of the source's absolute scale.
       - Iterate seeds in their natural order; for each seed *s*, put *s* into
         ``valid_seeds`` if no already-accepted valid seed has performance
-        within ``valid_gap_threshold`` of *s*; otherwise put *s* into
-        ``train_seeds``.
+        within ``valid_gap_threshold`` (z-score units) of *s*; otherwise
+        put *s* into ``train_seeds``.
       - Fallback: if the greedy split leaves valid with < 2 seeds (cannot
         form any pair) but the task had ≥ 4 seeds total, force-include the
         min-performance and max-performance seeds into valid.
@@ -103,9 +136,9 @@ def _split_seeds_and_pairs(
     Args:
         seeds: All evaluated seed records (multiple tasks allowed).
         task_features: ``task_id → task-feature tensor`` mapping.
-        valid_gap_threshold: Minimum performance gap required for a seed to
-            qualify for the valid pool.  The unit is whatever ``performance``
-            is — for forecasting (``-MSE``) typical values are 0.01 – 0.05.
+        valid_gap_threshold: Minimum performance gap (in z-score units)
+            required for a seed to qualify for the valid pool.  Typical
+            values are 0.3 – 0.6 (a fraction of one std).
 
     Returns:
         ``(train_pairs, valid_pairs)`` — each a list of dicts compatible
@@ -119,13 +152,14 @@ def _split_seeds_and_pairs(
     train_pairs: List[Dict] = []
     valid_pairs: List[Dict] = []
 
-    for task_id, task_seeds in by_task.items():
+    for task_id, raw_seeds in by_task.items():
         if task_id not in task_features:
             logger.warning("Task %s has seeds but no task_feature; skipping.", task_id)
             continue
         feat = task_features[task_id]
+        task_seeds = _zscore_seeds(raw_seeds)
 
-        # Greedy gap-based split.
+        # Greedy gap-based split (gap is in z-score units).
         valid_seeds: List[SeedRecord] = []
         train_seeds: List[SeedRecord] = []
         for s in task_seeds:
@@ -235,28 +269,26 @@ def _valid_loss(
 # ---------------------------------------------------------------------------
 
 def _train_one_stage(
-    stage_name: str,
     seeds: List[SeedRecord],
     task_features: Dict[str, Tensor],
     comparator: TCLSC,
     config: Dict,
     device: torch.device,
 ) -> TCLSC:
-    """Run one training stage over *seeds* and load best-by-valid weights.
+    """Train *comparator* over *seeds* and load best-by-valid weights.
 
     Args:
-        stage_name: Short label (e.g. ``"pretrain/noisy"`` or ``"finetune/
-            clean"``) used to namespace the log output.
-        seeds: All seed records for this stage.
+        seeds: All seed records.
         task_features: Shared ``task_id → feature`` mapping.
         comparator: Comparator to train in place.  Caller is responsible
             for constructing it / setting the device.
-        config: Per-stage config (see :func:`pretrain_comparator` for keys).
+        config: Training config (see :func:`pretrain_comparator` for keys).
         device: Torch device.
 
     Returns:
         The same comparator object with best-by-valid weights restored.
     """
+    stage_name = "pretrain"
     epochs              = int(config.get("epochs", 100))
     lr                  = float(config.get("lr", 1e-4))
     batch_size          = int(config.get("batch_size", 256))
@@ -370,26 +402,6 @@ def _train_one_stage(
     return comparator
 
 
-def _derive_clean_config(noisy_config: Dict, clean_config: Optional[Dict]) -> Dict:
-    """Compute an effective clean-stage config.
-
-    Behaviour:
-      - If *clean_config* is ``None``, derive from *noisy_config* with
-        ``lr *= 0.1`` (gentler fine-tune) and ``epochs //= 2`` (shorter
-        run on the smaller clean pool).
-      - If *clean_config* is given, its keys override those inherited
-        from *noisy_config*.  This lets callers specify only the keys
-        they care about (e.g. ``{"lr": 1e-5}``).
-    """
-    base = dict(noisy_config)
-    if clean_config is None:
-        base["lr"]     = float(noisy_config.get("lr", 1e-4)) * 0.1
-        base["epochs"] = max(1, int(noisy_config.get("epochs", 100)) // 2)
-        return base
-    base.update(clean_config)
-    return base
-
-
 def pretrain_comparator(
     seeds: List[SeedRecord],
     task_features: Dict[str, Tensor],
@@ -397,48 +409,32 @@ def pretrain_comparator(
     comparator: Optional[TCLSC] = None,
     save_path: Optional[str] = None,
     device: Optional[torch.device] = None,
-    clean_seeds: Optional[List[SeedRecord]] = None,
-    clean_config: Optional[Dict] = None,
 ) -> TCLSC:
-    """Pretrain T-CLSC, optionally with a two-stage noisy→clean curriculum.
+    """Pretrain T-CLSC on a single pool of seed records.
 
     Args:
-        seeds: Seed records for the (noisy) pretraining stage.  If
-            *clean_seeds* is ``None`` these are the only seeds used and the
-            function behaves as single-stage training.
+        seeds: Seed records to train on.
         task_features: Mapping ``task_id → task-feature tensor``.  Must
-            cover every ``task_id`` present in *seeds* and *clean_seeds*.
-        config: Pretraining-stage config.  Recognised keys:
+            cover every ``task_id`` present in *seeds*.
+        config: Training config.  Recognised keys:
 
             - ``epochs`` (int, 100)
             - ``lr`` (float, 1e-4)
             - ``batch_size`` (int, 256)
             - ``hidden_dim`` (int, 128): TCLSC hidden size (used only when
               a fresh comparator is constructed)
-            - ``valid_gap_threshold`` (float, 0.02)
+            - ``valid_gap_threshold`` (float, 0.5): in z-score units
             - ``patience`` (int, 10)
             - ``eval_every`` (int, 1)
 
         comparator: Optional pre-constructed comparator.  When ``None`` a
             fresh :class:`TCLSC` with ``hidden_dim`` from *config* is built.
-        save_path: If given, persist the final comparator weights here
-            (after the clean-stage fine-tune, when applicable).
+        save_path: If given, persist the final comparator weights here.
         device: Torch device; auto-detect when ``None``.
-        clean_seeds: Optional second-stage seeds (AutoCTS++ ``clean_seeds``
-            analog).  When provided, training runs two stages:
-
-              1. Pretrain on *seeds* with *config* (broad but noisy labels).
-              2. Fine-tune on *clean_seeds* with *clean_config* (narrow but
-                 reliable labels), starting from the best pretrain weights.
-
-        clean_config: Overrides for the fine-tune stage.  Any missing keys
-            inherit from *config*; the defaults when *clean_config* is
-            ``None`` are ``lr := 0.1 * config.lr`` and ``epochs :=
-            config.epochs // 2``.
 
     Returns:
-        Trained :class:`TCLSC` (with final-stage best-by-valid weights
-        loaded when a non-empty valid set was used).
+        Trained :class:`TCLSC` (with best-by-valid weights loaded when a
+        non-empty valid set was used).
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -448,42 +444,18 @@ def pretrain_comparator(
     if "curriculum_levels" in config:
         logger.warning(
             "config['curriculum_levels']=%s is deprecated — the gap-magnitude "
-            "curriculum was removed; the intended curriculum now lives in "
-            "generate_seeds(mode='noisy')→generate_seeds(mode='clean') two-stage "
-            "training.  Value ignored.",
+            "curriculum was removed.  Value ignored.",
             config["curriculum_levels"],
         )
 
-    # ── Comparator ────────────────────────────────────────────────────
     if comparator is None:
         comparator = TCLSC(hidden_dim=hidden_dim)
     comparator = comparator.to(device)
 
-    two_stage = clean_seeds is not None and len(clean_seeds) > 0
-    stage1_name = "pretrain/noisy" if two_stage else "pretrain"
-
-    # ── Stage 1 ──────────────────────────────────────────────────────
     comparator = _train_one_stage(
-        stage1_name, seeds, task_features, comparator, config, device,
+        seeds, task_features, comparator, config, device,
     )
 
-    # ── Stage 2 (optional, AutoCTS++ clean fine-tune) ────────────────
-    if two_stage:
-        effective_clean_config = _derive_clean_config(config, clean_config)
-        logger.info(
-            "[finetune/clean] starting from best-by-noisy-valid weights; "
-            "effective config: lr=%g  epochs=%d  patience=%d",
-            effective_clean_config.get("lr"),
-            effective_clean_config.get("epochs"),
-            effective_clean_config.get("patience", config.get("patience", 10)),
-        )
-        comparator = _train_one_stage(
-            "finetune/clean",
-            clean_seeds, task_features, comparator,
-            effective_clean_config, device,
-        )
-
-    # ── Save final ────────────────────────────────────────────────────
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         torch.save(comparator.state_dict(), save_path)

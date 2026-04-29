@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -79,7 +79,6 @@ def contrastive_pretrain(
     val_data: Optional[TimeSeriesDataset] = None,
     task_type: Optional[str] = None,
     horizons: Optional[List[int]] = None,
-    history: Optional[List[Dict[str, Any]]] = None,
 ) -> DilatedCNNEncoder:
     """Train *encoder* via contrastive learning.
 
@@ -125,9 +124,6 @@ def contrastive_pretrain(
         task_type: ``'classification' | 'forecasting' | 'anomaly_detection'``.
             Required when *val_data* is given.
         horizons: Forecasting horizons (only when ``task_type='forecasting'``).
-        history: Optional caller-supplied list; if given, training appends one
-            ``{epoch, loss, val_score}`` dict per epoch.  Useful for plotting
-            loss / val curves without re-running training.
 
     Returns:
         The trained encoder (same object as input, updated in-place).  When
@@ -161,13 +157,13 @@ def contrastive_pretrain(
         val_best_flag = task_type != "forecasting"
 
     # Split into two gates:
-    #   - ``eval_enabled``     controls per-epoch val_score computation and
-    #                          the history-record population.  Required by
-    #                          AutoCTS++-style noisy seed generation, which
-    #                          needs max(val_score) across epochs even when
-    #                          val-best restoration is disabled.
+    #   - ``eval_enabled``     controls per-epoch val_score computation
+    #                          (used for logging on every task type).
     #   - ``val_best_enabled`` controls whether to remember the best-by-val
-    #                          state_dict and restore it on exit.
+    #                          state_dict and restore it on exit.  Off for
+    #                          forecasting (train/val/test drift makes
+    #                          best-by-val pick the wrong epoch); on for
+    #                          classification / anomaly detection.
     eval_enabled = (
         eval_every > 0
         and val_data is not None
@@ -271,8 +267,8 @@ def contrastive_pretrain(
         # ── Optional val eval + best-checkpoint tracking (Bug #003a) ──
         # NOTE: ``eval_enabled`` only governs whether we COMPUTE val_score
         # each epoch; ``val_best_enabled`` governs whether we remember the
-        # best state.  Noisy seed generation turns val_best off but still
-        # needs the per-epoch scores through ``history``.
+        # best state.  Forecasting keeps eval on (for logging) but val_best
+        # off (because of train/val/test distribution drift).
         val_score: Optional[float] = None
         if eval_enabled and ((epoch + 1) % eval_every == 0 or epoch == epochs - 1):
             # When EMA is on, evaluate the AVERAGED weights (that's what
@@ -315,14 +311,6 @@ def contrastive_pretrain(
                 "Pretrain epoch %d/%d  loss=%.4f",
                 epoch + 1, epochs, mean_loss,
             )
-
-        if history is not None:
-            history.append({
-                "epoch": epoch + 1,
-                "step": global_step,
-                "loss": mean_loss,
-                "val_score": val_score,
-            })
 
         if stop:
             logger.info(

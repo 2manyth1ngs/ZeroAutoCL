@@ -49,23 +49,25 @@ def parse_args() -> argparse.Namespace:
                             "ExchangeRate", "PEMS-BAY"],
                    help="Source dataset names")
     p.add_argument("--n_per_dataset",   type=int,       default=30)
+    p.add_argument("--n_shared",        type=int,       default=None,
+                   help="Cross-source L-share pool size (AutoCTS++ trick). "
+                        "When >0, the first n_shared candidates per source are "
+                        "identical across ALL sources; the rest are sampled "
+                        "fresh per source.  None → read from YAML "
+                        "(seed_generation.n_shared, default 0).")
+    p.add_argument("--source_global_idx_offset", type=int, default=0,
+                   help="Per-source ds-index offset for SLURM job-array "
+                        "fan-out.  Each array task processes ONE source "
+                        "(--datasets <SRC>) and passes its --array task ID "
+                        "here so the per-source random pool seed and the "
+                        "per-candidate seed line up across the array exactly "
+                        "like a sequential single-job run.  Default 0 = "
+                        "sequential mode.")
     p.add_argument("--pretrain_epochs", type=int,       default=None,
                    help="Override per-dataset epoch budget for ALL datasets")
     p.add_argument("--pretrain_iters",  type=int,       default=None,
                    help="Override per-dataset iter budget for ALL datasets "
                         "(takes precedence over --pretrain_epochs)")
-    # Mode-specific budget — CLAUDE_ADV §12 calibrated 1/3 cut for noisy.
-    # These flags override YAML ``noisy_pretrain_iters`` /
-    # ``noisy_pretrain_epochs`` only when ``--mode noisy`` is active; they
-    # are silently ignored in clean mode.  When both --pretrain_iters and
-    # --noisy_pretrain_iters are set, the former drives clean stages and
-    # the latter drives noisy stages (no implicit equality).
-    p.add_argument("--noisy_pretrain_iters",  type=int, default=None,
-                   help="Override per-dataset noisy iter budget for ALL "
-                        "datasets (only consulted when --mode=noisy).")
-    p.add_argument("--noisy_pretrain_epochs", type=int, default=None,
-                   help="Override per-dataset noisy epoch budget for ALL "
-                        "datasets (only consulted when --mode=noisy).")
     p.add_argument("--batch_size",      type=int,       default=64)
     p.add_argument("--seed",            type=int,       default=42)
     p.add_argument("--device",          default=None,   help="'cpu' or 'cuda'")
@@ -75,24 +77,6 @@ def parse_args() -> argparse.Namespace:
                         "sub-space to the top-K rows of this file.")
     p.add_argument("--top_k_enc",       type=int, default=3,
                    help="(Plan B) How many encoders to keep from --encoder_grid.")
-    # ── AutoCTS++ two-stage seed generation ────────────────────────────
-    p.add_argument("--mode", choices=["clean", "noisy"], default="clean",
-                   help="Seed generation mode (AutoCTS++-style two-stage "
-                        "pipeline).  'clean' (default) runs full training + "
-                        "a single final eval — low-noise labels for the "
-                        "comparator fine-tuning stage.  'noisy' runs short "
-                        "training with per-epoch val eval and records "
-                        "max(val_score) over epochs (best-of-N estimator) — "
-                        "cheap labels for the comparator pretraining stage.  "
-                        "For noisy runs pair this with a small "
-                        "--pretrain_iters (e.g. 200) or a few epochs.")
-    p.add_argument("--randomise_init", action="store_true",
-                   help="Reseed every candidate from system entropy instead "
-                        "of the deterministic seed+i derivation.  Intended "
-                        "for the second half of the noisy pretraining stage "
-                        "(AutoCTS++'s use_seed=False branch) so the "
-                        "comparator's training data reflects real run-to-run "
-                        "variance.  Default OFF → reproducible seeds.")
     # ── Forecasting task-variant axes ─────────────────────────────────────
     p.add_argument("--n_time_windows", type=int, default=None,
                    help="Override forecasting_task_variants.n_time_windows "
@@ -142,6 +126,10 @@ def main() -> None:
         variants_cfg         = cfg.get("forecasting_task_variants", {}) or {}
 
     n_per_dataset   = args.n_per_dataset
+    n_shared        = args.n_shared
+    if n_shared is None:
+        n_shared = int(sg_cfg.get("n_shared", 0) or 0)
+    n_shared = max(0, min(int(n_shared), int(n_per_dataset)))
     pretrain_epochs = sg_cfg.get("pretrain_epochs", 40)
     pretrain_lr     = sg_cfg.get("pretrain_lr",     1e-3)
     batch_size      = sg_cfg.get("batch_size",      args.batch_size)
@@ -171,15 +159,9 @@ def main() -> None:
 
     # ── Per-dataset budget resolution ─────────────────────────────────────
     # Priority for each source dataset:
-    #   1. CLI --pretrain_iters / --pretrain_epochs (global override of the
-    #      base / clean axis — same semantics as before).
+    #   1. CLI --pretrain_iters / --pretrain_epochs (global override).
     #   2. configs/default.yaml :: dataset_budgets[name]
     #   3. Fallback: pretrain_epochs from seed_generation block (epoch-based)
-    #
-    # On TOP of whichever source wins, CLI --noisy_pretrain_iters /
-    # --noisy_pretrain_epochs (when given) replace any YAML-supplied
-    # noisy_pretrain_* keys.  These only matter when --mode=noisy; in clean
-    # mode they sit unused in the budget dict.
     dataset_budgets: Dict[str, Dict[str, int]] = {}
     for ds in args.datasets:
         if args.pretrain_iters is not None and args.pretrain_iters > 0:
@@ -190,13 +172,6 @@ def main() -> None:
             budget = dict(yaml_dataset_budgets[ds])
         else:
             budget = {"pretrain_epochs": int(pretrain_epochs)}
-
-        # CLI noisy-budget overrides — additive, not replacing.
-        if args.noisy_pretrain_iters is not None:
-            budget["noisy_pretrain_iters"] = int(args.noisy_pretrain_iters)
-        if args.noisy_pretrain_epochs is not None:
-            budget["noisy_pretrain_epochs"] = int(args.noisy_pretrain_epochs)
-
         dataset_budgets[ds] = budget
 
     device = torch.device(args.device) if args.device else None
@@ -210,10 +185,10 @@ def main() -> None:
         )
 
     logger.info(
-        "Generating seeds: datasets=%s  n_per=%d  lr=%.4f  bs=%d  "
-        "mode=%s  randomise_init=%s",
-        args.datasets, n_per_dataset, pretrain_lr, batch_size,
-        args.mode, args.randomise_init,
+        "Generating seeds: datasets=%s  n_per=%d (shared=%d, random=%d)  "
+        "lr=%.4f  bs=%d",
+        args.datasets, n_per_dataset, n_shared, n_per_dataset - n_shared,
+        pretrain_lr, batch_size,
     )
     logger.info("Per-dataset budgets: %s", dataset_budgets)
 
@@ -230,6 +205,8 @@ def main() -> None:
         source_datasets=args.datasets,
         data_dir=args.data_dir,
         n_per_dataset=n_per_dataset,
+        n_shared=n_shared,
+        source_global_idx_offset=int(args.source_global_idx_offset),
         pretrain_epochs=int(pretrain_epochs),    # used only as fallback
         pretrain_lr=float(pretrain_lr),
         batch_size=int(batch_size),
@@ -239,8 +216,6 @@ def main() -> None:
         dataset_budgets=dataset_budgets,
         fixed_encoders=fixed_encoders,
         crop_len=crop_len,
-        mode=args.mode,
-        randomise_init=args.randomise_init,
         n_time_windows=n_time_windows,
         horizon_groups=horizon_groups,
         min_window_len=min_window_len,

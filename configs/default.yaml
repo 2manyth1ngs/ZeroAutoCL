@@ -14,22 +14,25 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 seed_generation:
-  # AutoCTS++-aligned budget (reference/AutoCTS_plusplus/exps/generate_seeds.py
-  # uses ``sample_num=20`` as default — 20 clean + 40 noisy per task, total 60).
-  # Our previous 200 was ~10× AutoCTS++'s clean-mode count and made paper-scale
-  # runs impractical (~50+ hours on one GPU).
-  #
-  # Two-stage AutoCTS++ protocol, executed as THREE CLI invocations per task:
-  #
-  #   1. --mode noisy  --n_per_dataset 20  --seed 42     # deterministic init
-  #   2. --mode noisy  --n_per_dataset 20  --randomise_init  --seed 43
-  #   3. --mode clean  --n_per_dataset 20  --seed 44
-  #
-  # Yields 60 records per task × 8 source tasks = 480 total (matching AutoCTS++
-  # paper scale).  Estimated wall-clock ~15-20 h on a single RTX 4090.
-  n_per_dataset_noisy: 20   # per ``--mode noisy`` run (run twice → 40 total)
-  n_per_dataset_clean: 20   # single ``--mode clean`` run
-  n_per_dataset: 20         # backward-compat fallback when CLI doesn't pass it
+  # P0 fix (2026-04-29): the previous noisy/clean two-stage protocol was
+  # removed — at ZeroAutoCL's data scale (≤1000 train pairs), neither stage
+  # learned beyond the random-guess baseline (BCE valid loss stayed at
+  # ln 2 ≈ 0.6786, accuracy ≈ 0.6).  We now run a single full-budget seed
+  # generation pass and rely on sub-task slicing (forecasting_task_variants
+  # below) to multiply effective training pairs ~9× without extra sampling.
+  n_per_dataset: 20         # candidates per (source × sub-task)
+  # Cross-source L-share pool size (AutoCTS++ generate_seeds.py L65-103
+  # ``use_seed=True`` mechanism).  The first ``n_shared`` candidates per
+  # source are sampled ONCE before the source loop and are identical
+  # across every source; the remaining ``n_per_dataset - n_shared`` are
+  # sampled fresh per source.  Each shared config thus appears in
+  # (sources × sub-tasks) (task, perf) cells, giving the comparator's
+  # task-feature head dense supervision on how the same config's rank
+  # shifts across tasks — the signal needed for zero-shot generalisation.
+  # AutoCTS++ uses 1:1 (sample_num shared + sample_num random); we mirror
+  # that by default.  ``0`` disables L-share (independent per-source
+  # pools, the pre-2026-04-30 behaviour).
+  n_shared: 10
   pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
   pretrain_lr: 0.001
   batch_size: 32
@@ -63,7 +66,13 @@ seed_generation:
 # Total CL pre-trainings per source = n_time_windows × n_per_dataset
 # (horizon groups reuse the trained encoder).
 forecasting_task_variants:
-  n_time_windows: 1
+  # P0 fix (2026-04-29): time-window and variable-subset slicing are now
+  # ENABLED by default (3 each) so the comparator sees the same configs
+  # ranked under multiple data slices.  This is the cheapest way to lift
+  # the pair count from O(n_per_dataset²) to O((n_per_dataset × 9)²) per
+  # source — roughly an order-of-magnitude more learning signal at the
+  # cost of n_time_windows × n_variable_subsets more CL pretrain runs.
+  n_time_windows: 3
   horizon_groups: null
   min_window_len: 1000        # skip slicing when window < this many timesteps
 
@@ -75,18 +84,15 @@ forecasting_task_variants:
   # ``min_var_count``.  Per-source variable indices are deterministic (seeded
   # by ``--seed`` + base dataset name) so seed-gen and comparator pretrain
   # see identical sub-task definitions.
-  n_variable_subsets: 1                # 1 = disabled; ≥2 enables subsampling
+  n_variable_subsets: 3                # 1 = disabled; ≥2 enables subsampling
   var_size_rates: [0.25, 0.5, 0.75]    # fractional bucket centres
   min_var_count: 4                     # skip sources with fewer raw vars
 
-  # Example: 3 windows × 3 var-subsets × 2 horizon-groups = 18 sub-tasks
-  # per *wide* source (PEMS), 3 × 1 × 2 = 6 sub-tasks per *narrow* source
-  # (ETT univariate, ExchangeRate).
-  # n_time_windows: 3
-  # n_variable_subsets: 3
-  # horizon_groups:
-  #   - [24, 48, 168]           # short / mid horizons
-  #   - [336, 720]               # long horizons
+  # Effective sub-task counts per source with the defaults above:
+  #   • Wide  (PEMS series, 170–883 vars) : 3 × 3 = 9 sub-tasks
+  #   • Narrow (ETT univariate, 1 var)    : 3 × 1 = 3 sub-tasks
+  #     (variable subset axis silently disabled by min_var_count=4)
+  #   • ExchangeRate (8 vars)             : 3 × 3 = 9 sub-tasks
 
 # Per-dataset training budget (Bug #003a).
 #
@@ -97,32 +103,14 @@ forecasting_task_variants:
 #
 # Classification / anomaly datasets keep epoch-based training and use
 # val-best checkpointing (val signal is reliable for them).
-#
-# Mode-specific budget (AutoCTS++ §3.2.4 cheaper-noisy stage; CLAUDE_ADV
-# §12 calibration anchor):
-#
-#   - ``noisy_pretrain_iters``  : iter budget when ``mode='noisy'``.
-#   - ``noisy_pretrain_epochs`` : epoch budget when ``mode='noisy'``.
-#
-# Either alone is sufficient.  When both keys are absent, noisy mode falls
-# back to the base ``pretrain_iters`` / ``pretrain_epochs`` (preserves
-# legacy behaviour where noisy and clean shared the same budget).
-#
-# The 200-iter default is calibrated on ETTh2 (CLAUDE_ADV §12.4):
-# Spearman ρ=0.905 / pairwise concordance=0.947 already at ~1 epoch
-# (≈ 240 iters).  200 iters is a 3× cost cut vs the 600-iter clean budget
-# while staying inside the calibrated regime for ETT-scale data.
-# **Per-dataset tuning may still be required for PEMS-scale data** —
-# 200 iters at batch 32 on PEMS04 (~10k train samples) is only ~0.6 epoch.
-# If a re-calibration shows ρ < 0.6 there, raise to 300-400.
 dataset_budgets:
   # ── Forecasting (target pool) ──────────────────────────────────────────────
-  ETTh1:        { pretrain_iters: 600, noisy_pretrain_iters: 200 }
-  ETTm1:        { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  ETTh1:        { pretrain_iters: 600 }
+  ETTm1:        { pretrain_iters: 600 }
   # ── Forecasting (source pool) ──────────────────────────────────────────────
-  ETTh2:        { pretrain_iters: 600, noisy_pretrain_iters: 200 }
-  PEMS03:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
-  PEMS04:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  ETTh2:        { pretrain_iters: 600 }
+  PEMS03:       { pretrain_iters: 600 }
+  PEMS04:       { pretrain_iters: 600 }
   # PEMS07 has 883 sensor channels (vs PEMS03's 358, PEMS04's 307,
   # PEMS08's 170) — two independent OOM modes:
   #
@@ -138,31 +126,29 @@ dataset_budgets:
   #      two largest targets, cutting peak CPU memory by ~60 GB while
   #      keeping short + mid range for rank discrimination (same precedent
   #      as ``two_stage_search.encoder_grid.eval_horizons``).
-  PEMS07:       { pretrain_iters: 600, noisy_pretrain_iters: 200,
+  PEMS07:       { pretrain_iters: 600,
                   crop_len: 512, eval_horizons: [24, 48, 168] }
-  PEMS08:       { pretrain_iters: 600, noisy_pretrain_iters: 200 }
-  PEMS-BAY:     { pretrain_iters: 600, noisy_pretrain_iters: 200 }
-  ExchangeRate: { pretrain_iters: 600, noisy_pretrain_iters: 200 }
+  PEMS08:       { pretrain_iters: 600 }
+  PEMS-BAY:     { pretrain_iters: 600 }
+  ExchangeRate: { pretrain_iters: 600 }
   # ── Classification (iter-based for Stage A / B, epoch-based only in Phase 4) ─
   # SleepEEG has ~23k train samples vs Epilepsy's ~250; epoch-based budgets
   # cause 90× iteration disparity (Bug #006).  Iter-based budgets normalise
   # wall-clock cost across datasets.  Phase 4 (run_phase4_finalists_cls.py)
   # reads only pretrain_epochs and ignores pretrain_iters, so it still uses
   # epoch-based training with val-best checkpointing as intended.
-  HAR:          { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
-  Epilepsy:     { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
-  SleepEEG:     { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
-  Gesture:      { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
-  NATOPS:       { pretrain_iters: 600, pretrain_epochs: 40, noisy_pretrain_iters: 200 }
+  HAR:          { pretrain_iters: 600, pretrain_epochs: 40 }
+  Epilepsy:     { pretrain_iters: 600, pretrain_epochs: 40 }
+  SleepEEG:     { pretrain_iters: 600, pretrain_epochs: 40 }
+  Gesture:      { pretrain_iters: 600, pretrain_epochs: 40 }
+  NATOPS:       { pretrain_iters: 600, pretrain_epochs: 40 }
   # ── Anomaly detection (epoch-based) ──────────────────────────────────────
-  # Calibration didn't cover anomaly detection; leaving noisy at base budget
-  # until a separate calibration anchors the 1/3-cut decision.
   Yahoo:        { pretrain_epochs: 40 }
   KPI:          { pretrain_epochs: 40 }
 
 comparator:
-  # Stage 1 (pretrain / noisy seeds) config.  See
-  # search/pretrain_comparator.py for the full key reference.
+  # T-CLSC training config.  See search/pretrain_comparator.py for the
+  # full key reference.
   #
   # Values aligned with AutoCTS++ (random_search.py L28,29,41,538):
   #   batch_size=64, lr=1e-4, epochs=100, tolerance=3 (we allow patience=5
@@ -171,23 +157,13 @@ comparator:
   lr: 0.0001
   batch_size: 64
   hidden_dim: 128
-  valid_gap_threshold: 0.02 # P0: gap used to split valid from train seeds
-  patience: 5               # P0: epochs of non-improvement → early stop
-  eval_every: 1             # P0: evaluate valid loss every N epochs
-  # NOTE: ``curriculum_levels`` is deprecated (P0 removed the gap-magnitude
-  # curriculum).  The curriculum now lives in the two-stage noisy→clean
-  # protocol; the 'comparator_clean' block below configures stage 2.
-
-# Stage 2 (fine-tune / clean seeds) config — only consulted by
-# ``run_pretrain_comparator.py`` when ``--clean_seeds_path`` is supplied.
-# Any key omitted here inherits from ``comparator:`` above; the defaults
-# when this whole block is absent are ``lr := 0.1 × comparator.lr`` and
-# ``epochs := comparator.epochs // 2``.
-#
-# comparator_clean:
-#   lr: 1.0e-5
-#   epochs: 100
-#   patience: 8
+  # P0 fix (2026-04-29): bumped from 0.02 (raw-perf units) to 0.5 because
+  # the gap is now applied AFTER per-task z-score normalisation in
+  # ``_split_seeds_and_pairs`` — 0.5 ≈ half a standard deviation, a uniform
+  # split criterion across sources whose absolute scales differ by 50–100×.
+  valid_gap_threshold: 0.5
+  patience: 5               # epochs of non-improvement → early stop
+  eval_every: 1             # evaluate valid loss every N epochs
 
 zero_shot:
   n_candidates: 200000      # 200k pool — comparator forward is nearly free on 4090
