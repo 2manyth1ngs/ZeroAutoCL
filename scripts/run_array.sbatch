@@ -33,17 +33,25 @@
 #      and per-candidate training seed line up exactly with the sequential
 #      single-job ordering.  Verified byte-equal against sequential mode.
 #
-# Workflow
-# --------
+# Workflow (fully automatic — one command)
+# ----------------------------------------
 #
-#   # 1) Submit the array (6 parallel jobs, one per source)
-#   JID=$(sbatch --parsable scripts/run_array.sbatch)
+#   sbatch scripts/run_array.sbatch
 #
-#   # 2) Submit the dependent finish job (B.2 → Phase 4) once all
-#   #    array tasks finish OK.  ``run_full_etth1_autocts.sbatch``'s B.1
-#   #    stage will see all ``_seeds_<SRC>.json`` checkpoints and skip
-#   #    retraining; it just merges them into ``seeds.json`` and proceeds.
-#   sbatch --dependency=afterok:${JID} scripts/run_full_etth1_autocts.sbatch
+# That's the entire submission.  Task 0 of the array auto-submits
+# ``run_full_etth1_autocts.sbatch`` with
+# ``--dependency=afterok:${SLURM_ARRAY_JOB_ID}``, so once every array
+# task (B.1 seed-gen for one source) finishes OK, the downstream sbatch
+# is automatically launched and runs B.2 → B.3 → Phase 4 against the
+# merged ``seeds.json``.  Both stages are resume-safe — re-running this
+# script after a partial failure picks up where it left off via the
+# per-source ``_seeds_<SRC>.json`` checkpoints and the per-stage
+# output-file gates in ``run_full_etth1_autocts.sbatch``.
+#
+# Opt out (B.1 only, e.g. for debugging the array):
+#   ZAC_NO_CHAIN=1 sbatch scripts/run_array.sbatch
+# In that case submit the downstream manually after the array finishes:
+#   sbatch --dependency=afterok:${ARR_JID} scripts/run_full_etth1_autocts.sbatch
 #
 # Tightening %N
 # -------------
@@ -111,6 +119,51 @@ export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 
 nvidia-smi
 python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available(), '| dev:', torch.cuda.get_device_name(0), '| vram_gb:', round(torch.cuda.get_device_properties(0).total_memory/1e9, 1))"
+
+# ── Auto-chain: queue the downstream pipeline upfront ─────────────────────
+# Task 0 (only) submits ``run_full_etth1_autocts.sbatch`` with
+# ``--dependency=afterok:${SLURM_ARRAY_JOB_ID}`` so the entire chain
+# (B.1 array → B.2 → B.3 → Phase 4) launches from a single ``sbatch``
+# command.  We do this BEFORE the heavy seed-gen work so the dependent
+# job is visible in ``squeue`` immediately; ``afterok`` semantics ensure
+# it stays PD until every array task completes successfully.
+#
+# Requeue safety: a lock file in OUT_DIR keeps re-runs of task 0 (e.g.
+# spot pre-emption) from queuing duplicate downstream jobs.
+#
+# Opt out for B.1-only (debugging):  ZAC_NO_CHAIN=1 sbatch scripts/run_array.sbatch
+DEP_SBATCH="scripts/run_full_etth1_autocts.sbatch"
+LOCK="${OUT_DIR}/.auto_chain_${SLURM_ARRAY_JOB_ID:-manual}"
+if [[ "${ARRAY_ID}" == "0" && "${ZAC_NO_CHAIN:-}" != "1" ]]; then
+    if [[ -f "${LOCK}" ]]; then
+        echo "[auto-chain] downstream already queued (lock: ${LOCK})"
+        echo "[auto-chain] previous JID: $(cat "${LOCK}" 2>/dev/null || echo "?")"
+    elif [[ ! -s "${DEP_SBATCH}" ]]; then
+        echo "[auto-chain] downstream sbatch ${DEP_SBATCH} missing — skipping"
+    else
+        # Fail-safe: a flaky compute-node sbatch invocation must NOT mark the
+        # B.1 task FAILED.  Disable pipefail locally and capture rc.
+        set +e
+        DEP_OUT=$(sbatch --parsable \
+            --dependency=afterok:${SLURM_ARRAY_JOB_ID} \
+            "${DEP_SBATCH}" 2>&1)
+        DEP_RC=$?
+        set -e
+        if [[ ${DEP_RC} -ne 0 ]]; then
+            echo "[auto-chain] WARNING: sbatch failed (rc=${DEP_RC}): ${DEP_OUT}"
+            echo "[auto-chain] proceeding with seed-gen — submit downstream manually:"
+            echo "             sbatch --dependency=afterok:${SLURM_ARRAY_JOB_ID} ${DEP_SBATCH}"
+        else
+            DEP_JID="${DEP_OUT}"
+            echo "${DEP_JID}" > "${LOCK}"
+            echo "[auto-chain] queued downstream job ${DEP_JID}"
+            echo "             will run when all tasks of array ${SLURM_ARRAY_JOB_ID} finish OK"
+            echo "             ('scancel ${SLURM_ARRAY_JOB_ID} ${DEP_JID}' to abort the whole chain)"
+        fi
+    fi
+elif [[ "${ZAC_NO_CHAIN:-}" == "1" ]]; then
+    [[ "${ARRAY_ID}" == "0" ]] && echo "[auto-chain] disabled by ZAC_NO_CHAIN=1 — submit downstream manually"
+fi
 
 # ── Synthetic encoder_grid.json (Stage A is SKIP — we use GGS encoder) ─────
 # Each array task ensures this file exists.  If it already does (e.g. another
@@ -186,11 +239,13 @@ if [[ -s "${SRC_CKPT}" ]]; then
 fi
 echo "Log              : ${OUT_DIR}/run_array_${ARRAY_ID}_${SRC}.log"
 echo
-echo "Next step:"
-echo "  After all 6 array tasks finish OK, submit the downstream sbatch:"
-echo "    sbatch --dependency=afterok:\${SLURM_ARRAY_JOB_ID} \\"
-echo "        scripts/run_full_etth1_autocts.sbatch"
-echo "  ('run_full_etth1_autocts.sbatch' will detect all _seeds_<SRC>.json"
-echo "   checkpoints, skip B.1 retraining, merge into seeds.json, then run"
-echo "   B.2 → B.3 → Phase 4.)"
+if [[ -f "${LOCK}" ]]; then
+    echo "Downstream       : auto-chained, JID $(cat "${LOCK}" 2>/dev/null || echo "?")"
+    echo "                   (waits on afterok:${SLURM_ARRAY_JOB_ID:-?}; runs B.2 → B.3 → Phase 4)"
+else
+    echo "Downstream       : NOT auto-chained (ZAC_NO_CHAIN=1 or task != 0)"
+    echo "                   submit manually:"
+    echo "                     sbatch --dependency=afterok:\${SLURM_ARRAY_JOB_ID} \\"
+    echo "                         scripts/run_full_etth1_autocts.sbatch"
+fi
 echo "================================================================="
