@@ -41,11 +41,12 @@ Public surface
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import random
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -235,6 +236,42 @@ def _sample_variable_subsets(
         idx = sorted(rng.choice(n_raw_vars, size=size, replace=False).tolist())
         subsets.append(idx)
     return subsets
+
+
+def _slice_scaler(scaler: Optional[Any], idx_list: List[int]) -> Optional[Any]:
+    """Return a deep-copied scaler whose per-feature stats are sliced to ``idx_list``.
+
+    The parent scaler is fit on the full raw-variable column set during data
+    loading (e.g. PEMS03 → 358 sensors, ExchangeRate → 8 currencies).  When
+    variable subsampling reduces the column count, the subsetted dataset
+    must carry a scaler whose ``mean_`` / ``scale_`` / ``var_`` arrays match
+    the kept columns — otherwise ``scaler.inverse_transform`` inside
+    :func:`utils.metrics.compute_forecasting_metrics` raises a broadcast
+    ``ValueError`` (e.g. ``(N, 90)`` vs ``(358,)``).  That exception is
+    silently swallowed by ``_quick_eval`` and turns every candidate's
+    performance into a ``-1e9`` sentinel, poisoning seed generation.
+
+    Args:
+        scaler: A fitted sklearn ``StandardScaler`` (or ``None``).
+        idx_list: Raw-variable column indices to keep.  Must be valid
+            indices into ``scaler.mean_`` / ``scaler.scale_``.
+
+    Returns:
+        A deep copy of ``scaler`` with stats sliced to ``idx_list``, or
+        ``None`` when the input is ``None``.
+    """
+    if scaler is None:
+        return None
+    sub = copy.deepcopy(scaler)
+    idx = np.asarray(idx_list, dtype=np.int64)
+    if getattr(sub, "mean_", None) is not None:
+        sub.mean_ = sub.mean_[idx]
+    if getattr(sub, "scale_", None) is not None:
+        sub.scale_ = sub.scale_[idx]
+    if getattr(sub, "var_", None) is not None:
+        sub.var_ = sub.var_[idx]
+    sub.n_features_in_ = len(idx_list)
+    return sub
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +466,7 @@ def make_forecasting_subtasks(
                 # Full variable set → no per-window column slicing needed.
                 tr_arr = win_train
                 va_arr = win_val
+                sub_scaler = scaler
             else:
                 # Keep the n_cov covariate columns (always at the front)
                 # plus the chosen raw-variable columns.  Index arithmetic:
@@ -437,15 +475,24 @@ def make_forecasting_subtasks(
                 cols = list(range(n_cov)) + [n_cov + i for i in var_idx_list]
                 tr_arr = win_train[:, :, cols].copy()
                 va_arr = win_val[:, :, cols].copy()
+                # Match the scaler feature count to the sliced raw-variable
+                # set so ``compute_forecasting_metrics`` can call
+                # ``inverse_transform`` without a broadcast error.  The
+                # parent scaler operates on raw variables only (covariates
+                # are stripped before the inverse transform), so slicing
+                # by ``var_idx_list`` directly is correct for both the
+                # n_cov=0 sources (PEMS / ExchangeRate / pems-bay) and the
+                # n_cov>0 ETT sources.
+                sub_scaler = _slice_scaler(scaler, var_idx_list)
 
             train_sub = TimeSeriesDataset(
                 tr_arr, None, "forecasting", max_len=None,
                 window_len=win_crop, window_stride=1,
-                scaler=scaler, n_covariate_cols=n_cov,
+                scaler=sub_scaler, n_covariate_cols=n_cov,
             )
             val_sub = TimeSeriesDataset(
                 va_arr, None, "forecasting", max_len=None,
-                scaler=scaler, n_covariate_cols=n_cov,
+                scaler=sub_scaler, n_covariate_cols=n_cov,
             )
             sub = ForecastingSubTask(
                 base_name=name,
