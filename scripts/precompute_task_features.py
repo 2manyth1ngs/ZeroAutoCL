@@ -291,7 +291,8 @@ def main() -> None:
             continue
 
         # Atomic write so a crash mid-save can't leave a corrupt cache.
-        tmp = out_path + ".tmp"
+        # tmp must end in .npy so np.save doesn't append a second .npy suffix.
+        tmp = out_path[:-4] + ".tmp.npy"
         np.save(tmp, arr)
         os.replace(tmp, out_path)
         n_ok += 1
