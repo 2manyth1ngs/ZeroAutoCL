@@ -250,6 +250,12 @@ python -u scripts/merge_seed_checkpoints.py \\
 # datasets already cached at \${TASK_FEAT_DIR} are skipped automatically,
 # so this step costs ~0 on resume runs.
 #
+# Iter-based budget (--iters 600) is mandatory for ZeroAutoCL: the
+# stride-1 sliding-window TimeSeriesDataset inflates len(dataset) to
+# T - 3000 + 1 (~12k samples for PEMS03), so epoch-based budgets balloon
+# into 4+ hours per source.  600 iters mirrors TS2Vec's n_iters default
+# and bounds Stage T to ~5 min per dataset.
+#
 # slide_batch=64 is a safe default for the widest source (PEMS07, 883 ch);
 # narrower datasets fit easily and aren't slowed materially.
 echo
@@ -260,7 +266,7 @@ srun --unbuffered python -u scripts/precompute_task_features.py \\
     --datasets    PEMS03 PEMS04 PEMS07 PEMS08 ETTh2 ExchangeRate "\${TARGET}" \\
     --data_dir    "\${DATA_DIR}" \\
     --cache_dir   "\${TASK_FEAT_DIR}" \\
-    --epochs      20 \\
+    --iters       600 \\
     --slide_batch 64 \\
     --seed        "\${SEED}" \\
     > >(tee -a "\${OUT_DIR}/run_post.log") \\

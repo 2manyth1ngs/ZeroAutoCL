@@ -92,9 +92,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", required=True, help="Root data directory.")
     p.add_argument("--cache_dir", default=DEFAULT_CACHE_DIR,
                    help=f"Output dir for .npy files (default: {DEFAULT_CACHE_DIR}).")
-    p.add_argument("--epochs", type=int, default=20,
-                   help="CL pretraining epochs for the task-feature encoder "
-                        "(matches AutoCTS++ generate_task_feature.py default).")
+    p.add_argument("--iters", type=int, default=600,
+                   help="CL pretraining iter budget (matches TS2Vec's "
+                        "n_iters=600 default for size>100k datasets, used "
+                        "by AutoCTS++ generate_task_feature.py).  Iter "
+                        "mode is mandatory here because ZeroAutoCL's "
+                        "TimeSeriesDataset uses a stride-1 sliding-window "
+                        "view, which inflates ``len(dataset)`` to "
+                        "``T - window_len + 1`` (e.g. 12k+ for PEMS) — "
+                        "epoch-based budgets would then run ~30k batches "
+                        "per dataset and take hours.  Set --epochs to "
+                        "override.")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Optional epoch override.  When set, takes "
+                        "precedence over --iters and runs in epoch mode.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch_size", type=int, default=8,
                    help="CL pretraining batch size (small — long crops).")
@@ -179,13 +190,22 @@ def precompute_one(
     pipeline = CLPipeline(encoder, _GGS_STRATEGY).to(device)
 
     pretrain_cfg = {
-        "pretrain_epochs": args.epochs,
         "pretrain_lr":     args.lr,
         "batch_size":      args.batch_size,
         "use_ema":         True,
     }
-
-    logger.info("[%s] training task-feature encoder for %d epochs", name, args.epochs)
+    if args.epochs is not None:
+        pretrain_cfg["pretrain_epochs"] = int(args.epochs)
+        logger.info(
+            "[%s] training task-feature encoder for %d epochs (epoch mode)",
+            name, args.epochs,
+        )
+    else:
+        pretrain_cfg["pretrain_iters"] = int(args.iters)
+        logger.info(
+            "[%s] training task-feature encoder for %d iters (iter mode)",
+            name, args.iters,
+        )
     contrastive_pretrain(
         encoder=encoder,
         cl_pipeline=pipeline,
