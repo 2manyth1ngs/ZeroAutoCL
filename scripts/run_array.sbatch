@@ -42,11 +42,18 @@
 # downstream sbatch at ``${OUT_DIR}/_chained_post_<arr_jid>.sbatch`` and
 # submits it with ``--dependency=afterok:${SLURM_ARRAY_JOB_ID}``, so once
 # every array task (B.1 seed-gen for one source) finishes OK, the
-# downstream job is automatically launched and runs B.2 → B.3 → Phase 4
-# against the merged ``seeds.json`` — no separate sbatch file is needed.
-# Each stage is resume-safe — re-running this script after a partial
-# failure picks up where it left off via the per-source
-# ``_seeds_<SRC>.json`` checkpoints and per-stage output-file gates.
+# downstream job is automatically launched and runs:
+#
+#     final seeds merge → Stage T (precompute task features for sources
+#     + target) → B.2 (T-CLSC training) → B.3 (zero-shot ranking) →
+#     Phase 4 (Cartesian retrain on the target)
+#
+# — no separate sbatch file, no manual ``precompute_task_features.py``
+# invocation, nothing.  Each stage is resume-safe — re-running this
+# script after a partial failure picks up where it left off via the
+# per-source ``_seeds_<SRC>.json`` checkpoints, the per-dataset
+# ``{cache_dir}/<ds>_task_feature.npy`` files, and per-stage output-file
+# gates.
 #
 # Opt out (B.1 only, e.g. for debugging the array):
 #   ZAC_NO_CHAIN=1 sbatch scripts/run_array.sbatch
@@ -236,6 +243,29 @@ python -u scripts/merge_seed_checkpoints.py \\
     > >(tee -a "\${OUT_DIR}/run_post.log") \\
     2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
 
+# ── Stage T — precompute task features for sources + target ────────────────
+# AutoCTS++-aligned task features (full TS2Vec encode + sample 100 windows)
+# must exist on disk before B.2 — :class:\`TaskFeatureExtractor\` is a pure
+# loader, not a trainer.  ``precompute_task_features.py`` is idempotent:
+# datasets already cached at \${TASK_FEAT_DIR} are skipped automatically,
+# so this step costs ~0 on resume runs.
+#
+# slide_batch=64 is a safe default for the widest source (PEMS07, 883 ch);
+# narrower datasets fit easily and aren't slowed materially.
+echo
+echo "═══════ Stage T: precompute task features ═══════"
+TASK_FEAT_DIR="outputs/task_features"
+mkdir -p "\${TASK_FEAT_DIR}"
+srun --unbuffered python -u scripts/precompute_task_features.py \\
+    --datasets    PEMS03 PEMS04 PEMS07 PEMS08 ETTh2 ExchangeRate "\${TARGET}" \\
+    --data_dir    "\${DATA_DIR}" \\
+    --cache_dir   "\${TASK_FEAT_DIR}" \\
+    --epochs      20 \\
+    --slide_batch 64 \\
+    --seed        "\${SEED}" \\
+    > >(tee -a "\${OUT_DIR}/run_post.log") \\
+    2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
+
 # ── Stage B.2 — T-CLSC training ────────────────────────────────────────────
 echo
 echo "═══════ Stage B.2: T-CLSC training ═══════"
@@ -294,6 +324,7 @@ echo "================================================================="
 echo "Downstream finished : \$(date -Is)"
 echo "Outputs:"
 echo "  Stage B.1     : \${SEEDS}"
+echo "  Stage T       : \${TASK_FEAT_DIR}/<dataset>_task_feature.npy"
 echo "  Stage B.2     : \${COMPARATOR}"
 echo "  Stage B.3     : \${FINALISTS}"
 echo "  Phase 4       : \${OUT_DIR}/phase4_results.json"

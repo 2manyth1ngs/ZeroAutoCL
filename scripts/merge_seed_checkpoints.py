@@ -101,7 +101,25 @@ def main() -> int:
         return 0
 
     out = args.out or os.path.join(args.ckpt_dir, "seeds.json")
-    tmp = out + ".tmp"
+
+    # PID-suffixed tmp path so 6 array tasks running merger in parallel each
+    # write to their own tmp file.  Without the suffix, two concurrent
+    # writers collide:
+    #
+    #   1. Process A opens "seeds.json.tmp" (write-mode), writes, closes.
+    #   2. Process B opens the same path, truncates A's content, writes.
+    #   3. A calls ``os.replace(tmp, out)`` — succeeds, tmp now gone.
+    #   4. B calls ``os.replace(tmp, out)`` — FileNotFoundError (tmp was
+    #      moved out from under it by A).
+    #
+    # ``os.replace`` is a POSIX ``rename(2)`` which is atomic at the
+    # destination, so per-process tmp files are sufficient: whichever
+    # writer's rename runs last is the visible content of seeds.json, and
+    # since every concurrent writer reads the same set of checkpoints at
+    # the same point in time, all writers produce identical content (modulo
+    # writes interleaving with later checkpoints — handled by the LAST
+    # array task's merger, which always sees the full checkpoint set).
+    tmp = f"{out}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(all_records, f, indent=2)
     os.replace(tmp, out)
