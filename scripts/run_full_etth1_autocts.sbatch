@@ -176,11 +176,53 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage B.1 — seed generation (full training budget, sub-task slicing on)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Two upstream entry paths land us here:
+#
+#   1. Sequential mode (this sbatch invoked directly): a single Python
+#      process runs ``run_generate_seeds.py`` over all sources, writing
+#      per-source ``_seeds_<SRC>.json`` checkpoints AND a correctly-merged
+#      final ``seeds.json``.  Nothing extra to do — skip on resume.
+#
+#   2. SLURM-array mode (``run_array.sbatch`` → afterok dependency): 6
+#      array tasks run in parallel, each invoking
+#      ``run_generate_seeds.py --datasets <ONE_SRC>``.  Each task writes
+#      its own ``_seeds_<SRC>.json`` (resume-safe) AND a single-source
+#      ``seeds.json`` to the SAME path.  These six writes race; the last
+#      writer wins, so ``seeds.json`` ends up containing exactly one
+#      source's records — undetectable until B.2 fits the comparator on
+#      effectively zero cross-task signal (BCE valid loss stuck at ln 2).
+#
+# Detection: when ``_seeds_*.json`` checkpoints are present we ALWAYS run
+# the merger — it is idempotent and unconditionally overwrites whatever
+# stale ``seeds.json`` the array race may have left behind.
+# ─────────────────────────────────────────────────────────────────────────────
 echo
 echo "═══════ Stage B.1: seed generation ═══════"
-if [[ -s "${SEEDS}" ]]; then
-    echo "[stage-B.1] ${SEEDS} exists — skipping (delete to re-run)"
+
+shopt -s nullglob
+SRC_CKPTS=("${SEEDS_DIR}"/_seeds_*.json)
+shopt -u nullglob
+N_CKPTS=${#SRC_CKPTS[@]}
+N_SOURCES=${#SOURCES[@]}
+
+if (( N_CKPTS > 0 )); then
+    # Came from run_array.sbatch (or a partial sequential run that crashed
+    # mid-loop).  Merge per-source checkpoints into seeds.json — overrides
+    # any racy single-source seeds.json the array left behind.
+    echo "[stage-B.1] found ${N_CKPTS}/${N_SOURCES} per-source checkpoint(s) — merging into ${SEEDS}"
+    python -u scripts/merge_seed_checkpoints.py \
+        --ckpt_dir "${SEEDS_DIR}" \
+        --out      "${SEEDS}" \
+        > >(tee -a "${OUT_DIR}/run.log") 2> >(tee -a "${OUT_DIR}/run.log" >&2)
+    if (( N_CKPTS < N_SOURCES )); then
+        echo "[stage-B.1] WARNING: only ${N_CKPTS}/${N_SOURCES} sources covered — seeds.json is incomplete."
+        echo "[stage-B.1]          downstream stages will run on a narrower seed pool than configured."
+    fi
+elif [[ -s "${SEEDS}" ]]; then
+    echo "[stage-B.1] ${SEEDS} exists (no per-source checkpoints) — skipping (delete to re-run)"
 else
+    echo "[stage-B.1] no per-source checkpoints and no seeds.json — running full sequential seed-gen"
     srun --unbuffered python -u scripts/run_generate_seeds.py \
         --data_dir       "${DATA_DIR}" \
         --save_dir       "${SEEDS_DIR}" \
