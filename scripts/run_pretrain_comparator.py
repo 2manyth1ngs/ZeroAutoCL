@@ -125,6 +125,7 @@ def main() -> None:
             splits = load_dataset(base, args.data_dir)
             task_features[base] = tfe.extract(
                 splits["train"], splits["train"].task_type,
+                dataset_name=base,
             )
             continue
 
@@ -165,13 +166,16 @@ def main() -> None:
                 splits = load_dataset(base, args.data_dir)
                 task_features[tid] = tfe.extract(
                     splits["train"], splits["train"].task_type,
+                    dataset_name=base,
                 )
                 continue
             sub = by_window[window_id]
             # Pick the explicit horizon for this group (when applicable) so
-            # the meta-feature horizon scalar differs across hg variants of
-            # the same window — otherwise the comparator gets identical
-            # task features for differently-labelled (tid, candidate) pairs.
+            # downstream logging stays informative; the cached task feature
+            # itself is keyed only on the base dataset name (the precomputed
+            # encoder already captures the source's distribution; per-window
+            # / per-horizon variation is now learned by the comparator from
+            # the seed labels themselves).
             horizon_meta = 0
             if parts.hg_idx is not None and parts.hg_idx < len(sub.horizon_groups):
                 hg = sub.horizon_groups[parts.hg_idx]
@@ -184,6 +188,7 @@ def main() -> None:
             )
             task_features[tid] = tfe.extract(
                 sub.train, sub.train.task_type, horizon=horizon_meta,
+                dataset_name=base,
             )
     logger.info("Task features ready for %d task IDs.", len(task_features))
 

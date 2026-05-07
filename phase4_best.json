@@ -1,0 +1,74 @@
+{
+  "tag": "L10_H64_O320_r1",
+  "encoder_config": {
+    "n_layers": 10,
+    "hidden_dim": 64,
+    "output_dim": 320
+  },
+  "strategy": {
+    "augmentation": {
+      "resize": 0.0,
+      "rescale": 0.4,
+      "jitter": 0.95,
+      "point_mask": 0.95,
+      "freq_mask": 0.4,
+      "crop": 0.1,
+      "order": 2
+    },
+    "embedding_transform": {
+      "jitter_p": 0.4,
+      "mask_p": 0.4,
+      "norm_type": "l2"
+    },
+    "pair_construction": {
+      "instance": true,
+      "temporal": false,
+      "cross_scale": false,
+      "kernel_size": 5,
+      "pool_op": "avg",
+      "adj_neighbor": true
+    },
+    "loss": {
+      "type": "infonce",
+      "sim_func": "cosine",
+      "temperature": 0.01
+    }
+  },
+  "rank": 1,
+  "mean_mse": 0.10578412935137749,
+  "mean_mae": 0.24702939093112947,
+  "per_horizon": {
+    "24": {
+      "mse": 0.04026457294821739,
+      "mae": 0.15161149203777313,
+      "mse_raw": 3.390598773956299,
+      "mae_raw": 1.3912615776062012
+    },
+    "48": {
+      "mse": 0.06529714167118073,
+      "mae": 0.193333238363266,
+      "mse_raw": 5.498541355133057,
+      "mae_raw": 1.774120569229126
+    },
+    "168": {
+      "mse": 0.11897294223308563,
+      "mae": 0.26519301533699036,
+      "mse_raw": 10.018468856811523,
+      "mae_raw": 2.4335412979125977
+    },
+    "336": {
+      "mse": 0.15225321054458618,
+      "mae": 0.3082742691040039,
+      "mse_raw": 12.820935249328613,
+      "mae_raw": 2.8288755416870117
+    },
+    "720": {
+      "mse": 0.1521327793598175,
+      "mae": 0.3167349398136139,
+      "mse_raw": 12.810791015625,
+      "mae_raw": 2.9065146446228027
+    }
+  },
+  "train_secs": 257.5401077270508,
+  "eval_secs": 75.60038495063782
+}

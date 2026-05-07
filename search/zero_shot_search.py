@@ -160,8 +160,10 @@ def zero_shot_search(
     if task_feature_extractor is None:
         task_feature_extractor = TaskFeatureExtractor(device=device)
 
-    task_feat = task_feature_extractor.extract(train_ds, task_type).to(device)
-    logger.info("Task features extracted: dim=%d", task_feat.shape[0])
+    task_feat = task_feature_extractor.extract(
+        train_ds, task_type, dataset_name=target_dataset,
+    ).to(device)
+    logger.info("Task features extracted: shape=%s", tuple(task_feat.shape))
 
     # ── Step 2: Sample candidates ─────────────────────────────────────
     logger.info("Sampling %d candidates", n_candidates)
@@ -306,7 +308,9 @@ def rank_finalists(
 
     if task_feature_extractor is None:
         task_feature_extractor = TaskFeatureExtractor(device=device)
-    task_feat = task_feature_extractor.extract(train_ds, task_type).to(device)
+    task_feat = task_feature_extractor.extract(
+        train_ds, task_type, dataset_name=target_dataset,
+    ).to(device)
 
     candidates = batch_sample_strategies(n_candidates, fixed_encoders)
     ranking = tournament_rank(

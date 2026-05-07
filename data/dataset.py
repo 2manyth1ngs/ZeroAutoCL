@@ -791,6 +791,12 @@ def load_dataset(
             test_data, None, task_type, max_len, scaler=scaler,
         )
 
+    # Attach the logical dataset name to every split so downstream consumers
+    # (e.g. ``TaskFeatureExtractor.extract``) can resolve a cache key without
+    # the caller having to thread it through manually.
+    for _split_ds in splits.values():
+        _split_ds.name = name
+
     logger.info(
         "Loaded %s — train=%d, val=%d, test=%d",
         name,
