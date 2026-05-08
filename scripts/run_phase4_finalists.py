@@ -169,6 +169,15 @@ def main() -> None:
         logger.info("[phase4 %d/%d] %s", i + 1, len(finalists), tag)
         logger.info("=" * 60)
 
+        # Reset RNG state per finalist so a strategy's outcome doesn't depend
+        # on its position in the loop.  Verified empirically: training the
+        # same strategy with set_seed(42) re-applied per run yields ~0.005
+        # lower mean MSE than letting RNG drift across earlier finalists
+        # (see outputs/crop_rank_check/crop_rank_results.json — the
+        # phase4_best strategy clocked 0.0901 under per-run seed reset vs
+        # 0.0955 in the original phase4_best.json under shared-seed mode).
+        set_seed(args.seed)
+
         try:
             r = _retrain_one(enc_cfg, strat, train_ds, val_ds, test_ds, train_cfg, device)
         except Exception as exc:

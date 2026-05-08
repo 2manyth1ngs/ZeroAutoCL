@@ -208,7 +208,14 @@ two_stage_search:
     n_per_dataset: 20           # mirrors seed_generation.n_per_dataset (AutoCTS++ default)
     n_candidates: 200000
     tournament_rounds: 25
-    top_k_strategies: 5         # CL strategies kept per encoder
+    top_k_strategies: 15        # CL strategies kept per encoder (raised from 5
+                                # to widen the Phase-4 funnel — compensates for
+                                # the comparator being trained on MAE labels
+                                # while finalist selection uses MSE.  Spearman
+                                # MAE↔MSE rank correlation is ~0.85–0.95, so
+                                # MSE-best may sit at MAE-rank 6-15, no longer
+                                # at rank 1-5.  15 retrains ≈ 75 min on a 4090,
+                                # cheap relative to a full seed-gen rerun.)
 
   # Phase 4: K_enc × top_k_strategies = 3×5 = 15 retrains.
   # CLAUDE_ADV.md §10.2 originally proposed 3000 iters, but the protocol
