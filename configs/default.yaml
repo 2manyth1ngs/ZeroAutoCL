@@ -130,7 +130,26 @@ dataset_budgets:
                   crop_len: 512, eval_horizons: [24, 48, 168] }
   PEMS08:       { pretrain_iters: 600 }
   PEMS-BAY:     { pretrain_iters: 600 }
+  METR-LA:      { pretrain_iters: 600 }
   ExchangeRate: { pretrain_iters: 600 }
+  # Electricity (321 ch, hourly, ~26k timesteps): plenty of data, full budget.
+  # Frequency exactly matches ETTh1 — the most "target-aligned" source.
+  Electricity:  { pretrain_iters: 600 }
+  # Solar-AL (137 ch, 10-min, ~52k timesteps): full year of PV power, plenty.
+  Solar:        { pretrain_iters: 600 }
+  # Weather Jena 2020 (21 ch, 10-min, ~52k timesteps): full year, full budget.
+  Weather:      { pretrain_iters: 600 }
+  # ILI (7 ch, weekly, ~967 timesteps total → 7/1/2 split → ~676 train weeks):
+  #   - ``crop_len: 512`` ensures the sliding-window dataset DOES carve windows
+  #     (default 1024 is wider than train_len=676 → would fall back to one
+  #     sample, killing CL training diversity).  At 512 we get 165 windows.
+  #   - ``pretrain_iters: 200`` (down from 600): fewer effective samples means
+  #     the encoder over-fits its own augmentations long before 600 iters.
+  #   - ``eval_horizons: [24, 48, 168]``: test split is only ~193 weeks, so
+  #     H=336/720 (and parts of H=168) overflow.  Drop the long horizons —
+  #     ``eval_forecasting`` would skip them anyway (line 239-241), but
+  #     declaring it here saves the wasted Ridge α-search.
+  ILI:          { pretrain_iters: 200, crop_len: 512, eval_horizons: [24, 48, 168] }
   # ── Classification (iter-based for Stage A / B, epoch-based only in Phase 4) ─
   # SleepEEG has ~23k train samples vs Epilepsy's ~250; epoch-based budgets
   # cause 90× iteration disparity (Bug #006).  Iter-based budgets normalise

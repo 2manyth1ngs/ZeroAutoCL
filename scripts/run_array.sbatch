@@ -10,7 +10,7 @@
 #SBATCH --mem=50G
 #SBATCH --time=48:00:00
 #SBATCH --requeue
-#SBATCH --array=0-5%6
+#SBATCH --array=0-11%6
 #SBATCH --output=logs/zac_array_seedgen_%A_%a.out
 #SBATCH --error=logs/zac_array_seedgen_%A_%a.err
 
@@ -18,11 +18,11 @@
 # ZeroAutoCL — Stage B.1 (seed generation) parallelised across SLURM job array.
 #
 # One array task per source dataset: each task does a full seed-gen run for
-# its own source and writes ``${SEEDS_DIR}/_seeds_<SRC>.json``.  The 6 tasks
-# run concurrently (``--array=0-5%6``); per-source CL pretraining is the
-# real bottleneck (~30-35 h sequential), so 6-way fan-out cuts wallclock to
-# the slowest source's per-source time (~6-8 h, dominated by PEMS07's
-# 883-channel I/O).
+# its own source and writes ``${SEEDS_DIR}/_seeds_<SRC>.json``.  12 tasks
+# total (``--array=0-11%6``), max 6 concurrent — per-source CL pretraining
+# is the real bottleneck (~60-70 h sequential at 12 sources), so 6-way
+# fan-out cuts wallclock to roughly 2× the slowest single source's time
+# (~12-16 h total when PEMS07's 883-channel run is the wall).
 #
 # L-share consistency is preserved across the array thanks to two pieces:
 #
@@ -63,9 +63,11 @@
 #
 # Tightening %N
 # -------------
-# ``--array=0-5%6`` allows up to 6 tasks concurrent.  If the cluster is
-# tight or spot pre-emption is aggressive, drop to ``%3`` or ``%2`` — total
-# wallclock will rise but throughput stays robust.
+# ``--array=0-11%6`` allows up to 6 tasks concurrent (12 total tasks).  If
+# the cluster is tight or spot pre-emption is aggressive, drop to ``%3`` or
+# ``%2`` — total wallclock will rise but throughput stays robust.  Raise to
+# ``%12`` if you have plenty of GPUs and want all sources running in
+# parallel (wallclock ≈ slowest single source).
 #
 # Submit  :  sbatch scripts/run_array.sbatch
 # Watch   :  tail -f logs/zac_array_seedgen_<jobid>_<task>.out
@@ -93,7 +95,19 @@ mkdir -p logs "${OUT_DIR}" "${SEEDS_DIR}"
 # is the heaviest source (883 sensor channels) and the most likely to OOM
 # or saturate wall-clock; failing fast here lets the user catch resource
 # issues without waiting on the lighter tasks.
-SOURCES=(PEMS07 ETTh2 PEMS03 PEMS04 PEMS08 ExchangeRate)
+#
+# 12-source pool (was 6).  Six new sources expand the task-feature manifold
+# along under-represented axes:
+#   - Electricity  : 321 ch, **hourly**  → matches ETTh1 target frequency
+#   - PEMS-BAY     : 325 ch, 5-min       → fills out graph-traffic family
+#   - METR-LA      : 207 ch, 5-min       → AutoCTS++ standard, pairs PEMS-BAY
+#   - Solar        : 137 ch, 10-min      → energy domain, AutoCTS++ standard
+#   - Weather      : 21 ch,  10-min      → atmospheric, near ETTm1 frequency
+#   - ILI          : 7 ch,   **weekly**  → very long time scale, low channel
+#
+# Order: heavier sources first (failing fast on resource issues) — PEMS07,
+# Electricity, PEMS-BAY, then PEMS04/03 etc., ILI last (cheapest, ~5 min).
+SOURCES=(PEMS07 Electricity PEMS-BAY PEMS04 PEMS03 METR-LA PEMS08 Solar ETTh2 Weather ExchangeRate ILI)
 
 ARRAY_ID="${SLURM_ARRAY_TASK_ID:-0}"
 if (( ARRAY_ID < 0 || ARRAY_ID >= ${#SOURCES[@]} )); then
@@ -263,7 +277,9 @@ echo "═══════ Stage T: precompute task features ══════
 TASK_FEAT_DIR="outputs/task_features"
 mkdir -p "\${TASK_FEAT_DIR}"
 srun --unbuffered python -u scripts/precompute_task_features.py \\
-    --datasets    PEMS03 PEMS04 PEMS07 PEMS08 ETTh2 ExchangeRate "\${TARGET}" \\
+    --datasets    PEMS03 PEMS04 PEMS07 PEMS08 ETTh2 ExchangeRate \\
+                  PEMS-BAY METR-LA Electricity Solar Weather ILI \\
+                  "\${TARGET}" \\
     --data_dir    "\${DATA_DIR}" \\
     --cache_dir   "\${TASK_FEAT_DIR}" \\
     --iters       600 \\

@@ -4,7 +4,9 @@ Supported datasets
 ------------------
 Classification   : HAR, Epilepsy, SleepEEG, Gesture, NATOPS
 Anomaly detection: Yahoo, KPI
-Forecasting      : ETTh1, ETTh2, ETTm1, PEMS series, exchange rate, electricity
+Forecasting      : ETTh1, ETTh2, ETTm1, PEMS series, PEMS-BAY, METR-LA,
+                   ExchangeRate, Electricity, Solar (AL), Weather (Jena 2020),
+                   ILI (national_illness)
 
 All returned data arrays have shape (N, T, C) where:
   N — number of samples / time-series instances
@@ -591,6 +593,155 @@ def _load_electricity(
     )
 
 
+def _load_solar_al(
+    data_dir: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
+    """Load Solar-Energy (Solar-AL) dataset.
+
+    Expects ``{data_dir}/solar_AL.txt`` — comma-separated, **no header, no
+    date column**.  Standard LSTNet distribution: shape ``(52560, 137)``,
+    one year of 10-min PV power output from 137 plants in Alabama 2006.
+    Values are non-negative (kW), with ~50% of rows being all-zero
+    (nighttime hours).  6/2/2 split per LSTNet original.
+
+    Returns:
+        train_data, val_data, test_data — each of shape ``(1, T_split, 137)``.
+    """
+    path = os.path.join(data_dir, "solar_AL.txt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Solar-AL data not found at {path}")
+    data = np.loadtxt(path, delimiter=",").astype(np.float32)  # (52560, 137)
+
+    train_raw, val_raw, test_raw = _ratio_split(data, _RATIO_SPLITS["6-2-2"])
+
+    scaler = StandardScaler().fit(train_raw)
+    train_data = scaler.transform(train_raw)
+    val_data = scaler.transform(val_raw)
+    test_data = scaler.transform(test_raw)
+
+    return (
+        train_data[np.newaxis],
+        val_data[np.newaxis],
+        test_data[np.newaxis],
+        scaler,
+    )
+
+
+def _load_weather(
+    data_dir: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
+    """Load Weather dataset (Max Planck Biogeochemistry, Jena 2020).
+
+    Expects ``{data_dir}/weather.csv`` with a ``date`` column followed by 21
+    numerical atmospheric features (last column = ``OT``).  10-min sampling
+    over one year ≈ 52,696 timesteps.  7/1/2 split per Informer convention.
+
+    Returns:
+        train_data, val_data, test_data — each of shape ``(1, T_split, 21)``.
+    """
+    path = os.path.join(data_dir, "weather.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Weather data not found at {path}")
+    df = pd.read_csv(path)
+    if "date" in df.columns:
+        df = df.drop(columns=["date"])
+
+    data = df.values.astype(np.float32)  # (T, 21)
+
+    train_raw, val_raw, test_raw = _ratio_split(data, _RATIO_SPLITS["7-1-2"])
+
+    scaler = StandardScaler().fit(train_raw)
+    train_data = scaler.transform(train_raw)
+    val_data = scaler.transform(val_raw)
+    test_data = scaler.transform(test_raw)
+
+    return (
+        train_data[np.newaxis],
+        val_data[np.newaxis],
+        test_data[np.newaxis],
+        scaler,
+    )
+
+
+def _load_ili(
+    data_dir: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
+    """Load ILI (national_illness) dataset.
+
+    Expects ``{data_dir}/national_illness.csv`` with a ``date`` column and 7
+    numerical features (% WEIGHTED ILI, %UNWEIGHTED ILI, AGE 0-4, AGE 5-24,
+    ILITOTAL, NUM. OF PROVIDERS, OT) at **weekly** frequency.  ~966 rows
+    covering 2002-01-01 to 2020-06-30.  7/1/2 split per Informer convention.
+
+    Note: this is by far the shortest source in ZeroAutoCL's pool — 7/1/2
+    yields only ~676 train / 96 val / 193 test weeks.  The corresponding
+    ``dataset_budgets`` entry overrides ``crop_len`` to 512 (so sliding
+    windows kick in instead of falling back to the full series as one
+    sample) and trims ``eval_horizons`` to ``[24, 48, 168]`` because longer
+    horizons exceed the 193-week test split.
+
+    Returns:
+        train_data, val_data, test_data — each of shape ``(1, T_split, 7)``.
+    """
+    path = os.path.join(data_dir, "national_illness.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"ILI data not found at {path}")
+    df = pd.read_csv(path)
+    if "date" in df.columns:
+        df = df.drop(columns=["date"])
+
+    data = df.values.astype(np.float32)  # (~966, 7)
+
+    train_raw, val_raw, test_raw = _ratio_split(data, _RATIO_SPLITS["7-1-2"])
+
+    scaler = StandardScaler().fit(train_raw)
+    train_data = scaler.transform(train_raw)
+    val_data = scaler.transform(val_raw)
+    test_data = scaler.transform(test_raw)
+
+    return (
+        train_data[np.newaxis],
+        val_data[np.newaxis],
+        test_data[np.newaxis],
+        scaler,
+    )
+
+
+def _load_metr_la(
+    data_dir: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
+    """Load METR-LA traffic speed dataset (207 sensors).
+
+    Expects ``{data_dir}/METR-LA.h5`` (DCRNN/Graph-WaveNet standard format)
+    with a ``'df'`` key containing a DataFrame of shape ``(34272, 207)`` —
+    5-min loop-detector readings from 207 LA freeway sensors over 4 months.
+    7/1/2 split per DCRNN / AutoCTS++ convention.
+
+    Returns:
+        train_data, val_data, test_data — each of shape ``(1, T_split, 207)``.
+    """
+    h5_path = os.path.join(data_dir, "METR-LA.h5")
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(f"METR-LA data not found at {h5_path}")
+
+    df = pd.read_hdf(h5_path)
+    data = df.values.astype(np.float32)  # (T, 207)
+
+    train_raw, val_raw, test_raw = _ratio_split(data, _RATIO_SPLITS["7-1-2"])
+
+    scaler = StandardScaler().fit(train_raw)
+    train_data = scaler.transform(train_raw)
+    val_data = scaler.transform(val_raw)
+    test_data = scaler.transform(test_raw)
+
+    return (
+        train_data[np.newaxis],
+        val_data[np.newaxis],
+        test_data[np.newaxis],
+        scaler,
+    )
+
+
 def _load_anomaly(
     data_dir: str,
     name: str,
@@ -644,8 +795,12 @@ _SUPPORTED_DATASETS: Dict[str, str] = {
     "PEMS07": "forecasting",
     "PEMS08": "forecasting",
     "PEMS-BAY": "forecasting",
+    "METR-LA": "forecasting",
     "ExchangeRate": "forecasting",
     "Electricity": "forecasting",
+    "Solar": "forecasting",
+    "Weather": "forecasting",
+    "ILI": "forecasting",
 }
 
 
@@ -779,6 +934,62 @@ def load_dataset(
 
     elif name == "Electricity":
         train_data, val_data, test_data, scaler = _load_electricity(data_dir)
+        splits["train"] = TimeSeriesDataset(
+            train_data, None, task_type, max_len,
+            window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
+        )
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
+
+    elif name == "Solar":
+        train_data, val_data, test_data, scaler = _load_solar_al(data_dir)
+        splits["train"] = TimeSeriesDataset(
+            train_data, None, task_type, max_len,
+            window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
+        )
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
+
+    elif name == "Weather":
+        train_data, val_data, test_data, scaler = _load_weather(data_dir)
+        splits["train"] = TimeSeriesDataset(
+            train_data, None, task_type, max_len,
+            window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
+        )
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
+
+    elif name == "ILI":
+        train_data, val_data, test_data, scaler = _load_ili(data_dir)
+        splits["train"] = TimeSeriesDataset(
+            train_data, None, task_type, max_len,
+            window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
+        )
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
+
+    elif name == "METR-LA":
+        train_data, val_data, test_data, scaler = _load_metr_la(data_dir)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
             window_len=forecast_wl, window_stride=1,
