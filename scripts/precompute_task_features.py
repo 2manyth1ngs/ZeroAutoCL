@@ -11,21 +11,43 @@ For each named dataset, this script:
      ``(seq_len, D)`` windows.
   4. Randomly samples ``--n_set`` of those windows.
   5. Saves a single tensor of shape ``(N_set, seq_len, D)`` to
-     ``{cache_dir}/{dataset}_task_feature.npy``.
+     ``{cache_dir}/{slug}_task_feature.npy``.
 
 This mirrors ``reference/AutoCTS_plusplus/exps/generate_task_feature.py`` —
 the cached output is what :class:`models.comparator.task_feature
 .TaskFeatureExtractor` reads at runtime.
 
+Two modes
+---------
+* **Default (base mode)**: one task feature per dataset name.  Used for
+  *target* datasets (zero-shot inference sees the target as a single task).
+* ``--sub_task_mode``: for forecasting sources, expand each dataset into
+  ``n_time_windows × n_variable_subsets`` sub-tasks (re-using
+  ``make_forecasting_subtasks`` with the same params as seed-gen), and train
+  a separate encoder + sample a separate task feature per sub-task.  Cache
+  files are named after the sub-task slug (e.g. ``ETTh2__tw0__vs1``).
+  Requires ``--config`` to read the slicing params from the YAML.  Mirrors
+  AutoCTS++'s ``--loader subset`` flow where each subset is its own dataset.
+
 Usage
 -----
 ::
 
+    # Base mode (targets):
     python scripts/precompute_task_features.py \\
-        --datasets PEMS03 PEMS04 PEMS07 PEMS08 ETTh2 ExchangeRate ETTh1 ETTm1 \\
+        --datasets ETTh1 Electricity Weather \\
         --data_dir data/datasets \\
         --cache_dir outputs/task_features \\
-        --epochs 20 \\
+        --seed 42
+
+    # Sub-task mode (sources):
+    python scripts/precompute_task_features.py \\
+        --datasets ETTh2 ETTm1 ETTm2 Solar traffic \\
+                   AQShunyi AQWanliu AQGuanyuan ExchangeRate \\
+        --sub_task_mode \\
+        --config configs/default.yaml \\
+        --data_dir data/datasets \\
+        --cache_dir outputs/task_features \\
         --seed 42
 
 Re-run with ``--force`` to overwrite existing caches.
@@ -42,13 +64,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
+import yaml
 
-from data.dataset import load_dataset
+from data.dataset import load_dataset, TimeSeriesDataset
+from data.dataset_slicer import make_forecasting_subtasks
 from models.comparator.task_feature import (
     DEFAULT_CACHE_DIR,
     TASK_FEATURE_REPR_DIM,
     TASK_FEATURE_SET_SIZE,
     TASK_FEATURE_SEQ_LEN,
+    task_feature_slug,
 )
 from models.contrastive.cl_pipeline import CLPipeline
 from models.encoder.dilated_cnn import DilatedCNNEncoder
@@ -127,6 +152,17 @@ def parse_args() -> argparse.Namespace:
                    help="Recompute even when {cache_dir}/{ds}_task_feature.npy exists.")
     p.add_argument("--device", default=None,
                    help="Torch device override (e.g. 'cuda:0', 'cpu').")
+    # Option B (2026-05-10): sub-task-mode aligns with AutoCTS++ §3.2.4 +
+    # generate_task_feature.py's per-subset feature extraction.
+    p.add_argument("--sub_task_mode", action="store_true",
+                   help="For forecasting sources, expand each dataset into "
+                        "n_time_windows × n_variable_subsets sub-tasks and "
+                        "precompute one task feature per sub-task.  Requires "
+                        "--config to read the slicing params from YAML.")
+    p.add_argument("--config", default=None,
+                   help="YAML config (typically configs/default.yaml) "
+                        "providing forecasting_task_variants and "
+                        "dataset_budgets for --sub_task_mode.")
     return p.parse_args()
 
 
@@ -165,20 +201,31 @@ def _flatten_for_causal_encode(data: torch.Tensor) -> torch.Tensor:
     return flat.unsqueeze(0)                          # (1, T_flat, C)
 
 
-def precompute_one(
-    name: str, args: argparse.Namespace, device: torch.device,
+def _train_encode_sample(
+    train_ds: TimeSeriesDataset,
+    label: str,
+    args: argparse.Namespace,
+    device: torch.device,
 ) -> np.ndarray:
-    """Train + encode + sample a task feature for one dataset.
+    """Shared core: train one encoder on *train_ds*, sliding-encode, sample windows.
+
+    Used by both base mode (full dataset) and sub-task mode (each
+    (tw, vs)-sliced view).
+
+    Args:
+        train_ds: Pre-loaded training dataset (``(1, T, C)`` for forecasting).
+        label: Human-readable identifier for log lines (the dataset name in
+            base mode, the sub-task window_id in sub-task mode).
+        args: Parsed argparse namespace.
+        device: Torch device.
 
     Returns:
         ``(n_set, seq_len, repr_dim)`` ``float32`` numpy array.
     """
-    splits = load_dataset(name, args.data_dir)
-    train_ds = splits["train"]
     input_dim = train_ds.n_channels
     logger.info(
         "[%s] train data shape=%s  task_type=%s  input_dim=%d",
-        name, tuple(train_ds.data.shape), train_ds.task_type, input_dim,
+        label, tuple(train_ds.data.shape), train_ds.task_type, input_dim,
     )
 
     encoder_cfg = EncoderConfig(
@@ -198,13 +245,13 @@ def precompute_one(
         pretrain_cfg["pretrain_epochs"] = int(args.epochs)
         logger.info(
             "[%s] training task-feature encoder for %d epochs (epoch mode)",
-            name, args.epochs,
+            label, args.epochs,
         )
     else:
         pretrain_cfg["pretrain_iters"] = int(args.iters)
         logger.info(
             "[%s] training task-feature encoder for %d iters (iter mode)",
-            name, args.iters,
+            label, args.iters,
         )
     contrastive_pretrain(
         encoder=encoder,
@@ -219,7 +266,7 @@ def precompute_one(
     full_series = _flatten_for_causal_encode(train_ds.data)   # (1, T, C)
     logger.info(
         "[%s] causal sliding encode: T=%d  padding=%d  slide_batch=%d",
-        name, full_series.shape[1], args.padding, args.slide_batch,
+        label, full_series.shape[1], args.padding, args.slide_batch,
     )
     repr_full = causal_sliding_encode(
         encoder, full_series,
@@ -232,13 +279,13 @@ def precompute_one(
     if D != args.repr_dim:
         # Should not happen with our encoder, but guard anyway.
         raise RuntimeError(
-            f"[{name}] encoder output_dim={D} != --repr_dim={args.repr_dim}",
+            f"[{label}] encoder output_dim={D} != --repr_dim={args.repr_dim}",
         )
 
     bn = T // args.seq_len
     if bn == 0:
         raise RuntimeError(
-            f"[{name}] series too short ({T}) for seq_len={args.seq_len}",
+            f"[{label}] series too short ({T}) for seq_len={args.seq_len}",
         )
 
     repr_windows = repr_full[: bn * args.seq_len].reshape(bn, args.seq_len, D)
@@ -247,7 +294,7 @@ def precompute_one(
     if bn < args.n_set:
         logger.warning(
             "[%s] only %d windows of length %d available (requested %d) — "
-            "sampling with replacement", name, bn, args.seq_len, args.n_set,
+            "sampling with replacement", label, bn, args.seq_len, args.n_set,
         )
         sample_idx = rng.choice(bn, size=args.n_set, replace=True)
     else:
@@ -258,21 +305,199 @@ def precompute_one(
     return sample_repr.astype(np.float32)
 
 
+def precompute_one(
+    name: str, args: argparse.Namespace, device: torch.device,
+) -> np.ndarray:
+    """Base mode: precompute task feature for one dataset.
+
+    Loads ``name`` via ``load_dataset`` and runs the shared training +
+    sampling pipeline on the full training split.
+
+    Returns:
+        ``(n_set, seq_len, repr_dim)`` ``float32`` numpy array.
+    """
+    splits = load_dataset(name, args.data_dir)
+    return _train_encode_sample(splits["train"], name, args, device)
+
+
+def precompute_sub_tasks(
+    name: str,
+    args: argparse.Namespace,
+    device: torch.device,
+    variants_cfg: dict,
+    dataset_budgets: dict,
+    save_dir: str,
+    default_crop_len: Optional[int] = None,
+) -> tuple:
+    """Sub-task mode: precompute one task feature per (tw, vs) sub-task.
+
+    Mirrors AutoCTS++'s ``generate_task_feature.py`` invoked with
+    ``--loader subset`` for each subset file produced by
+    ``dataset_slice.py``.  We achieve the same effect on-the-fly by replaying
+    ``make_forecasting_subtasks`` with the same params seed-gen used, then
+    training a fresh encoder per sub-task.
+
+    Args:
+        name: Source dataset name.
+        args: Parsed argparse namespace.
+        device: Torch device.
+        variants_cfg: ``forecasting_task_variants`` block from the YAML.
+        dataset_budgets: ``dataset_budgets`` block from the YAML (per-source
+            ``n_time_windows`` / ``n_variable_subsets`` / ``crop_len`` overrides).
+        save_dir: Directory to write the ``{slug}_task_feature.npy`` files.
+        default_crop_len: Fallback ``crop_len`` read from the YAML's
+            ``seed_generation.crop_len`` block.  Per-source budget entries
+            override this.
+
+    Returns:
+        ``(n_ok, n_skip, n_fail)`` — count of newly-written, cache-hit, and
+        failed sub-task files for THIS source.
+    """
+    ds_budget = (dataset_budgets or {}).get(name, {}) or {}
+    n_tw_global = int(variants_cfg.get("n_time_windows", 1) or 1)
+    n_vs_global = int(variants_cfg.get("n_variable_subsets", 1) or 1)
+    ds_n_tw = int(ds_budget.get("n_time_windows", n_tw_global))
+    ds_n_vs = int(ds_budget.get("n_variable_subsets", n_vs_global))
+
+    crop_len = ds_budget.get("crop_len", default_crop_len)
+    if crop_len is not None:
+        crop_len = int(crop_len)
+
+    min_window_len = int(variants_cfg.get("min_window_len", 1000) or 1000)
+    var_size_rates = variants_cfg.get("var_size_rates")
+    min_var_count = int(variants_cfg.get("min_var_count", 4) or 4)
+
+    logger.info(
+        "[%s] sub-task mode: n_time_windows=%d  n_variable_subsets=%d  "
+        "crop_len=%s  min_window_len=%d  min_var_count=%d",
+        name, ds_n_tw, ds_n_vs, crop_len, min_window_len, min_var_count,
+    )
+
+    sub_tasks = make_forecasting_subtasks(
+        name, args.data_dir,
+        n_time_windows=ds_n_tw,
+        horizon_groups=[None],     # task feature is horizon-agnostic
+        crop_len=crop_len,
+        min_window_len=min_window_len,
+        n_variable_subsets=ds_n_vs,
+        var_size_rates=var_size_rates,
+        min_var_count=min_var_count,
+        var_subset_seed=args.seed,
+    )
+    logger.info(
+        "[%s] expanded into %d sub-task(s) for task-feature precompute",
+        name, len(sub_tasks),
+    )
+
+    n_ok = n_skip = n_fail = 0
+    for sub in sub_tasks:
+        window_id = sub.window_id
+        slug = task_feature_slug(window_id)
+        out_path = os.path.join(save_dir, f"{slug}_task_feature.npy")
+
+        if os.path.exists(out_path) and not args.force:
+            logger.info(
+                "[%s] cache hit at %s — skipping (use --force to overwrite)",
+                window_id, out_path,
+            )
+            n_skip += 1
+            continue
+
+        logger.info("=" * 60)
+        logger.info(
+            "[%s] precomputing sub-task feature → %s", window_id, out_path,
+        )
+        logger.info("=" * 60)
+
+        try:
+            arr = _train_encode_sample(sub.train, window_id, args, device)
+        except Exception as exc:                              # pragma: no cover
+            logger.exception("[%s] precompute failed: %s", window_id, exc)
+            n_fail += 1
+            continue
+
+        tmp = out_path[:-4] + ".tmp.npy"
+        np.save(tmp, arr)
+        os.replace(tmp, out_path)
+        n_ok += 1
+        logger.info(
+            "[%s] saved %s shape=%s dtype=%s",
+            window_id, out_path, arr.shape, arr.dtype,
+        )
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    return n_ok, n_skip, n_fail
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     os.makedirs(args.cache_dir, exist_ok=True)
 
+    # ── Sub-task mode plumbing ─────────────────────────────────────────────
+    # When --sub_task_mode is set, the YAML supplies the slicing axes
+    # (n_time_windows / n_variable_subsets / crop_len) so the sub-task
+    # decomposition here matches the one seed-gen uses.  Without --config
+    # this mode can't work; fail fast with a clear message.
+    variants_cfg: dict = {}
+    dataset_budgets: dict = {}
+    default_crop_len: Optional[int] = None
+    if args.sub_task_mode:
+        if not args.config:
+            raise SystemExit(
+                "--sub_task_mode requires --config to read "
+                "forecasting_task_variants and dataset_budgets from the YAML.",
+            )
+        with open(args.config, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        variants_cfg = cfg.get("forecasting_task_variants", {}) or {}
+        dataset_budgets = cfg.get("dataset_budgets", {}) or {}
+        sg_cfg = cfg.get("seed_generation", {}) or {}
+        sg_crop_len = sg_cfg.get("crop_len")
+        if sg_crop_len is not None:
+            default_crop_len = int(sg_crop_len)
+        logger.info(
+            "[sub_task_mode] YAML loaded: %d budget entries, "
+            "n_tw_global=%s n_vs_global=%s seed_gen.crop_len=%s",
+            len(dataset_budgets),
+            variants_cfg.get("n_time_windows"),
+            variants_cfg.get("n_variable_subsets"),
+            default_crop_len,
+        )
+
     device = (
         torch.device(args.device) if args.device
         else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     )
-    logger.info("device=%s  cache_dir=%s", device, args.cache_dir)
+    logger.info("device=%s  cache_dir=%s  sub_task_mode=%s",
+                device, args.cache_dir, args.sub_task_mode)
 
     n_ok = 0
     n_skip = 0
     n_fail = 0
     for name in args.datasets:
+        # ── Sub-task mode path ────────────────────────────────────────────
+        if args.sub_task_mode:
+            try:
+                ok, skip, fail = precompute_sub_tasks(
+                    name, args, device,
+                    variants_cfg=variants_cfg,
+                    dataset_budgets=dataset_budgets,
+                    save_dir=args.cache_dir,
+                    default_crop_len=default_crop_len,
+                )
+            except Exception as exc:                          # pragma: no cover
+                logger.exception("[%s] sub-task precompute failed: %s", name, exc)
+                n_fail += 1
+                continue
+            n_ok += ok
+            n_skip += skip
+            n_fail += fail
+            continue
+
+        # ── Base mode path (targets / standalone datasets) ────────────────
         out_path = os.path.join(args.cache_dir, f"{name}_task_feature.npy")
         if os.path.exists(out_path) and not args.force:
             logger.info("[%s] cache hit at %s — skipping (use --force to overwrite)",
@@ -304,8 +529,10 @@ def main() -> None:
 
     logger.info("=" * 60)
     logger.info(
-        "Done — saved=%d  skipped=%d  failed=%d  (out of %d datasets)",
-        n_ok, n_skip, n_fail, len(args.datasets),
+        "Done — saved=%d  skipped=%d  failed=%d  (mode=%s, %d source datasets)",
+        n_ok, n_skip, n_fail,
+        "sub_task" if args.sub_task_mode else "base",
+        len(args.datasets),
     )
     logger.info("=" * 60)
 

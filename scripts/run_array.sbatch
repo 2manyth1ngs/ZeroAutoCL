@@ -10,19 +10,24 @@
 #SBATCH --mem=50G
 #SBATCH --time=48:00:00
 #SBATCH --requeue
-#SBATCH --array=0-11%6
+#SBATCH --array=0-8%6
 #SBATCH --output=logs/zac_array_seedgen_%A_%a.out
 #SBATCH --error=logs/zac_array_seedgen_%A_%a.err
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ZeroAutoCL — Stage B.1 (seed generation) parallelised across SLURM job array.
+# Rev 2026-05-10: 9-source CL-aligned pool + 3 targets (ETTh1, Electricity,
+# Weather).  ONCE STARTED, NO MANUAL OPS — the auto-chain in task 0 queues
+# the entire downstream pipeline (Stage T → B.2 → 3× (B.3 + Phase 4)).
 #
 # One array task per source dataset: each task does a full seed-gen run for
-# its own source and writes ``${SEEDS_DIR}/_seeds_<SRC>.json``.  12 tasks
-# total (``--array=0-11%6``), max 6 concurrent — per-source CL pretraining
-# is the real bottleneck (~60-70 h sequential at 12 sources), so 6-way
-# fan-out cuts wallclock to roughly 2× the slowest single source's time
-# (~12-16 h total when PEMS07's 883-channel run is the wall).
+# its own source and writes ``${SEEDS_DIR}/_seeds_<SRC>.json``.  9 tasks
+# total (``--array=0-8%6``), max 6 concurrent — first batch of 6 covers the
+# heaviest sources (traffic 862ch, Solar 137ch, both ETT-15min variants,
+# ExchangeRate, AQShunyi); second batch of 3 finishes the lighter AQ
+# stations + ETTh2 (~10 min each).  Expected B.1 wallclock ≈ 1.5-2 h with
+# %6, plus ~6 h downstream (Stage T 1h + B.2 30min + 3 targets × ~1.5h each).
+# Grand total ≈ 7.5-8 h on a 4090.
 #
 # L-share consistency is preserved across the array thanks to two pieces:
 #
@@ -44,9 +49,10 @@
 # every array task (B.1 seed-gen for one source) finishes OK, the
 # downstream job is automatically launched and runs:
 #
-#     final seeds merge → Stage T (precompute task features for sources
-#     + target) → B.2 (T-CLSC training) → B.3 (zero-shot ranking) →
-#     Phase 4 (Cartesian retrain on the target)
+#     final seeds merge → Stage T (precompute task features for the 9
+#     sources + 3 targets) → B.2 (T-CLSC training, one shared comparator)
+#     → for each of 3 targets {ETTh1, Electricity, Weather}: B.3
+#     (zero-shot ranking) → Phase 4 (Cartesian retrain on that target).
 #
 # — no separate sbatch file, no manual ``precompute_task_features.py``
 # invocation, nothing.  Each stage is resume-safe — re-running this
@@ -80,7 +86,7 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/ZeroAutoCL}"
 cd "$PROJECT_ROOT"
 
-OUT_DIR="outputs/full_etth1_autocts"
+OUT_DIR="outputs/zac_2026_05_10"
 DATA_DIR="data/datasets"
 CONFIG="configs/default.yaml"
 
@@ -91,23 +97,38 @@ SEEDS_DIR="${OUT_DIR}/seeds"
 
 mkdir -p logs "${OUT_DIR}" "${SEEDS_DIR}"
 
-# Source list — index = SLURM_ARRAY_TASK_ID.  PEMS07 is task 0 because it
-# is the heaviest source (883 sensor channels) and the most likely to OOM
-# or saturate wall-clock; failing fast here lets the user catch resource
-# issues without waiting on the lighter tasks.
+# Source list — index = SLURM_ARRAY_TASK_ID.  traffic is task 0 because it
+# has the most channels (862) and is the most likely to OOM or saturate
+# wallclock; failing fast here lets the user catch resource issues without
+# waiting on the lighter tasks.
 #
-# 12-source pool (was 6).  Six new sources expand the task-feature manifold
-# along under-represented axes:
-#   - Electricity  : 321 ch, **hourly**  → matches ETTh1 target frequency
-#   - PEMS-BAY     : 325 ch, 5-min       → fills out graph-traffic family
-#   - METR-LA      : 207 ch, 5-min       → AutoCTS++ standard, pairs PEMS-BAY
-#   - Solar        : 137 ch, 10-min      → energy domain, AutoCTS++ standard
-#   - Weather      : 21 ch,  10-min      → atmospheric, near ETTm1 frequency
-#   - ILI          : 7 ch,   **weekly**  → very long time scale, low channel
+# 9-source CL-aligned pool (rev 2026-05-10) — every target has ≥2
+# same-domain neighbours; sub-task counts are tuned per source in
+# ``configs/default.yaml::dataset_budgets`` to keep windows above the
+# encoder RF=2047 and preserve each dataset's characteristic structure:
 #
-# Order: heavier sources first (failing fast on resource issues) — PEMS07,
-# Electricity, PEMS-BAY, then PEMS04/03 etc., ILI last (cheapest, ~5 min).
-SOURCES=(PEMS07 Electricity PEMS-BAY PEMS04 PEMS03 METR-LA PEMS08 Solar ETTh2 Weather ExchangeRate ILI)
+#   ETT family   (univariate OT column, auto-skips var-subsetting):
+#     - ETTh2  3 windows × 1 var = 3 sub-tasks   (window ≈ 2880, hourly)
+#     - ETTm1  9 windows × 1 var = 9 sub-tasks   (window ≈ 7742, 15-min)
+#     - ETTm2  9 windows × 1 var = 9 sub-tasks   (window ≈ 7742, 15-min)
+#   Energy:
+#     - Solar    137 ch, 3×3 = 9 sub-tasks       (window ≈ 17520, 10-min)
+#   Transport (no graph):
+#     - traffic  862 ch, 3×3 = 9 sub-tasks       (window ≈ 5848, hourly)
+#   Atmospheric (var-subsetting disabled to preserve pollutant×weather):
+#     - AQShunyi    11 ch, 3×1 = 3 sub-tasks     (window ≈ 11688, hourly)
+#     - AQWanliu    11 ch, 3×1 = 3 sub-tasks
+#     - AQGuanyuan  11 ch, 3×1 = 3 sub-tasks
+#   Finance:
+#     - ExchangeRate  8 ch, 3×3 = 9 sub-tasks    (window ≈ 2529, daily)
+#
+# Total 57 sub-tasks.  Domain breakdown: ETT 37% / Energy 16% / Transport
+# 16% / Atmospheric 16% / Finance 16% — mirrors AutoCTS++ §4.1.1's 36% ETT
+# ratio.
+#
+# Order: heaviest first (traffic, Solar) → ETT-15min → finance → AQ
+# stations → ETTh2 (cheapest).  Failing fast on resource issues at task 0.
+SOURCES=(traffic Solar ETTm1 ETTm2 ExchangeRate AQShunyi AQWanliu AQGuanyuan ETTh2)
 
 ARRAY_ID="${SLURM_ARRAY_TASK_ID:-0}"
 if (( ARRAY_ID < 0 || ARRAY_ID >= ${#SOURCES[@]} )); then
@@ -147,10 +168,12 @@ python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda
 # the per-task Stage B.1 below can share path/scalar definitions.  Doing
 # the YAML reads up-front also lets task 0 bake the values into the
 # generated downstream sbatch before any seed-gen work starts.
-TARGET="ETTh1"
+# Three targets — Stage B.3 + Phase 4 run sequentially per target inside
+# the downstream sbatch (one shared comparator from Stage B.2 serves all
+# three).  Per-target outputs live in ``${OUT_DIR}/finalists_<target>.json``
+# and ``${OUT_DIR}/phase4_<target>/phase4_best.json``.
+TARGETS=(ETTh1 Electricity Weather)
 COMPARATOR="${OUT_DIR}/comparator.pt"
-FINALISTS="${OUT_DIR}/finalists.json"
-PHASE4_BEST="${OUT_DIR}/phase4_best.json"
 SEEDS="${SEEDS_DIR}/seeds.json"
 
 N_PER_DATASET=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['two_stage_search']['cl_strategy_search']['n_per_dataset'])")
@@ -189,7 +212,7 @@ if [[ "${ARRAY_ID}" == "0" && "${ZAC_NO_CHAIN:-}" != "1" ]]; then
         # downstream job actually runs (e.g. SLURM_* runtime vars).
         cat > "${DEP_SBATCH}" <<DEPEOF
 #!/usr/bin/env bash
-#SBATCH --job-name=zac_post_${TARGET}
+#SBATCH --job-name=zac_post_multi
 #SBATCH --partition=gpu_spot
 #SBATCH --gpus=nvidia_geforce_rtx_4090:1
 #SBATCH --gpu-bind=closest
@@ -200,8 +223,8 @@ if [[ "${ARRAY_ID}" == "0" && "${ZAC_NO_CHAIN:-}" != "1" ]]; then
 #SBATCH --mem=50G
 #SBATCH --time=24:00:00
 #SBATCH --requeue
-#SBATCH --output=logs/zac_post_${TARGET}_%j.out
-#SBATCH --error=logs/zac_post_${TARGET}_%j.err
+#SBATCH --output=logs/zac_post_multi_%j.out
+#SBATCH --error=logs/zac_post_multi_%j.err
 
 set -euo pipefail
 
@@ -212,14 +235,12 @@ cd "\${PROJECT_ROOT}"
 OUT_DIR="${OUT_DIR}"
 DATA_DIR="${DATA_DIR}"
 CONFIG="${CONFIG}"
-TARGET="${TARGET}"
+TARGETS=(ETTh1 Electricity Weather)
 SEED=${SEED}
 ENCODER_GRID="${ENCODER_GRID}"
 SEEDS_DIR="${SEEDS_DIR}"
 SEEDS="${SEEDS}"
 COMPARATOR="${COMPARATOR}"
-FINALISTS="${FINALISTS}"
-PHASE4_BEST="${PHASE4_BEST}"
 TOP_K_ENC=${TOP_K_ENC}
 TOP_K_STR=${TOP_K_STR}
 
@@ -239,7 +260,7 @@ echo "Partition         : \${SLURM_JOB_PARTITION:-unknown}"
 echo "GPUs visible      : \${CUDA_VISIBLE_DEVICES:-<none>}"
 echo "Project root      : \${PROJECT_ROOT}"
 echo "Output dir        : \${OUT_DIR}"
-echo "Target            : \${TARGET}"
+echo "Targets           : \${TARGETS[*]}"
 echo "Started           : \$(date -Is)"
 echo "================================================================="
 
@@ -266,20 +287,44 @@ python -u scripts/merge_seed_checkpoints.py \\
 #
 # Iter-based budget (--iters 600) is mandatory for ZeroAutoCL: the
 # stride-1 sliding-window TimeSeriesDataset inflates len(dataset) to
-# T - 3000 + 1 (~12k samples for PEMS03), so epoch-based budgets balloon
-# into 4+ hours per source.  600 iters mirrors TS2Vec's n_iters default
-# and bounds Stage T to ~5 min per dataset.
+# T - 3000 + 1 (~14k samples for traffic at T=17544), so epoch-based
+# budgets balloon into 4+ hours per source.  600 iters mirrors TS2Vec's
+# n_iters default and bounds Stage T to ~5 min per dataset.
 #
-# slide_batch=64 is a safe default for the widest source (PEMS07, 883 ch);
-# narrower datasets fit easily and aren't slowed materially.
+# slide_batch=64 is a safe default for the widest source in this pool
+# (traffic.csv, 862 ch); narrower datasets fit easily and aren't slowed
+# materially.
 echo
 echo "═══════ Stage T: precompute task features ═══════"
 TASK_FEAT_DIR="outputs/task_features"
 mkdir -p "\${TASK_FEAT_DIR}"
+
+# Option B (2026-05-10): sources use --sub_task_mode so each (tw, vs)
+# sub-task gets its own task feature .npy (mirrors AutoCTS++'s per-subset
+# generate_task_feature.py invocation).  Targets stay in base mode — at
+# zero-shot inference time each target is a single task with no sub-task
+# decomposition.
+
+echo
+echo "─── Stage T.1: sources (sub-task mode, per-(tw, vs) features) ───"
 srun --unbuffered python -u scripts/precompute_task_features.py \\
-    --datasets    PEMS03 PEMS04 PEMS07 PEMS08 ETTh2 ExchangeRate \\
-                  PEMS-BAY METR-LA Electricity Solar Weather ILI \\
-                  "\${TARGET}" \\
+    --datasets    ETTh2 ETTm1 ETTm2 \\
+                  Solar traffic ExchangeRate \\
+                  AQShunyi AQWanliu AQGuanyuan \\
+    --sub_task_mode \\
+    --config      "\${CONFIG}" \\
+    --data_dir    "\${DATA_DIR}" \\
+    --cache_dir   "\${TASK_FEAT_DIR}" \\
+    --iters       600 \\
+    --slide_batch 64 \\
+    --seed        "\${SEED}" \\
+    > >(tee -a "\${OUT_DIR}/run_post.log") \\
+    2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
+
+echo
+echo "─── Stage T.2: targets (base mode, one feature per dataset) ───"
+srun --unbuffered python -u scripts/precompute_task_features.py \\
+    --datasets    "\${TARGETS[@]}" \\
     --data_dir    "\${DATA_DIR}" \\
     --cache_dir   "\${TASK_FEAT_DIR}" \\
     --iters       600 \\
@@ -304,42 +349,60 @@ else
         2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
 fi
 
-# ── Stage B.3 — zero-shot ranking on target ────────────────────────────────
-echo
-echo "═══════ Stage B.3: zero-shot ranking on \${TARGET} ═══════"
-if [[ -s "\${FINALISTS}" ]]; then
-    echo "[stage-B.3] \${FINALISTS} exists — skipping (delete to re-run)"
-else
-    srun --unbuffered python -u scripts/run_zero_shot_search.py \\
-        --comparator_path  "\${COMPARATOR}" \\
-        --data_dir         "\${DATA_DIR}" \\
-        --target_dataset   "\${TARGET}" \\
-        --config           "\${CONFIG}" \\
-        --encoder_grid     "\${ENCODER_GRID}" \\
-        --top_k_enc        "\${TOP_K_ENC}" \\
-        --top_k_strategies "\${TOP_K_STR}" \\
-        --output           "\${FINALISTS}" \\
-        --seed             "\${SEED}" \\
-        > >(tee -a "\${OUT_DIR}/run_post.log") \\
-        2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
-fi
+# ── Per-target zero-shot ranking + Phase 4 retrain (3 targets) ─────────────
+# B.3 + Phase 4 run sequentially per target.  The comparator from B.2 is
+# shared across all three.  Each target gets its own ``finalists_<t>.json``
+# and ``phase4_<t>/phase4_best.json`` so resume is per-target — if one
+# target's Phase 4 dies mid-way, re-running the downstream sbatch picks up
+# from the next target without redoing completed ones.
+for target in "\${TARGETS[@]}"; do
+    echo
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "Target: \${target}"
+    echo "═══════════════════════════════════════════════════════════════════"
 
-# ── Phase 4 — Cartesian retrain on target ──────────────────────────────────
-echo
-echo "═══════ Phase 4: Cartesian retrain on \${TARGET} ═══════"
-if [[ -s "\${PHASE4_BEST}" ]]; then
-    echo "[phase4] \${PHASE4_BEST} exists — skipping (delete to re-run)"
-else
-    srun --unbuffered python -u scripts/run_phase4_finalists.py \\
-        --finalists "\${FINALISTS}" \\
-        --target    "\${TARGET}" \\
-        --data_dir  "\${DATA_DIR}" \\
-        --config    "\${CONFIG}" \\
-        --save_dir  "\${OUT_DIR}" \\
-        --seed      "\${SEED}" \\
-        > >(tee -a "\${OUT_DIR}/run_post.log") \\
-        2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
-fi
+    FINALISTS="\${OUT_DIR}/finalists_\${target}.json"
+    PHASE4_DIR="\${OUT_DIR}/phase4_\${target}"
+    PHASE4_BEST="\${PHASE4_DIR}/phase4_best.json"
+    mkdir -p "\${PHASE4_DIR}"
+
+    # Stage B.3 — zero-shot ranking on this target
+    echo
+    echo "═══════ Stage B.3: zero-shot ranking on \${target} ═══════"
+    if [[ -s "\${FINALISTS}" ]]; then
+        echo "[stage-B.3] \${FINALISTS} exists — skipping (delete to re-run)"
+    else
+        srun --unbuffered python -u scripts/run_zero_shot_search.py \\
+            --comparator_path  "\${COMPARATOR}" \\
+            --data_dir         "\${DATA_DIR}" \\
+            --target_dataset   "\${target}" \\
+            --config           "\${CONFIG}" \\
+            --encoder_grid     "\${ENCODER_GRID}" \\
+            --top_k_enc        "\${TOP_K_ENC}" \\
+            --top_k_strategies "\${TOP_K_STR}" \\
+            --output           "\${FINALISTS}" \\
+            --seed             "\${SEED}" \\
+            > >(tee -a "\${OUT_DIR}/run_post.log") \\
+            2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
+    fi
+
+    # Phase 4 — Cartesian retrain on this target
+    echo
+    echo "═══════ Phase 4: Cartesian retrain on \${target} ═══════"
+    if [[ -s "\${PHASE4_BEST}" ]]; then
+        echo "[phase4] \${PHASE4_BEST} exists — skipping (delete to re-run)"
+    else
+        srun --unbuffered python -u scripts/run_phase4_finalists.py \\
+            --finalists "\${FINALISTS}" \\
+            --target    "\${target}" \\
+            --data_dir  "\${DATA_DIR}" \\
+            --config    "\${CONFIG}" \\
+            --save_dir  "\${PHASE4_DIR}" \\
+            --seed      "\${SEED}" \\
+            > >(tee -a "\${OUT_DIR}/run_post.log") \\
+            2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
+    fi
+done
 
 echo
 echo "================================================================="
@@ -348,18 +411,23 @@ echo "Outputs:"
 echo "  Stage B.1     : \${SEEDS}"
 echo "  Stage T       : \${TASK_FEAT_DIR}/<dataset>_task_feature.npy"
 echo "  Stage B.2     : \${COMPARATOR}"
-echo "  Stage B.3     : \${FINALISTS}"
-echo "  Phase 4       : \${OUT_DIR}/phase4_results.json"
-echo "  Best          : \${PHASE4_BEST}"
+for t in "\${TARGETS[@]}"; do
+    echo "  [\${t}] B.3   : \${OUT_DIR}/finalists_\${t}.json"
+    echo "  [\${t}] Ph4   : \${OUT_DIR}/phase4_\${t}/phase4_best.json"
+done
 echo "  Full log      : \${OUT_DIR}/run_post.log"
 echo "================================================================="
 
-if [[ -s "\${PHASE4_BEST}" ]]; then
-    echo
-    echo ">>> Best finalist:"
-    python -c "
+echo
+echo ">>> Best finalist per target:"
+for t in "\${TARGETS[@]}"; do
+    best="\${OUT_DIR}/phase4_\${t}/phase4_best.json"
+    if [[ -s "\${best}" ]]; then
+        echo
+        echo "--- \${t} ---"
+        python -c "
 import json
-with open('\${PHASE4_BEST}') as f:
+with open('\${best}') as f:
     b = json.load(f)
 print(f\"  Tag      : {b.get('tag', 'n/a')}\")
 for k in ('mean_mse', 'mean_mae', 'mean_mse_raw', 'mean_mae_raw'):
@@ -367,7 +435,10 @@ for k in ('mean_mse', 'mean_mae', 'mean_mse_raw', 'mean_mae_raw'):
         print(f\"  {k:9s}: {b[k]:.4f}\")
 print(f\"  Encoder  : {b.get('encoder_config', 'n/a')}\")
 "
-fi
+    else
+        echo "  [\${t}] no phase4_best.json — check log"
+    fi
+done
 DEPEOF
 
         # Submit downstream with afterok dep on the entire array.
@@ -501,7 +572,7 @@ echo
 if [[ -f "${LOCK}" ]]; then
     echo "Downstream       : auto-chained, JID $(cat "${LOCK}" 2>/dev/null || echo "?")"
     echo "                   sbatch script   : ${DEP_SBATCH}"
-    echo "                   (waits on afterok:${SLURM_ARRAY_JOB_ID:-?}; runs B.2 → B.3 → Phase 4)"
+    echo "                   (waits on afterok:${SLURM_ARRAY_JOB_ID:-?}; runs Stage T → B.2 → 3×(B.3 + Phase 4))"
 else
     echo "Downstream       : NOT auto-chained (ZAC_NO_CHAIN=1 or task != 0)"
     echo "                   re-run with chain enabled:  sbatch scripts/run_array.sbatch"

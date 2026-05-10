@@ -4,9 +4,11 @@ Supported datasets
 ------------------
 Classification   : HAR, Epilepsy, SleepEEG, Gesture, NATOPS
 Anomaly detection: Yahoo, KPI
-Forecasting      : ETTh1, ETTh2, ETTm1, PEMS series, PEMS-BAY, METR-LA,
-                   ExchangeRate, Electricity, Solar (AL), Weather (Jena 2020),
-                   ILI (national_illness)
+Forecasting      : ETTh1, ETTh2, ETTm1, ETTm2, PEMS series, PEMS-BAY,
+                   METR-LA, ExchangeRate, Electricity, Solar (AL),
+                   Weather (Jena 2020), traffic (Lai/SF), ILI
+                   (national_illness), AQShunyi/AQWanliu/AQGuanyuan
+                   (Beijing PRSA Multi-Site Air Quality)
 
 All returned data arrays have shape (N, T, C) where:
   N — number of samples / time-series instances
@@ -342,7 +344,7 @@ def _load_ett(
 
     Args:
         data_dir: Root data directory.
-        name: One of 'ETTh1', 'ETTh2', 'ETTm1'.
+        name: One of 'ETTh1', 'ETTh2', 'ETTm1', 'ETTm2'.
 
     Returns:
         ``(train_data, val_data, test_data, raw_scaler, n_covariate_cols)``
@@ -707,6 +709,108 @@ def _load_ili(
     )
 
 
+def _load_traffic(
+    data_dir: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
+    """Load traffic.csv (Lai 2018 / SF freeway road occupancy).
+
+    Expects ``{data_dir}/traffic.csv`` with a ``date`` column followed by 862
+    numerical road-sensor occupancy columns (last column = ``OT``).  Hourly
+    sampling, ~17,544 timesteps.  7/1/2 split per Informer convention.
+
+    Returns:
+        train_data, val_data, test_data — each of shape ``(1, T_split, 862)``.
+    """
+    path = os.path.join(data_dir, "traffic.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Traffic data not found at {path}")
+    df = pd.read_csv(path)
+    if "date" in df.columns:
+        df = df.drop(columns=["date"])
+
+    data = df.values.astype(np.float32)  # (T, 862)
+
+    train_raw, val_raw, test_raw = _ratio_split(data, _RATIO_SPLITS["7-1-2"])
+
+    scaler = StandardScaler().fit(train_raw)
+    train_data = scaler.transform(train_raw)
+    val_data = scaler.transform(val_raw)
+    test_data = scaler.transform(test_raw)
+
+    return (
+        train_data[np.newaxis],
+        val_data[np.newaxis],
+        test_data[np.newaxis],
+        scaler,
+    )
+
+
+# AQ feature columns kept for the Beijing PRSA Multi-Site loader.  The raw
+# CSV has 18 columns; we drop ``No`` / date components / ``station`` (metadata)
+# and ``wd`` (16-class wind-direction *string*) to keep all 11 features
+# numerical and avoid breaking the pollutant×meteorology coupling that gives
+# this dataset its characteristic dynamics.
+_AQ_KEEP_COLS = [
+    "PM2.5", "PM10", "SO2", "NO2", "CO", "O3",   # 6 pollutants
+    "TEMP", "PRES", "DEWP", "RAIN", "WSPM",      # 5 meteorology
+]
+
+_AQ_FILE_MAP = {
+    "AQShunyi":   "PRSA_Data_Shunyi_20130301-20170228.csv",
+    "AQWanliu":   "PRSA_Data_Wanliu_20130301-20170228.csv",
+    "AQGuanyuan": "PRSA_Data_Guanyuan_20130301-20170228.csv",
+}
+
+
+def _load_aq_prsa(
+    data_dir: str,
+    name: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
+    """Load a single Beijing PRSA Multi-Site Air Quality station.
+
+    Each station CSV contains 35,064 hourly rows (2013-03-01 → 2017-02-28)
+    with 11 numerical features kept here: PM2.5, PM10, SO2, NO2, CO, O3,
+    TEMP, PRES, DEWP, RAIN, WSPM.  The raw file also has a ``wd`` 16-class
+    string column (wind direction) which we drop to keep all inputs numeric
+    — encoding it as one-hot would inflate the channel count to 26 and
+    distort the dataset's task-feature footprint relative to other
+    ZeroAutoCL sources.  Missing values (``NA``) are forward+backward
+    filled.  7/1/2 split per Informer convention.
+
+    Args:
+        data_dir: Root data directory.
+        name: Logical name — 'AQShunyi', 'AQWanliu', 'AQGuanyuan'.
+
+    Returns:
+        train_data, val_data, test_data — each of shape ``(1, T_split, 11)``.
+    """
+    if name not in _AQ_FILE_MAP:
+        raise ValueError(f"Unknown PRSA AQ station: {name!r}")
+    path = os.path.join(data_dir, _AQ_FILE_MAP[name])
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"AQ data not found at {path}")
+
+    df = pd.read_csv(path)
+    df = df[_AQ_KEEP_COLS].apply(pd.to_numeric, errors="coerce")
+    df = df.ffill().bfill()
+
+    data = df.values.astype(np.float32)  # (35064, 11)
+
+    train_raw, val_raw, test_raw = _ratio_split(data, _RATIO_SPLITS["7-1-2"])
+
+    scaler = StandardScaler().fit(train_raw)
+    train_data = scaler.transform(train_raw)
+    val_data = scaler.transform(val_raw)
+    test_data = scaler.transform(test_raw)
+
+    return (
+        train_data[np.newaxis],
+        val_data[np.newaxis],
+        test_data[np.newaxis],
+        scaler,
+    )
+
+
 def _load_metr_la(
     data_dir: str,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, StandardScaler]:
@@ -790,6 +894,7 @@ _SUPPORTED_DATASETS: Dict[str, str] = {
     "ETTh1": "forecasting",
     "ETTh2": "forecasting",
     "ETTm1": "forecasting",
+    "ETTm2": "forecasting",
     "PEMS03": "forecasting",
     "PEMS04": "forecasting",
     "PEMS07": "forecasting",
@@ -800,6 +905,10 @@ _SUPPORTED_DATASETS: Dict[str, str] = {
     "Electricity": "forecasting",
     "Solar": "forecasting",
     "Weather": "forecasting",
+    "traffic": "forecasting",
+    "AQShunyi": "forecasting",
+    "AQWanliu": "forecasting",
+    "AQGuanyuan": "forecasting",
     "ILI": "forecasting",
 }
 
@@ -874,7 +983,7 @@ def load_dataset(
         splits["val"] = TimeSeriesDataset(train_x[-n_val:], train_y[-n_val:], task_type, max_len)
         splits["test"] = TimeSeriesDataset(test_x, test_y, task_type, max_len)
 
-    elif name in ("ETTh1", "ETTh2", "ETTm1"):
+    elif name in ("ETTh1", "ETTh2", "ETTm1", "ETTm2"):
         train_data, val_data, test_data, scaler, n_cov = _load_ett(data_dir, name)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
@@ -962,6 +1071,34 @@ def load_dataset(
 
     elif name == "Weather":
         train_data, val_data, test_data, scaler = _load_weather(data_dir)
+        splits["train"] = TimeSeriesDataset(
+            train_data, None, task_type, max_len,
+            window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
+        )
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
+
+    elif name == "traffic":
+        train_data, val_data, test_data, scaler = _load_traffic(data_dir)
+        splits["train"] = TimeSeriesDataset(
+            train_data, None, task_type, max_len,
+            window_len=forecast_wl, window_stride=1,
+            scaler=scaler,
+        )
+        splits["val"] = TimeSeriesDataset(
+            val_data, None, task_type, max_len, scaler=scaler,
+        )
+        splits["test"] = TimeSeriesDataset(
+            test_data, None, task_type, max_len, scaler=scaler,
+        )
+
+    elif name in ("AQShunyi", "AQWanliu", "AQGuanyuan"):
+        train_data, val_data, test_data, scaler = _load_aq_prsa(data_dir, name)
         splits["train"] = TimeSeriesDataset(
             train_data, None, task_type, max_len,
             window_len=forecast_wl, window_stride=1,

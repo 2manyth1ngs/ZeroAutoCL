@@ -117,9 +117,9 @@ def main() -> None:
     tfe = TaskFeatureExtractor(device=device)
     task_features = {}
     for base, tids in sorted(by_base.items()):
-        # No sub-task suffix → the legacy fast path: extract once on the
-        # full dataset.  This keeps backward compatibility with seed files
-        # generated before the variant patch.
+        # No sub-task suffix → fast path: load the base cache directly.
+        # Keeps backward compatibility with seed files that predate the
+        # variant patch.
         if len(tids) == 1 and tids[0] == base:
             logger.info("Extracting task features for: %s", base)
             splits = load_dataset(base, args.data_dir)
@@ -129,10 +129,13 @@ def main() -> None:
             )
             continue
 
-        # Sub-task path: re-derive the SAME (window × var-subset) sub-tasks
-        # used at seed-gen time.  ``var_subset_seed`` must match what
-        # ``generate_seeds`` passed in (we use ``args.seed`` on both sides
-        # so the per-source variable index lists are reproducible).
+        # Sub-task path.  Option B (2026-05-10): per-sub-task task features
+        # are now precomputed by ``precompute_task_features.py --sub_task_mode``
+        # under filenames like ``ETTh2__tw0__vs1_task_feature.npy``.  We pass
+        # the full window_id as the cache key; ``TaskFeatureExtractor.extract``
+        # tries the sub-task-specific cache first and falls back to the base
+        # cache when the sub-task file is missing (e.g. legacy runs that only
+        # precomputed base-level features).
         sub_tasks = make_forecasting_subtasks(
             base, args.data_dir,
             n_time_windows=n_time_windows,
@@ -170,12 +173,6 @@ def main() -> None:
                 )
                 continue
             sub = by_window[window_id]
-            # Pick the explicit horizon for this group (when applicable) so
-            # downstream logging stays informative; the cached task feature
-            # itself is keyed only on the base dataset name (the precomputed
-            # encoder already captures the source's distribution; per-window
-            # / per-horizon variation is now learned by the comparator from
-            # the seed labels themselves).
             horizon_meta = 0
             if parts.hg_idx is not None and parts.hg_idx < len(sub.horizon_groups):
                 hg = sub.horizon_groups[parts.hg_idx]
@@ -186,9 +183,11 @@ def main() -> None:
                 "n_vars=%d)",
                 tid, window_id, horizon_meta, sub.train.n_channels,
             )
+            # Pass the full window_id so the loader picks up the sub-task
+            # cache when available (and falls back to base otherwise).
             task_features[tid] = tfe.extract(
                 sub.train, sub.train.task_type, horizon=horizon_meta,
-                dataset_name=base,
+                dataset_name=window_id,
             )
     logger.info("Task features ready for %d task IDs.", len(task_features))
 

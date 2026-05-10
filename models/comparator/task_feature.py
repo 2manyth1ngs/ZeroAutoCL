@@ -68,6 +68,30 @@ DEFAULT_CACHE_DIR: str = "outputs/task_features"
 _DEPRECATION_WARNED = False
 
 
+def task_feature_slug(key: str) -> str:
+    """Convert a task-feature cache key into a filesystem-safe slug.
+
+    Sub-task IDs use ``:`` as separator (e.g. ``"ETTh2:tw0:vs1"``).  On Windows
+    NTFS ``:`` is reserved for alternate data streams and corrupts filenames,
+    so we encode it as ``__`` everywhere the key crosses into disk:
+
+        ``"ETTh2"``           → ``"ETTh2"``               (base only)
+        ``"ETTh2:tw0"``       → ``"ETTh2__tw0"``          (one axis)
+        ``"ETTh2:tw0:vs1"``   → ``"ETTh2__tw0__vs1"``     (two axes)
+
+    The double underscore was chosen because it is extremely rare in dataset
+    names (which use single underscores at most), keeping the slug
+    unambiguous.
+
+    Args:
+        key: Task feature cache key (base name or sub-task ID).
+
+    Returns:
+        Filesystem-safe slug for the ``{slug}_task_feature.npy`` filename.
+    """
+    return key.replace(":", "__")
+
+
 # --------------------------------------------------------------------------- #
 # Loader
 # --------------------------------------------------------------------------- #
@@ -159,12 +183,30 @@ class TaskFeatureExtractor:
                 "automatically).",
             )
 
-        path = os.path.join(self.cache_dir, f"{key}_task_feature.npy")
+        # Option B (2026-05-10): sub-task-aware cache lookup.  When *key* is
+        # a sub-task ID like ``"ETTh2:tw0:vs1"`` we first try the
+        # sub-task-specific cache (precomputed via ``--sub_task_mode``); if
+        # that's missing we fall back to the base dataset's cache so old
+        # workflows keep working.
+        slug = task_feature_slug(key)
+        path = os.path.join(self.cache_dir, f"{slug}_task_feature.npy")
+        if not os.path.isfile(path) and ":" in key:
+            base = key.split(":")[0]
+            base_path = os.path.join(self.cache_dir, f"{base}_task_feature.npy")
+            if os.path.isfile(base_path):
+                logger.info(
+                    "Task feature cache for %r not found; falling back to "
+                    "base-dataset cache at %s.",
+                    key, base_path,
+                )
+                path = base_path
+
         if not os.path.isfile(path):
             raise FileNotFoundError(
                 f"Task feature cache missing for {key!r}: expected {path}.\n"
                 f"Run `python scripts/precompute_task_features.py "
-                f"--datasets {key} --data_dir <data_root>` first.",
+                f"--datasets {key.split(':', 1)[0]} --data_dir <data_root>` "
+                f"first (add --sub_task_mode --config <yaml> for sources).",
             )
 
         arr = np.load(path)
@@ -172,5 +214,17 @@ class TaskFeatureExtractor:
             raise ValueError(
                 f"Task feature {path} has unexpected shape {arr.shape}; "
                 f"expected (N_set, seq_len, D).",
+            )
+        # Bug A2 (2026-05-10): if the user precomputed the cache with a
+        # different --repr_dim, the .npy's D axis won't match what TCLSC's
+        # SetTransformerEncoder is sized for, causing a confusing dim-mismatch
+        # error deep inside the comparator.  Catch it early with a clear msg.
+        if arr.shape[-1] != TASK_FEATURE_REPR_DIM:
+            raise ValueError(
+                f"Task feature {path} has D={arr.shape[-1]} but "
+                f"TASK_FEATURE_REPR_DIM={TASK_FEATURE_REPR_DIM}.  Either set "
+                f"TASK_FEATURE_REPR_DIM in models/comparator/task_feature.py "
+                f"to {arr.shape[-1]}, or regenerate the cache with "
+                f"--repr_dim {TASK_FEATURE_REPR_DIM}.",
             )
         return torch.from_numpy(arr).float().to(self.device)

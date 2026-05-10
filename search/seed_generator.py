@@ -354,6 +354,17 @@ def generate_seeds(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Resolve task-variant axes once so logging and ID building stay consistent.
+    # Bug A1 (2026-05-10): ``has_windows`` / ``has_var_subsets`` used to be
+    # computed from the *global* ``n_time_windows`` / ``n_variable_subsets``
+    # and reused for every source.  When global=1 but a per-source override
+    # turned an axis on (e.g. global ``n_time_windows: 1`` + ETTh2 override
+    # to 3), the global flag stayed ``False`` and ``build_task_id`` suppressed
+    # the ``:twX`` suffix, collapsing all of ETTh2's sub-task IDs to the bare
+    # base name and silently merging their seed pools under one task feature.
+    # The fix moves the *axis-on* decision inside the per-source loop where
+    # the resolved ``ds_n_time_windows`` / ``ds_n_variable_subsets`` are
+    # available.  ``has_hg`` is genuinely a run-level decision (horizon
+    # groups are not per-source-overridable) so it stays global.
     if not horizon_groups:
         horizon_groups = [None]
     has_windows = n_time_windows > 1
@@ -411,7 +422,21 @@ def generate_seeds(
     # order.  That makes seeds line up identically between sequential mode
     # and SLURM job-array fan-out (each task processes one source at its
     # own ``source_global_idx_offset``).
-    n_max_subtasks = max(1, int(n_time_windows) * int(n_variable_subsets))
+    #
+    # Per-source overrides (``dataset_budgets[ds].n_time_windows`` /
+    # ``n_variable_subsets``) can push a single source above the run-level
+    # global, e.g. ETTh2 boosted to ``n_time_windows=9`` while the global
+    # default stays at 3.  Take the max across all sources so per-candidate
+    # seed slots never collide between consecutive ``effective_ds_idx``.
+    def _resolve_subtask_upper(name: str) -> int:
+        b = (dataset_budgets or {}).get(name, {}) or {}
+        ntw = int(b.get("n_time_windows", n_time_windows))
+        nvs = int(b.get("n_variable_subsets", n_variable_subsets))
+        return max(1, ntw * nvs)
+    n_max_subtasks = max(
+        max(1, int(n_time_windows) * int(n_variable_subsets)),
+        max((_resolve_subtask_upper(n) for n in source_datasets), default=1),
+    )
     if int(source_global_idx_offset) != 0:
         logger.info(
             "[generate_seeds] source_global_idx_offset=%d  n_max_subtasks=%d",
@@ -427,38 +452,6 @@ def generate_seeds(
             "[dataset %d/%d] Generating seeds for: %s",
             ds_idx + 1, n_datasets, ds_name,
         )
-
-        # ── Per-dataset checkpoint resume ──────────────────────────────
-        # On crash mid-loop (e.g. PEMS07 OOM) we lose ``all_seeds`` because
-        # the bottom-of-function ``seeds.json`` write is unreached.  A
-        # sidecar ``_seeds_<ds>.json`` is written after each source
-        # completes; on the next invocation we replay it instead of re-
-        # training the source.  Per-candidate seeds now derive from
-        # ``effective_ds_idx`` (independent of iteration order), so cache
-        # resume needs no counter bookkeeping.
-        ds_ckpt = (
-            os.path.join(save_dir, f"_seeds_{ds_name}.json")
-            if save_dir is not None else None
-        )
-        if ds_ckpt and os.path.exists(ds_ckpt) and os.path.getsize(ds_ckpt) > 0:
-            try:
-                with open(ds_ckpt, encoding="utf-8") as f:
-                    payload = json.load(f)
-                cached = [SeedRecord.from_dict(d) for d in payload["records"]]
-                n_sub_cached = int(payload.get("n_subtasks", 0))
-                logger.info(
-                    "[dataset %d/%d] %s — checkpoint hit (%d records, "
-                    "%d sub-tasks); skipping re-training.",
-                    ds_idx + 1, n_datasets, ds_name,
-                    len(cached), n_sub_cached,
-                )
-                all_seeds.extend(cached)
-                continue
-            except Exception as exc:                            # pragma: no cover
-                logger.warning(
-                    "Checkpoint %s unreadable (%s); re-running %s from scratch.",
-                    ds_ckpt, exc, ds_name,
-                )
 
         # Per-dataset budget override (Bug #003a).  Sub-tasks of the same
         # source share the same budget — they are different windows of the
@@ -484,17 +477,91 @@ def generate_seeds(
                 "  per-dataset eval_horizons override: %s", ds_eval_horizons,
             )
 
+        # Per-dataset slicing axes override (AutoCTS++ §4.1.1: under-represented
+        # domains need more sub-tasks to cover their task-feature cluster).
+        # Used to bump ETTh2's sub-task count from 3 (univariate → variable
+        # axis silently disabled) up to 9, matching wide sources whose 3×3
+        # = 9 sub-tasks come from time × variable axes.  Without this the
+        # comparator's ETT cluster gets ~3% of the seed pool and degrades to
+        # the dominant traffic-source preference.
+        ds_n_time_windows = int(ds_budget.get("n_time_windows", n_time_windows))
+        ds_n_variable_subsets = int(
+            ds_budget.get("n_variable_subsets", n_variable_subsets),
+        )
+        if ds_n_time_windows != n_time_windows:
+            logger.info(
+                "  per-dataset n_time_windows override: %d → %d",
+                n_time_windows, ds_n_time_windows,
+            )
+        if ds_n_variable_subsets != n_variable_subsets:
+            logger.info(
+                "  per-dataset n_variable_subsets override: %d → %d",
+                n_variable_subsets, ds_n_variable_subsets,
+            )
+        # Per-source axis-on flags (Bug A1 fix): use the *resolved* per-source
+        # subtask counts so a global-off + per-source-on override (or the
+        # reverse) doesn't collapse IDs.  See axis-decision comment at the
+        # top of generate_seeds().
+        ds_has_windows     = ds_n_time_windows     > 1
+        ds_has_var_subsets = ds_n_variable_subsets > 1
+
+        # ── Per-dataset checkpoint resume ──────────────────────────────
+        # On crash mid-loop (e.g. PEMS07 OOM) we lose ``all_seeds`` because
+        # the bottom-of-function ``seeds.json`` write is unreached.  A
+        # sidecar ``_seeds_<ds>.json`` is written after each source
+        # completes; on the next invocation we replay it instead of re-
+        # training the source.  Per-candidate seeds derive from
+        # ``effective_ds_idx`` (independent of iteration order), so cache
+        # resume needs no counter bookkeeping.
+        #
+        # Stale-cache guard: when the user bumps ``n_time_windows`` for a
+        # source (e.g. ETTh2 3 → 9 to fix the ETT-cluster underrepresentation)
+        # the existing checkpoint silently keeps the old sub-task count.
+        # Detect that and force regeneration.
+        ds_ckpt = (
+            os.path.join(save_dir, f"_seeds_{ds_name}.json")
+            if save_dir is not None else None
+        )
+        if ds_ckpt and os.path.exists(ds_ckpt) and os.path.getsize(ds_ckpt) > 0:
+            try:
+                with open(ds_ckpt, encoding="utf-8") as f:
+                    payload = json.load(f)
+                cached = [SeedRecord.from_dict(d) for d in payload["records"]]
+                n_sub_cached = int(payload.get("n_subtasks", 0))
+                if n_sub_cached > 0 and n_sub_cached < ds_n_time_windows:
+                    logger.warning(
+                        "[%s] checkpoint has n_subtasks=%d but config now "
+                        "requests at least %d (n_time_windows). Discarding "
+                        "stale cache and regenerating; delete %s manually if "
+                        "you want to keep it.",
+                        ds_name, n_sub_cached, ds_n_time_windows, ds_ckpt,
+                    )
+                else:
+                    logger.info(
+                        "[dataset %d/%d] %s — checkpoint hit (%d records, "
+                        "%d sub-tasks); skipping re-training.",
+                        ds_idx + 1, n_datasets, ds_name,
+                        len(cached), n_sub_cached,
+                    )
+                    all_seeds.extend(cached)
+                    continue
+            except Exception as exc:                            # pragma: no cover
+                logger.warning(
+                    "Checkpoint %s unreadable (%s); re-running %s from scratch.",
+                    ds_ckpt, exc, ds_name,
+                )
+
         # Expand the source into one or more sub-tasks (time-window axis
         # × variable-subset axis).  Horizon-group axis is handled inside
         # ``_evaluate_candidate`` (one CL pre-train, multiple Ridge evals).
         sub_tasks: List[ForecastingSubTask] = make_forecasting_subtasks(
             ds_name,
             data_dir,
-            n_time_windows=n_time_windows,
+            n_time_windows=ds_n_time_windows,
             horizon_groups=horizon_groups,
             crop_len=ds_crop_len,
             min_window_len=min_window_len,
-            n_variable_subsets=n_variable_subsets,
+            n_variable_subsets=ds_n_variable_subsets,
             var_size_rates=var_size_rates,
             min_var_count=min_var_count,
             var_subset_seed=seed,
@@ -578,8 +645,8 @@ def generate_seeds(
                         tw_idx=sub.tw_idx,
                         vs_idx=sub.vs_idx,
                         hg_idx=hg_idx if has_hg else None,
-                        has_windows=has_windows,
-                        has_variable_subsets=has_var_subsets,
+                        has_windows=ds_has_windows,
+                        has_variable_subsets=ds_has_var_subsets,
                         has_horizon_groups=has_hg,
                     )
                     ds_seeds.append(

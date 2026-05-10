@@ -6,13 +6,28 @@ datasets fall back to epoch-based training.  CLI flags
 ``--pretrain_iters`` and ``--pretrain_epochs`` override the YAML values
 **globally** (applied to every source dataset).
 
+Default source pool (forecasting, rev 2026-05-10 — CL-aligned 9 sources for
+zero-shot to ETTh1 / Electricity / Weather targets):
+
+  ETTh2 ETTm1 ETTm2 Solar traffic AQShunyi AQWanliu AQGuanyuan ExchangeRate
+
+Mirrors AutoCTS++ §4.1.1 — every target has ≥2 same-domain neighbours in
+the source pool, and the seed-record distribution is balanced across five
+task-feature clusters (ETT 37% / Energy 16% / Transport 16% / Atmospheric
+16% / Finance 16%) so the comparator's zero-shot ranking doesn't collapse
+onto a dominant-domain preference.  PEMS / METR-LA / ILI are excluded
+because (a) they are not CL-forecasting benchmarks and (b) the prior
+12-source PEMS-heavy run produced mode collapse on ETTh1 (mean MSE 0.180
+vs 0.090 for the 6-source pool).
+
 Usage
 -----
 python scripts/run_generate_seeds.py \\
     --data_dir  ZeroAutoCL/data/datasets \\
     --save_dir  ZeroAutoCL/outputs/seeds \\
     --config    ZeroAutoCL/configs/default.yaml \\
-    --datasets  ETTm1 PEMS03 PEMS04 PEMS07 PEMS08 ExchangeRate PEMS-BAY \\
+    --datasets  ETTh2 ETTm1 ETTm2 Solar traffic \\
+                AQShunyi AQWanliu AQGuanyuan ExchangeRate \\
     --n_per_dataset 30 \\
     --batch_size 64 \\
     --seed 42
@@ -45,9 +60,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_dir",        required=True,  help="Output directory for seeds.json")
     p.add_argument("--config",          default=None,   help="Path to default.yaml (optional)")
     p.add_argument("--datasets",        nargs="+",
-                   default=["ETTm1", "PEMS03", "PEMS04", "PEMS07", "PEMS08",
-                            "ExchangeRate", "PEMS-BAY"],
-                   help="Source dataset names")
+                   default=["ETTh2", "ETTm1", "ETTm2",
+                            "Solar", "traffic",
+                            "AQShunyi", "AQWanliu", "AQGuanyuan",
+                            "ExchangeRate"],
+                   help="Source dataset names. Default = CL-aligned 9-source "
+                        "pool (rev 2026-05-10): 3 ETT siblings, 1 Solar "
+                        "(energy), 1 traffic.csv (transport), 3 Beijing AQ "
+                        "stations (atmospheric), 1 ExchangeRate (finance). "
+                        "Excludes PEMS/METR-LA (graph-traffic, not CL "
+                        "benchmarks) and ILI (too short for stable CL).")
     p.add_argument("--n_per_dataset",   type=int,       default=30)
     p.add_argument("--n_shared",        type=int,       default=None,
                    help="Cross-source L-share pool size (AutoCTS++ trick). "
@@ -158,20 +180,36 @@ def main() -> None:
     min_var_count  = int(variants_cfg.get("min_var_count", 4) or 4)
 
     # ── Per-dataset budget resolution ─────────────────────────────────────
-    # Priority for each source dataset:
-    #   1. CLI --pretrain_iters / --pretrain_epochs (global override).
-    #   2. configs/default.yaml :: dataset_budgets[name]
-    #   3. Fallback: pretrain_epochs from seed_generation block (epoch-based)
+    # Resolution order (merge semantics, NOT replace):
+    #   1. Start from configs/default.yaml :: dataset_budgets[name] (carries
+    #      per-dataset overrides for n_time_windows, n_variable_subsets,
+    #      crop_len, eval_horizons, …).
+    #   2. If CLI --pretrain_iters / --pretrain_epochs is set, REPLACE only
+    #      the compute key (drops the other one to avoid ambiguity, leaves
+    #      everything else untouched).
+    #   3. If both YAML budget AND CLI overrides are absent, fall back to the
+    #      global ``pretrain_epochs`` from the seed_generation block.
+    #
+    # Bug #1 (2026-05-10): the previous logic REPLACED the whole budget dict
+    # when CLI --pretrain_iters/--pretrain_epochs was set, silently dropping
+    # YAML-side n_variable_subsets / n_time_windows / etc. overrides.  This
+    # caused AQ stations to inflate from 3 to 9 sub-tasks in dry runs.
     dataset_budgets: Dict[str, Dict[str, int]] = {}
     for ds in args.datasets:
+        # Step 1: base = YAML budget (may be empty).
+        budget: Dict[str, int] = dict(yaml_dataset_budgets.get(ds, {}))
+
+        # Step 2: CLI compute override — replace only the compute key.
         if args.pretrain_iters is not None and args.pretrain_iters > 0:
-            budget: Dict[str, int] = {"pretrain_iters": int(args.pretrain_iters)}
+            budget.pop("pretrain_epochs", None)
+            budget["pretrain_iters"] = int(args.pretrain_iters)
         elif args.pretrain_epochs is not None:
-            budget = {"pretrain_epochs": int(args.pretrain_epochs)}
-        elif ds in yaml_dataset_budgets:
-            budget = dict(yaml_dataset_budgets[ds])
-        else:
+            budget.pop("pretrain_iters", None)
+            budget["pretrain_epochs"] = int(args.pretrain_epochs)
+        elif not budget:
+            # Step 3: nothing from YAML and no CLI override → global fallback.
             budget = {"pretrain_epochs": int(pretrain_epochs)}
+
         dataset_budgets[ds] = budget
 
     device = torch.device(args.device) if args.device else None
