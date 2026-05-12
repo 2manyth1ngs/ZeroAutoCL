@@ -127,7 +127,7 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/ZeroAutoCL}"
 cd "$PROJECT_ROOT"
 
-OUT_DIR="outputs/zac_2026_05_10"
+OUT_DIR="outputs/zac_2026_05_12"
 DATA_DIR="data/datasets"
 CONFIG="configs/default.yaml"
 
