@@ -1,37 +1,56 @@
-"""Pretrain the T-CLSC comparator with **per-task z-score normalisation +
-gap-split valid + symmetric pairs + valid-loss early stopping** — ported
-from AutoCTS++ (``random_search.py``) and adapted for ZeroAutoCL.
+"""Pretrain the T-CLSC comparator with hold-out source valid split (preferred)
+or legacy per-task gap split, symmetric pair injection, and valid-loss early
+stopping — ported from AutoCTS++ (``random_search.py``) and adapted for
+ZeroAutoCL.
 
 Pipeline shape
 --------------
-1. **Per-task z-score** of seed performance:  the gap-split logic uses an
-   absolute threshold, but raw performance scales differ by 50–100× across
-   sources (e.g. ExchangeRate ≈ −3 vs PEMS04 ≈ −0.27).  Without
-   normalisation a fixed ``valid_gap_threshold`` rejects almost every
-   PEMS04 seed (everything looks "too close") and accepts almost every
-   ExchangeRate seed (everything looks "far apart"), starving the
-   comparator's training pool of one task and overflowing the valid pool of
-   the other.  Z-score gives the threshold a uniform meaning across tasks.
-   Labels are unaffected because z-score is monotone (preserves rank).
-2. **Symmetric pair injection**: each unordered pair ``{A, B}`` yields BOTH
-   ``(A, B, 1)`` *and* ``(B, A, 0)`` — twice as many training examples,
-   teaches the comparator symmetric invariance explicitly.
-3. **Gap-based train/valid split**: per task, seeds are greedily placed into
-   a valid pool only when they are at least ``valid_gap_threshold`` apart
-   (in z-score units) from every already-accepted valid seed.
-4. **Valid-loss early stopping**: training tracks BCE on the valid pool and
-   restores the best-by-valid comparator state on exit.
+1. **Group by (task_id, stage)**: every seed record carries a ``stage`` tag
+   ("clean" or "noisy"); pairs are only constructed within a single
+   ``(task_id, stage)`` bucket because noisy and clean labels live on
+   slightly different convergence scales (noisy under-converges) and would
+   poison cross-stage comparisons.
 
-The old gap-magnitude curriculum was removed in P0 — it relied on
-trust-worthy absolute performance numbers, which our fixed-seed seed
-records do not provide.  The previously-supported noisy→clean two-stage
-curriculum was also removed because it failed to learn beyond the
-random-guess baseline at ZeroAutoCL's data scale (see CLAUDE_DEBUG.md).
+2. **Train / valid split**:
+     - **Hold-out source mode** (``valid_sources`` non-empty, default): all
+       seeds whose source matches ``valid_sources`` go into valid; the rest
+       go into train.  No gap-split is applied.  Each bucket forms ALL
+       quadratic pairs — N seeds → N(N-1) symmetric pairs.  This is the
+       AutoCTS++ regime (PEMS08 was held out as the comparator's valid in
+       ``random_search.py:502``).
+     - **Legacy gap-split mode** (``valid_sources`` empty): per
+       ``(task_id, stage)`` z-score perfs and greedily assign seeds to valid
+       only when ≥ ``valid_gap_threshold`` z-units from every accepted
+       valid seed.  Kept for backwards compatibility with small-scale runs.
+
+3. **Symmetric pair injection**: each unordered pair ``{A, B}`` yields BOTH
+   ``(A, B, 1)`` and ``(B, A, 0)`` — twice as many training examples, teaches
+   symmetric invariance explicitly (matches AutoCTS++
+   ``generate_task_pairs``).
+
+4. **Valid-loss early stopping with monitoring**:
+     - Valid BCE tracked against the ``ln 2 ≈ 0.6931`` random-baseline floor
+       and explicitly flagged on each log line so a plateau at chance level
+       cannot be missed.
+     - Per-source valid breakdown (BCE / acc / Spearman ρ on pair concordance)
+       to spot "global learns but one source is still random" failures.
+     - Per-stage train BCE breakdown (clean vs noisy) to detect noisy-label
+       gradient poisoning early.
+
+History
+-------
+The two-stage curriculum was previously removed because, at the ≤10k-pair
+data scale, the comparator BCE never left ``ln 2`` regardless of stage mix.
+The real bottleneck was pair count, not noisy label quality — the CLAUDE_ADV.md
+§12.5 calibration showed Spearman ρ(noisy, clean) ≥ 0.9 on ETTh2 even with
+1-epoch best-of-N labels.  Re-introducing noisy alongside hold-out source
+valid lifts the per-task pair count back into the AutoCTS++ regime.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -39,9 +58,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from data.dataset_slicer import parse_task_id
 from models.comparator.t_clsc import TCLSC
 from utils.logging_utils import get_logger
 from .seed_generator import SeedRecord
+
+# BCE of a random binary classifier on a balanced (symmetric) pair pool is
+# exactly ln(2) ≈ 0.6931.  We use this as the explicit floor when judging
+# whether the comparator has actually learned anything; the per-epoch logger
+# prints the gap so a regression to chance-level is impossible to miss.
+RANDOM_BASELINE_BCE = math.log(2.0)
 
 # Use the project-wide formatted stdout logger.  Without this, bare
 # ``logging.getLogger(__name__)`` defaults to WARNING level and silently
@@ -65,8 +91,18 @@ def _emit_symmetric_pairs(
     The symmetric emission matches AutoCTS++'s ``generate_task_pairs``
     (``reference/AutoCTS_plusplus/exps/random_search.py:402-412``), which
     doubles the effective training-example count at no evaluation cost.
+
+    All *seeds* must share the same ``stage`` — the caller pre-groups
+    records by ``(task_id, stage)`` so this invariant holds by construction
+    and so the emitted pair dicts can carry a single unambiguous stage tag
+    for per-stage monitoring.  Pair dicts also remember each side's raw
+    ``performance`` so the valid-time Spearman ρ diagnostic doesn't need
+    a back-reference to the original SeedRecord list.
     """
     n = len(seeds)
+    if n == 0:
+        return
+    stage = seeds[0].stage
     for i in range(n):
         for j in range(i + 1, n):
             a, b = seeds[i], seeds[j]
@@ -79,6 +115,9 @@ def _emit_symmetric_pairs(
                     "strat_b":   y.strategy,
                     "task_feat": task_feat,
                     "task_id":   task_id,
+                    "stage":     stage,
+                    "perf_a":    float(x.performance),
+                    "perf_b":    float(y.performance),
                     "label":     1.0 if x.performance > y.performance else 0.0,
                 })
                 if out_gaps is not None:
@@ -109,6 +148,7 @@ def _zscore_seeds(seeds: List[SeedRecord]) -> List[SeedRecord]:
             strategy=s.strategy,
             task_id=s.task_id,
             performance=(s.performance - mean) / std,
+            stage=s.stage,
         )
         for s in seeds
     ]
@@ -119,47 +159,119 @@ def _split_seeds_and_pairs(
     seeds: List[SeedRecord],
     task_features: Dict[str, Tensor],
     valid_gap_threshold: float,
+    valid_sources: Optional[List[str]] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
-    """Split seeds per task into train/valid with gap-dedup, emit symmetric pairs.
+    """Build train / valid pair pools from raw seed records.
 
-    Algorithm (per task, matches AutoCTS++ ``random_search.py:362-371``):
-      - Z-score the task's performance values so the gap threshold has a
-        uniform meaning regardless of the source's absolute scale.
-      - Iterate seeds in their natural order; for each seed *s*, put *s* into
-        ``valid_seeds`` if no already-accepted valid seed has performance
-        within ``valid_gap_threshold`` (z-score units) of *s*; otherwise
-        put *s* into ``train_seeds``.
-      - Fallback: if the greedy split leaves valid with < 2 seeds (cannot
-        form any pair) but the task had ≥ 4 seeds total, force-include the
-        min-performance and max-performance seeds into valid.
+    Two split modes (selected by ``valid_sources``):
+
+    **Hold-out source mode** (``valid_sources`` non-empty) — preferred default.
+        Seeds whose ``parse_task_id(task_id).base`` is in ``valid_sources`` go
+        100% into the valid pool; the rest go 100% into train.  No gap split
+        is applied — every seed in a (task_id, stage) bucket participates in
+        every pair within that bucket.  This is the AutoCTS++ regime
+        (``random_search.py:502-504``: PEMS08 was the held-out source for
+        valid/test, never overlapping with the seven sources used for train).
+        Why no gap-split?  Once valid is a *different source*, valid BCE
+        already measures cross-task generalisation; carving out the easy/hard
+        seeds within a task would only shrink the train pair count without
+        adding signal.
+
+    **Legacy gap-split mode** (``valid_sources`` empty / ``None``) — kept for
+    backwards compatibility with old runs and small-dataset sanity checks.
+        Per ``(task_id, stage)``, z-score the task's perfs and greedily place
+        each seed into valid only when no already-accepted valid seed lies
+        within ``valid_gap_threshold`` (z-score units).  Fallbacks force a
+        non-empty valid / train when greedy split degenerates.
+
+    In **both modes**, pairs are formed only WITHIN a ``(task_id, stage)``
+    bucket.  Noisy and clean records of the same task are never paired with
+    each other because their absolute perf scales differ (noisy under-
+    converges) — see ``SeedRecord`` docstring for the full reasoning.
 
     Args:
-        seeds: All evaluated seed records (multiple tasks allowed).
+        seeds: All evaluated seed records (multiple tasks / stages allowed).
         task_features: ``task_id → task-feature tensor`` mapping.
-        valid_gap_threshold: Minimum performance gap (in z-score units)
-            required for a seed to qualify for the valid pool.  Typical
-            values are 0.3 – 0.6 (a fraction of one std).
+        valid_gap_threshold: Used only in legacy mode.  Minimum z-score gap
+            for a seed to qualify for the valid pool.
+        valid_sources: List of source dataset base names whose seeds become
+            the valid pool.  ``None`` or empty falls back to legacy gap-split
+            so existing scripts keep working unchanged.
 
     Returns:
         ``(train_pairs, valid_pairs)`` — each a list of dicts compatible
-        with :meth:`TCLSC.forward_batch`.  Both lists already contain the
-        symmetric (A, B, 1) / (B, A, 0) examples.
+        with :meth:`TCLSC.forward_batch`.  Both lists contain the symmetric
+        ``(A, B, 1)`` / ``(B, A, 0)`` examples per unordered pair.
     """
-    by_task: Dict[str, List[SeedRecord]] = {}
+    # Group by (task_id, stage) so noisy and clean records of the same task
+    # never end up in the same pair-construction bucket.  Legacy seed files
+    # (no stage field) all get stage="clean" via SeedRecord.from_dict, so this
+    # grouping is a no-op for backwards-compat runs.
+    by_group: Dict[Tuple[str, str], List[SeedRecord]] = {}
     for s in seeds:
-        by_task.setdefault(s.task_id, []).append(s)
+        by_group.setdefault((s.task_id, s.stage), []).append(s)
 
     train_pairs: List[Dict] = []
     valid_pairs: List[Dict] = []
 
-    for task_id, raw_seeds in by_task.items():
+    # ── Hold-out source path ──────────────────────────────────────────
+    if valid_sources:
+        valid_sources_set = {str(name) for name in valid_sources}
+        # Per-bucket book-keeping for the single summary log line below.
+        n_train_buckets = 0
+        n_valid_buckets = 0
+        n_train_pairs_total = 0
+        n_valid_pairs_total = 0
+        skipped_no_feat = 0
+
+        for (task_id, stage), raw_seeds in by_group.items():
+            if task_id not in task_features:
+                skipped_no_feat += 1
+                logger.warning(
+                    "Task %s has seeds but no task_feature; skipping.", task_id,
+                )
+                continue
+            feat = task_features[task_id]
+            base = parse_task_id(task_id).base
+            is_valid_source = base in valid_sources_set
+
+            target_pool = valid_pairs if is_valid_source else train_pairs
+            before = len(target_pool)
+            _emit_symmetric_pairs(raw_seeds, feat, task_id, target_pool)
+            added = len(target_pool) - before
+
+            if is_valid_source:
+                n_valid_buckets += 1
+                n_valid_pairs_total += added
+            else:
+                n_train_buckets += 1
+                n_train_pairs_total += added
+
+            logger.info(
+                "Task %s [stage=%s]: %d seeds → %s pool (%d pairs)",
+                task_id, stage, len(raw_seeds),
+                "valid" if is_valid_source else "train", added,
+            )
+
+        logger.info(
+            "[split] hold-out-source mode: valid_sources=%s  | "
+            "train buckets=%d (%d pairs)  | valid buckets=%d (%d pairs)  | "
+            "skipped (no task_feat)=%d",
+            sorted(valid_sources_set),
+            n_train_buckets, n_train_pairs_total,
+            n_valid_buckets, n_valid_pairs_total,
+            skipped_no_feat,
+        )
+        return train_pairs, valid_pairs
+
+    # ── Legacy gap-split path ─────────────────────────────────────────
+    for (task_id, stage), raw_seeds in by_group.items():
         if task_id not in task_features:
             logger.warning("Task %s has seeds but no task_feature; skipping.", task_id)
             continue
         feat = task_features[task_id]
         task_seeds = _zscore_seeds(raw_seeds)
 
-        # Greedy gap-based split (gap is in z-score units).
         valid_seeds: List[SeedRecord] = []
         train_seeds: List[SeedRecord] = []
         for s in task_seeds:
@@ -172,29 +284,25 @@ def _split_seeds_and_pairs(
             else:
                 valid_seeds.append(s)
 
-        # Fallback 1: valid too small → need ≥ 2 valid seeds to form any pair.
         if len(valid_seeds) < 2 and len(task_seeds) >= 4:
             sorted_by_perf = sorted(task_seeds, key=lambda r: r.performance)
             forced_valid = [sorted_by_perf[0], sorted_by_perf[-1]]
             valid_seeds = forced_valid
             train_seeds = [s for s in task_seeds if s not in forced_valid]
             logger.warning(
-                "Task %s: greedy split left < 2 valid seeds; forced min+max split.",
-                task_id,
+                "Task %s [stage=%s]: greedy split left < 2 valid seeds; "
+                "forced min+max split.",
+                task_id, stage,
             )
 
-        # Fallback 2: train too small → threshold was too loose OR the task
-        # simply has few seeds.  Rebalance 50/50 across ALL seeds by sorted
-        # performance so both pools see a spread of labels and contain at
-        # least 2 members each (the minimum needed to form any pair).
         if len(train_seeds) < 2 and len(task_seeds) >= 4:
             all_sorted = sorted(task_seeds, key=lambda r: r.performance)
             valid_seeds = all_sorted[::2]
             train_seeds = all_sorted[1::2]
             logger.warning(
-                "Task %s: train pool had %d seeds (threshold=%s, valid=%d); "
-                "rebalancing 50/50 between train and valid across %d total.",
-                task_id, len(train_seeds), valid_gap_threshold,
+                "Task %s [stage=%s]: train pool had %d seeds (threshold=%s, "
+                "valid=%d); rebalancing 50/50 across %d total.",
+                task_id, stage, len(train_seeds), valid_gap_threshold,
                 len(valid_seeds), len(task_seeds),
             )
 
@@ -202,8 +310,8 @@ def _split_seeds_and_pairs(
         _emit_symmetric_pairs(valid_seeds, feat, task_id, valid_pairs)
 
         logger.info(
-            "Task %s: %d seeds → %d train (%d pairs) + %d valid (%d pairs)",
-            task_id, len(task_seeds),
+            "Task %s [stage=%s]: %d seeds → %d train (%d pairs) + %d valid (%d pairs)",
+            task_id, stage, len(task_seeds),
             len(train_seeds), len(train_seeds) * max(0, len(train_seeds) - 1),
             len(valid_seeds), len(valid_seeds) * max(0, len(valid_seeds) - 1),
         )
@@ -221,47 +329,155 @@ def _valid_loss(
     valid_pairs: List[Dict],
     device: torch.device,
     batch_size: int,
-) -> Tuple[float, float]:
-    """Compute mean BCE loss + accuracy over the valid pair pool.
+) -> Tuple[float, float, Dict]:
+    """Compute valid-pool BCE + accuracy with per-source / per-stage breakdown.
 
-    Pairs are grouped by task_id (each group shares a task_feat vector);
-    within each group pairs are batched according to ``batch_size``.
+    P0-1: uses ``forward_batch_multitask`` so each pair's own ``task_feat``
+    flows through the task encoder.  Pairs are NOT pre-grouped by task —
+    we batch directly through the full pair list so per-pair scoring is
+    consistent with training.
+
+    Returns a ``(mean_loss, accuracy, breakdown)`` triple.  ``breakdown`` is
+    a dict of optional diagnostic sub-dicts whose keys may include:
+
+    - ``per_source``: ``{source_base: {"bce": float, "acc": float, "n": int,
+      "spearman": float}}`` — per held-out source, also includes a per-task
+      Spearman ρ averaged over that source's sub-tasks (gives a fine-grained
+      "is this source learnable at all?" signal that BCE alone hides on
+      degenerate buckets).
+    - ``per_stage``: ``{"clean"|"noisy": {"bce", "acc", "n"}}`` — present
+      when valid contains both stages.
+
+    The per-source breakdown is most useful when ``valid_sources`` covers a
+    single hold-out — it surfaces "this single source's BCE is fine but its
+    ranking is random" failure modes that aggregate BCE can hide.
     """
     if not valid_pairs:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), {}
 
     comparator.eval()
 
-    task_groups: Dict[str, List[int]] = {}
-    for k, p in enumerate(valid_pairs):
-        task_groups.setdefault(p["task_id"], []).append(k)
-
-    losses: List[float] = []
+    total_weighted_loss = 0.0
     correct = 0
     n_examples = 0
 
-    for tid, idxs in task_groups.items():
-        task_feat = valid_pairs[idxs[0]]["task_feat"].to(device)
-        for start in range(0, len(idxs), batch_size):
-            batch_idx = idxs[start : start + batch_size]
-            enc_a   = [valid_pairs[i]["enc_a"]   for i in batch_idx]
-            strat_a = [valid_pairs[i]["strat_a"] for i in batch_idx]
-            enc_b   = [valid_pairs[i]["enc_b"]   for i in batch_idx]
-            strat_b = [valid_pairs[i]["strat_b"] for i in batch_idx]
-            labels  = torch.tensor(
-                [valid_pairs[i]["label"] for i in batch_idx],
-                dtype=torch.float32, device=device,
+    # Per-source aggregates (keyed by parse_task_id(...).base).
+    per_source: Dict[str, Dict[str, float]] = {}
+    # Per-stage aggregates.
+    per_stage: Dict[str, Dict[str, float]] = {}
+    # Per-task Spearman accumulators: collect (pred, label) lists per task so
+    # we can compute a ranking-quality measure once at the end.
+    per_task_signals: Dict[str, Dict[str, list]] = {}
+
+    # Mixed-task batched eval.  We don't shuffle valid (eval is deterministic),
+    # but we DO walk the full pair list in batch chunks so each batch carries
+    # mixed task_feats — the same forward path training uses.
+    n_pairs = len(valid_pairs)
+    for start in range(0, n_pairs, batch_size):
+        batch_idx = list(range(start, min(start + batch_size, n_pairs)))
+
+        enc_a       = [valid_pairs[i]["enc_a"]     for i in batch_idx]
+        strat_a     = [valid_pairs[i]["strat_a"]   for i in batch_idx]
+        enc_b       = [valid_pairs[i]["enc_b"]     for i in batch_idx]
+        strat_b     = [valid_pairs[i]["strat_b"]   for i in batch_idx]
+        task_feats  = [valid_pairs[i]["task_feat"] for i in batch_idx]
+        task_ids    = [valid_pairs[i]["task_id"]   for i in batch_idx]
+        labels      = torch.tensor(
+            [valid_pairs[i]["label"] for i in batch_idx],
+            dtype=torch.float32, device=device,
+        )
+
+        pred = comparator.forward_batch_multitask(
+            enc_a, strat_a, enc_b, strat_b, task_feats, task_ids=task_ids,
+        )
+        loss = F.binary_cross_entropy(pred, labels)
+        batch_correct = int(((pred > 0.5).float() == labels).sum().item())
+        n_batch = len(batch_idx)
+
+        total_weighted_loss += loss.item() * n_batch
+        correct += batch_correct
+        n_examples += n_batch
+
+        # Per-source / per-stage accumulators.  Each pair contributes its own
+        # source/stage independently — no batch-level grouping assumption.
+        for k_local, i in enumerate(batch_idx):
+            tid = valid_pairs[i]["task_id"]
+            base = parse_task_id(tid).base
+            stg = valid_pairs[i].get("stage", "clean")
+            pred_val = float(pred[k_local].item())
+            lab_val  = float(labels[k_local].item())
+            # Numerically-stable per-example BCE: -[y log p + (1-y) log(1-p)].
+            # Exact (not batch-mean approximated) so per-source / per-stage
+            # numbers can be trusted at fine granularity.
+            p_clip = min(max(pred_val, 1e-7), 1.0 - 1e-7)
+            ex_bce = -(lab_val * math.log(p_clip)
+                       + (1.0 - lab_val) * math.log(1.0 - p_clip))
+            is_correct = int((pred_val > 0.5) == (lab_val > 0.5))
+
+            src = per_source.setdefault(base, {"bce_sum": 0.0, "correct": 0, "n": 0})
+            src["bce_sum"] += ex_bce
+            src["correct"] += is_correct
+            src["n"] += 1
+
+            bk = per_stage.setdefault(stg, {"bce_sum": 0.0, "correct": 0, "n": 0})
+            bk["bce_sum"] += ex_bce
+            bk["correct"] += is_correct
+            bk["n"] += 1
+
+            sig = per_task_signals.setdefault(
+                tid, {"pred": [], "label": [], "base": base},
             )
-            pred = comparator.forward_batch(enc_a, strat_a, enc_b, strat_b, task_feat)
-            loss = F.binary_cross_entropy(pred, labels)
-            losses.append(loss.item() * len(batch_idx))
-            correct += int(((pred > 0.5).float() == labels).sum().item())
-            n_examples += len(batch_idx)
+            sig["pred"].append(pred_val)
+            sig["label"].append(lab_val)
 
     comparator.train()
-    mean_loss = sum(losses) / max(n_examples, 1)
+
+    mean_loss = total_weighted_loss / max(n_examples, 1)
     acc = correct / max(n_examples, 1)
-    return mean_loss, acc
+
+    # Per-task Spearman ρ: rank-correlation of pred-prob vs label across the
+    # task's valid pairs.  Each unordered seed pair contributes two examples
+    # (A>B,1) and (B>A,0); a perfect comparator outputs pred>0.5 exactly when
+    # label=1, so ρ on (pred, label) is monotone in pair concordance.  We
+    # roll up by source for the breakdown.
+    per_source_spearman: Dict[str, list] = {}
+    for tid, sig in per_task_signals.items():
+        if len(sig["pred"]) < 4:
+            continue
+        try:
+            from scipy.stats import spearmanr
+            rho, _ = spearmanr(sig["pred"], sig["label"])
+            if rho == rho:  # not NaN
+                per_source_spearman.setdefault(sig["base"], []).append(float(rho))
+        except ImportError:                                       # pragma: no cover
+            pass
+
+    # Materialise the breakdown dict.
+    breakdown: Dict = {}
+    if per_source:
+        breakdown["per_source"] = {
+            base: {
+                "bce": v["bce_sum"] / max(v["n"], 1),
+                "acc": v["correct"] / max(v["n"], 1),
+                "n":   int(v["n"]),
+                "spearman_mean": (
+                    sum(per_source_spearman[base]) / len(per_source_spearman[base])
+                    if base in per_source_spearman else float("nan")
+                ),
+            }
+            for base, v in per_source.items()
+        }
+    if len(per_stage) > 1:
+        # Only emit per-stage breakdown when it actually splits — single-stage
+        # valid pools (the common case) just duplicate the global numbers.
+        breakdown["per_stage"] = {
+            stg: {
+                "bce": v["bce_sum"] / max(v["n"], 1),
+                "n":   int(v["n"]),
+            }
+            for stg, v in per_stage.items()
+        }
+    return mean_loss, acc, breakdown
 
 
 # ---------------------------------------------------------------------------
@@ -295,20 +511,35 @@ def _train_one_stage(
     valid_gap_threshold = float(config.get("valid_gap_threshold", 0.02))
     patience            = int(config.get("patience", 10))
     eval_every          = int(config.get("eval_every", 1))
+    valid_sources       = config.get("valid_sources") or []
+    # The "is comparator stuck at random?" log threshold.  At chance level
+    # the BCE on a balanced symmetric pair set is exactly ln(2) ≈ 0.693.
+    # We flag epochs whose valid BCE sits inside [ln2 - eps, ln2 + eps].
+    plateau_eps         = float(config.get("plateau_eps", 0.02))
 
     comparator.train()
 
     # ── Build train / valid pairs ─────────────────────────────────────
     train_pairs, valid_pairs = _split_seeds_and_pairs(
-        seeds, task_features, valid_gap_threshold=valid_gap_threshold,
+        seeds, task_features,
+        valid_gap_threshold=valid_gap_threshold,
+        valid_sources=list(valid_sources) if valid_sources else None,
     )
     if not train_pairs:
         logger.warning("[%s] No train pairs — skipping stage.", stage_name)
         return comparator
 
+    n_train_clean = sum(1 for p in train_pairs if p.get("stage") == "clean")
+    n_train_noisy = sum(1 for p in train_pairs if p.get("stage") == "noisy")
+    n_valid_clean = sum(1 for p in valid_pairs if p.get("stage") == "clean")
+    n_valid_noisy = sum(1 for p in valid_pairs if p.get("stage") == "noisy")
     logger.info(
-        "[%s] %d train pairs (symmetric) and %d valid pairs  | lr=%g  epochs=%d  patience=%d",
-        stage_name, len(train_pairs), len(valid_pairs), lr, epochs, patience,
+        "[%s] train=%d (clean=%d, noisy=%d)  valid=%d (clean=%d, noisy=%d)  "
+        "| lr=%g  epochs=%d  patience=%d  plateau_eps=%.3f  "
+        "random-baseline BCE=%.4f",
+        stage_name, len(train_pairs), n_train_clean, n_train_noisy,
+        len(valid_pairs), n_valid_clean, n_valid_noisy,
+        lr, epochs, patience, plateau_eps, RANDOM_BASELINE_BCE,
     )
 
     optimizer = torch.optim.Adam(comparator.parameters(), lr=lr)
@@ -319,47 +550,78 @@ def _train_one_stage(
     patience_counter: int = 0
 
     for epoch in range(epochs):
-        task_groups: Dict[str, List[int]] = {}
-        for k, p in enumerate(train_pairs):
-            task_groups.setdefault(p["task_id"], []).append(k)
+        # P0-1 fix: global shuffle across ALL train pairs (mixed-task batches).
+        # Each batch now contains pairs from many different tasks, so the
+        # ``z_task`` term in the comparison head MUST be task-discriminative
+        # to fit the per-pair labels — task_encoder finally gets a meaningful
+        # gradient signal.  See Debug/comparator_bug_2026_05_12.md §3.
+        n_train = len(train_pairs)
+        perm = torch.randperm(n_train).tolist()
 
         epoch_loss = 0.0
         n_batches = 0
+        # Per-stage train BCE accumulators for the per-epoch monitor.  Use
+        # per-example BCE so the accumulator is exact even when a batch mixes
+        # stages (which it now does under mixed-task batching).
+        per_stage_loss = {"clean": 0.0, "noisy": 0.0}
+        per_stage_n    = {"clean": 0,   "noisy": 0}
 
-        for tid, group_indices in task_groups.items():
-            perm = torch.randperm(len(group_indices)).tolist()
-            task_feat = train_pairs[group_indices[0]]["task_feat"].to(device)
+        for start in range(0, n_train, batch_size):
+            batch_idx = [perm[j] for j in range(start, min(start + batch_size, n_train))]
 
-            for start in range(0, len(perm), batch_size):
-                batch_idx = [group_indices[perm[j]]
-                             for j in range(start, min(start + batch_size, len(perm)))]
+            enc_a       = [train_pairs[i]["enc_a"]     for i in batch_idx]
+            strat_a     = [train_pairs[i]["strat_a"]   for i in batch_idx]
+            enc_b       = [train_pairs[i]["enc_b"]     for i in batch_idx]
+            strat_b     = [train_pairs[i]["strat_b"]   for i in batch_idx]
+            task_feats  = [train_pairs[i]["task_feat"] for i in batch_idx]
+            task_ids    = [train_pairs[i]["task_id"]   for i in batch_idx]
+            labels      = torch.tensor(
+                [train_pairs[i]["label"] for i in batch_idx],
+                dtype=torch.float32, device=device,
+            )
 
-                enc_a   = [train_pairs[i]["enc_a"]   for i in batch_idx]
-                strat_a = [train_pairs[i]["strat_a"] for i in batch_idx]
-                enc_b   = [train_pairs[i]["enc_b"]   for i in batch_idx]
-                strat_b = [train_pairs[i]["strat_b"] for i in batch_idx]
-                labels  = torch.tensor(
-                    [train_pairs[i]["label"] for i in batch_idx],
-                    dtype=torch.float32, device=device,
-                )
+            pred = comparator.forward_batch_multitask(
+                enc_a, strat_a, enc_b, strat_b, task_feats, task_ids=task_ids,
+            )
+            loss = F.binary_cross_entropy(pred, labels)
 
-                pred = comparator.forward_batch(enc_a, strat_a, enc_b, strat_b, task_feat)
-                loss = F.binary_cross_entropy(pred, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
 
-                epoch_loss += loss.item()
-                n_batches += 1
+            # Per-stage roll-up: each pair contributes its own stage to the
+            # accumulator (a single batch may now mix stages because we don't
+            # group by task_id any more).  Approximation: use the batch's mean
+            # loss for every example in the batch — this loses per-example
+            # signal but matches what the optimizer actually saw.
+            mean_loss_item = loss.item()
+            for i in batch_idx:
+                stg = train_pairs[i].get("stage", "clean")
+                if stg not in per_stage_loss:
+                    stg = "clean"
+                per_stage_loss[stg] += mean_loss_item
+                per_stage_n[stg]    += 1
 
         avg_train_loss = epoch_loss / max(n_batches, 1)
+        clean_train_bce = (
+            per_stage_loss["clean"] / per_stage_n["clean"]
+            if per_stage_n["clean"] > 0 else float("nan")
+        )
+        noisy_train_bce = (
+            per_stage_loss["noisy"] / per_stage_n["noisy"]
+            if per_stage_n["noisy"] > 0 else float("nan")
+        )
 
         should_eval = valid_pairs and (
             (epoch + 1) % eval_every == 0 or epoch == epochs - 1
         )
         if should_eval:
-            v_loss, v_acc = _valid_loss(comparator, valid_pairs, device, batch_size)
+            v_loss, v_acc, breakdown = _valid_loss(
+                comparator, valid_pairs, device, batch_size,
+            )
 
             improved = v_loss < best_valid_loss - 1e-6
             if improved:
@@ -370,14 +632,63 @@ def _train_one_stage(
             else:
                 patience_counter += 1
 
-            if (epoch + 1) % 10 == 0 or improved or epoch == 0:
+            # Random-baseline marker: explicit ↑/↓ relative to ln(2) so a
+            # plateau at chance level is impossible to overlook in the log.
+            gap = v_loss - RANDOM_BASELINE_BCE
+            if abs(gap) <= plateau_eps:
+                plateau_tag = "≈ random"
+            elif gap < 0:
+                plateau_tag = f"↓ random by {-gap:.3f}"
+            else:
+                plateau_tag = f"↑ random by {gap:.3f}  ⚠"
+
+            # Always log when something changes (improved, plateau-near, or
+            # every 10 epochs).  Plateau detection lifts the log threshold so
+            # the user can spot "stuck at 0.69" without scanning every line.
+            verbose = (
+                improved
+                or epoch == 0
+                or (epoch + 1) % 10 == 0
+                or abs(gap) <= plateau_eps
+            )
+            if verbose:
                 logger.info(
-                    "[%s] ep %3d/%d  train=%.4f  valid=%.4f  acc=%.3f  "
-                    "patience=%d/%d%s",
-                    stage_name, epoch + 1, epochs, avg_train_loss, v_loss, v_acc,
+                    "[%s] ep %3d/%d  train=%.4f (clean=%.4f noisy=%s)  "
+                    "valid=%.4f  acc=%.3f  [%s]  patience=%d/%d%s",
+                    stage_name, epoch + 1, epochs, avg_train_loss,
+                    clean_train_bce,
+                    "n/a" if math.isnan(noisy_train_bce) else f"{noisy_train_bce:.4f}",
+                    v_loss, v_acc, plateau_tag,
                     patience_counter, patience,
                     "  *best*" if improved else "",
                 )
+                # Per-source breakdown — only on improvement or every 10
+                # epochs to keep the log readable.  Helps spot "comparator
+                # learns globally but is random on one specific source".
+                src_bd = breakdown.get("per_source") if breakdown else None
+                if src_bd and (improved or (epoch + 1) % 10 == 0):
+                    for base in sorted(src_bd):
+                        m = src_bd[base]
+                        rho_str = (
+                            f"  ρ={m['spearman_mean']:+.3f}"
+                            if not math.isnan(m["spearman_mean"]) else ""
+                        )
+                        logger.info(
+                            "[%s] ep %3d   source=%s  bce=%.4f  acc=%.3f  "
+                            "n=%d%s",
+                            stage_name, epoch + 1, base,
+                            m["bce"], m["acc"], m["n"], rho_str,
+                        )
+                stg_bd = breakdown.get("per_stage") if breakdown else None
+                if stg_bd and (improved or (epoch + 1) % 10 == 0):
+                    parts = [
+                        f"{s}={v['bce']:.4f} (n={v['n']})"
+                        for s, v in sorted(stg_bd.items())
+                    ]
+                    logger.info(
+                        "[%s] ep %3d   valid per-stage: %s",
+                        stage_name, epoch + 1, "  ".join(parts),
+                    )
 
             if patience_counter >= patience:
                 logger.info(
@@ -388,8 +699,10 @@ def _train_one_stage(
         else:
             if (epoch + 1) % 10 == 0:
                 logger.info(
-                    "[%s] ep %3d/%d  train=%.4f",
+                    "[%s] ep %3d/%d  train=%.4f (clean=%.4f noisy=%s)",
                     stage_name, epoch + 1, epochs, avg_train_loss,
+                    clean_train_bce,
+                    "n/a" if math.isnan(noisy_train_bce) else f"{noisy_train_bce:.4f}",
                 )
 
     if best_state is not None:
@@ -399,6 +712,10 @@ def _train_one_stage(
             stage_name, best_epoch, best_valid_loss,
         )
 
+    # Surface best_valid_loss to the caller (pretrain_comparator) so the
+    # P0-3 sanity gate can decide whether to save the weights.  Stashed as
+    # an attribute to avoid breaking the public return type.
+    comparator._best_valid_loss = float(best_valid_loss)  # noqa: SLF001
     return comparator
 
 
@@ -423,9 +740,19 @@ def pretrain_comparator(
             - ``batch_size`` (int, 256)
             - ``hidden_dim`` (int, 128): TCLSC hidden size (used only when
               a fresh comparator is constructed)
-            - ``valid_gap_threshold`` (float, 0.5): in z-score units
+            - ``valid_sources`` (list[str], []): source dataset base names
+              held out for valid (preferred).  Non-empty → no gap-split.
+            - ``valid_gap_threshold`` (float, 0.5): in z-score units; used
+              only when ``valid_sources`` is empty.
             - ``patience`` (int, 10)
             - ``eval_every`` (int, 1)
+            - ``plateau_eps`` (float, 0.02): half-width of the random-
+              baseline plateau band for log flagging.
+            - ``sanity_eps`` (float, 0.02): P0-3 sanity gate margin.
+              Saving fails when ``best_valid_loss >= ln(2) - sanity_eps``.
+            - ``sanity_skip`` (bool, False): bypass the P0-3 gate (only
+              for ablation runs that intentionally want to save a
+              chance-level comparator).
 
         comparator: Optional pre-constructed comparator.  When ``None`` a
             fresh :class:`TCLSC` with ``hidden_dim`` from *config* is built.
@@ -456,9 +783,37 @@ def pretrain_comparator(
         seeds, task_features, comparator, config, device,
     )
 
+    # ── P0-3 sanity gate ─────────────────────────────────────────────
+    # A comparator whose best valid BCE never escaped the ln(2) random-
+    # baseline plateau is downstream-useless: zero_shot_search would just
+    # produce noise rankings.  Refuse to save such weights so the user
+    # gets a loud failure rather than a silent regression.  The threshold
+    # ``ln(2) − sanity_eps`` mirrors the per-epoch plateau marker — if the
+    # log already screams "[≈ random]" for the best epoch, the gate fires.
+    #
+    # Override via ``config["sanity_skip"] = True`` (escape hatch for
+    # ablation / diagnostic runs where you WANT to save a random model).
+    sanity_eps  = float(config.get("sanity_eps", 0.02))
+    sanity_skip = bool(config.get("sanity_skip", False))
+    best_valid  = getattr(comparator, "_best_valid_loss", float("inf"))
+    if not sanity_skip and best_valid >= RANDOM_BASELINE_BCE - sanity_eps:
+        raise RuntimeError(
+            f"[P0-3 sanity gate] Comparator never beat random: "
+            f"best_valid_loss = {best_valid:.4f} >= "
+            f"ln(2) - {sanity_eps} = {RANDOM_BASELINE_BCE - sanity_eps:.4f}.  "
+            f"Refusing to save weights — downstream zero-shot search would be "
+            f"noise.  Diagnose via the per-source / per-stage breakdown in "
+            f"the training log and rerun, or pass config['sanity_skip']=True "
+            f"to bypass (e.g. for ablation runs).",
+        )
+
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         torch.save(comparator.state_dict(), save_path)
-        logger.info("Saved comparator weights to %s", save_path)
+        logger.info(
+            "Saved comparator weights to %s  (best_valid_loss=%.4f, "
+            "gap to ln 2 = %+.4f)",
+            save_path, best_valid, best_valid - RANDOM_BASELINE_BCE,
+        )
 
     return comparator

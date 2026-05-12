@@ -14,13 +14,27 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 seed_generation:
-  # P0 fix (2026-04-29): the previous noisy/clean two-stage protocol was
-  # removed — at ZeroAutoCL's data scale (≤1000 train pairs), neither stage
-  # learned beyond the random-guess baseline (BCE valid loss stayed at
-  # ln 2 ≈ 0.6786, accuracy ≈ 0.6).  We now run a single full-budget seed
-  # generation pass and rely on sub-task slicing (forecasting_task_variants
-  # below) to multiply effective training pairs ~9× without extra sampling.
-  n_per_dataset: 20         # candidates per (source × sub-task)
+  # Rev 2026-05-12 — noisy stage RE-INTRODUCED alongside hold-out-source
+  # valid (see ``comparator.valid_sources`` below).  The previous removal
+  # (P0 fix, 2026-04-29) blamed noisy labels for the BCE-stuck-at-ln(2)
+  # plateau, but the actual bottleneck was pair count: 57 sub-tasks × ≤14
+  # train seeds (after gap-split) ≈ 10k pairs total, far below the AutoCTS++
+  # ~200-500k regime.  CLAUDE_ADV.md §12.5 had already verified noisy-vs-
+  # clean Spearman ρ ≥ 0.9 on ETTh2, so the labels were fine — only the
+  # quantity was missing.  Combined with the gap-split removal in
+  # ``pretrain_comparator``, this configuration lifts per-task train pairs
+  # from O(14²) to O((30+80)²) = 110² ≈ 12k pairs per (sub-task, stage),
+  # roughly 50× the previous train-pool size.
+  n_per_dataset: 30         # CLEAN candidates per (source × sub-task);
+                            # full ``pretrain_iters`` budget per candidate.
+  n_noisy_per_dataset: 80   # NOISY candidates per (source × sub-task);
+                            # cheap ``noisy_pretrain_iters`` budget each.
+                            # 0 disables the noisy stage (legacy behaviour).
+  noisy_pretrain_iters: 100 # ~1/6 of the canonical 600-iter clean budget.
+                            # Calibration: CLAUDE_ADV.md §12.5 showed 1-epoch
+                            # (~131 iters) best-of-N already gives Spearman
+                            # ρ=0.9 on ETTh2; 100 iters keeps that safety
+                            # margin while being ~6× cheaper than clean.
   # Cross-source L-share pool size (AutoCTS++ generate_seeds.py L65-103
   # ``use_seed=True`` mechanism).  The first ``n_shared`` candidates per
   # source are sampled ONCE before the source loop and are identical
@@ -210,11 +224,38 @@ comparator:
   lr: 0.0001
   batch_size: 64
   hidden_dim: 128
-  # P0 fix (2026-04-29): bumped from 0.02 (raw-perf units) to 0.5 because
-  # the gap is now applied AFTER per-task z-score normalisation in
-  # ``_split_seeds_and_pairs`` — 0.5 ≈ half a standard deviation, a uniform
-  # split criterion across sources whose absolute scales differ by 50–100×.
+
+  # Rev 2026-05-12 — hold-out source valid split (preferred).  Seeds whose
+  # task_id base matches any name in ``valid_sources`` go 100% into valid;
+  # all other seeds go 100% into train.  No gap-split is applied — every
+  # bucket forms ALL quadratic pairs.
+  #
+  # Why ExchangeRate as the default hold-out?
+  #   • 9 sub-tasks (3 × 3) — enough pairs for stable valid BCE.
+  #   • Finance domain has NO target dataset (ETTh1 / Electricity / Weather
+  #     are all non-finance), so losing this source from train doesn't hurt
+  #     downstream zero-shot coverage.
+  #   • Domain diversity test — if the comparator can rank ExchangeRate
+  #     strategies after seeing only the other 8 sources, it has learned a
+  #     transferable task-feature representation rather than memorising
+  #     per-source biases.
+  #
+  # Set to ``[]`` to fall back to the legacy per-task gap-split (carves
+  # train seeds away into a valid pool by z-score gap).  Not recommended
+  # at scale — see ``random_search.py:502`` for the AutoCTS++ rationale
+  # behind a held-out source.
+  valid_sources: [ExchangeRate]
+
+  # Used only when ``valid_sources`` is empty (legacy mode).  Half-σ in
+  # z-score units — kept for backwards compat with old small-scale runs.
   valid_gap_threshold: 0.5
+
+  # Plateau-detection half-width: valid-BCE inside ``ln(2) ± plateau_eps``
+  # gets explicitly flagged as "≈ random" in the per-epoch log.  0.02 is
+  # tight enough to flag chance-level plateaus without false positives on
+  # genuinely-near-random epochs early in training.
+  plateau_eps: 0.02
+
   patience: 5               # epochs of non-improvement → early stop
   eval_every: 1             # evaluate valid loss every N epochs
 

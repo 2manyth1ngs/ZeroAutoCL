@@ -1,16 +1,52 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=zac_array_seedgen
 #SBATCH --partition=gpu_spot
-#SBATCH --gpus=nvidia_geforce_rtx_4090:1
+#SBATCH --gpus=1
 #SBATCH --gpu-bind=closest
-#SBATCH --constraint=vram24g&cc8.9
+# GPU pool (rev 2026-05-12, updated to maximise availability):
+#
+# Eligible GPUs in ``gpu_spot``, in preference order:
+#   1. ``nvidia_a100``        80GB  CC 8.0   1 node × 4 GPUs  (g3n1)
+#   2. ``nvidia_l40s``        48GB  CC 8.9   1 node × 4 GPUs  (g5n1)
+#   3. ``nvidia_geforce_rtx_4090`` 24GB  CC 8.9   6 nodes × 1 GPU  (g1n1-6)
+#   4. ``nvidia_geforce_rtx_3090`` 24GB  CC 8.6   3 nodes (g4n1-2: 1 GPU each,
+#                                                          g2n1: 2 GPUs)
+#
+# Total pool ≈ 18 eligible GPUs on ``gpu_spot``, so a 9-task array with
+# %9 concurrency (all sources running in parallel) almost never has to wait.
+#
+# Mechanism (two layers):
+#   • ``--constraint=(vram80g|vram48g|vram24g)&cc8.0`` — accept ANY VRAM
+#     class with CC ≥ 8.0.  Both 3090 (CC 8.6) and 4090 (CC 8.9) satisfy
+#     the 24GB+CC8.0 lower bound; A100 (80GB) and L40s (48GB) satisfy via
+#     the higher VRAM buckets.  Loosened from the old ``vram24g&cc8.9``
+#     which excluded both A100 (CC=8.0) and 3090 (CC=8.6).
+#   • ``--prefer=vram80g|vram48g`` — SOFT preference for A100 / L40s.
+#     Requires SLURM ≥ 22.05; older schedulers ignore the line and rely
+#     on the ``--constraint`` OR clause to pick whatever's free.
+#
+# Within the 24GB tier (4090 vs 3090), SLURM cannot natively distinguish
+# preference via features — both have ``vram24g`` and our code is
+# functionally identical on either.  Either will be picked based on which
+# node has free resources at submit time.  If you specifically want 4090
+# only, tighten to ``cc8.9`` (excludes 3090 which is CC 8.6).
+#
+# A100 / L40s are only listed in ``gpu_csi`` (AI-Center-only) and
+# ``gpu_spot``.  As regular users we reach them through ``gpu_spot``
+# (subject to preemption — typically by CSI users).
+#
+# The ``nvidia-smi`` printout at job start (further down in this script)
+# shows which class actually got assigned, so you can spot-check whether
+# the array got A100/L40s/4090/3090.
+#SBATCH --constraint=(vram80g|vram48g|vram24g)&cc8.0
+#SBATCH --prefer=vram80g|vram48g
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=50G
 #SBATCH --time=48:00:00
 #SBATCH --requeue
-#SBATCH --array=0-8%6
+#SBATCH --array=0-8%9
 #SBATCH --output=logs/zac_array_seedgen_%A_%a.out
 #SBATCH --error=logs/zac_array_seedgen_%A_%a.err
 
@@ -22,12 +58,18 @@
 #
 # One array task per source dataset: each task does a full seed-gen run for
 # its own source and writes ``${SEEDS_DIR}/_seeds_<SRC>.json``.  9 tasks
-# total (``--array=0-8%6``), max 6 concurrent — first batch of 6 covers the
-# heaviest sources (traffic 862ch, Solar 137ch, both ETT-15min variants,
-# ExchangeRate, AQShunyi); second batch of 3 finishes the lighter AQ
-# stations + ETTh2 (~10 min each).  Expected B.1 wallclock ≈ 1.5-2 h with
-# %6, plus ~6 h downstream (Stage T 1h + B.2 30min + 3 targets × ~1.5h each).
-# Grand total ≈ 7.5-8 h on a 4090.
+# total (``--array=0-8%9``), ALL concurrent — the 18-GPU pool on
+# ``gpu_spot`` comfortably absorbs 9 simultaneous jobs (1 per source).
+#
+# Rev 2026-05-12 budget update — now runs BOTH a clean stage
+# (``n_per_dataset=30`` × 600 iters each) AND a noisy stage
+# (``n_noisy_per_dataset=80`` × 100 iters each) per sub-task.  Combined
+# wall-time per source: ~1.5-2.5 h (was ~1 h).  With %9 (full parallel),
+# B.1 wall ≈ wallclock of slowest single source ≈ 2-2.5 h.
+# Per-(sub_idx, stage) checkpointing inside ``seed_generator.py`` limits
+# spot-pre-emption loss to one (sub-task × stage) chunk (~30 min worst case).
+# Downstream after array completes: Stage T 1h + B.2 30min + 3 targets ×
+# ~1.5h each ≈ 6h.  Grand total ≈ 8-9 h (was 9-10 h with %6).
 #
 # L-share consistency is preserved across the array thanks to two pieces:
 #
@@ -69,11 +111,10 @@
 #
 # Tightening %N
 # -------------
-# ``--array=0-11%6`` allows up to 6 tasks concurrent (12 total tasks).  If
-# the cluster is tight or spot pre-emption is aggressive, drop to ``%3`` or
-# ``%2`` — total wallclock will rise but throughput stays robust.  Raise to
-# ``%12`` if you have plenty of GPUs and want all sources running in
-# parallel (wallclock ≈ slowest single source).
+# ``--array=0-8%9`` allows up to 9 tasks concurrent (= total tasks → full
+# parallel).  If the cluster is tight or spot pre-emption is aggressive,
+# drop to ``%6`` / ``%3`` / ``%2`` — total wallclock will rise but
+# throughput stays robust.  At %9, wallclock ≈ slowest single source.
 #
 # Submit  :  sbatch scripts/run_array.sbatch
 # Watch   :  tail -f logs/zac_array_seedgen_<jobid>_<task>.out
@@ -176,10 +217,18 @@ TARGETS=(ETTh1 Electricity Weather)
 COMPARATOR="${OUT_DIR}/comparator.pt"
 SEEDS="${SEEDS_DIR}/seeds.json"
 
-N_PER_DATASET=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['two_stage_search']['cl_strategy_search']['n_per_dataset'])")
+# Rev 2026-05-12: read clean ``n_per_dataset`` from ``seed_generation``
+# (the canonical key actually consumed by ``run_generate_seeds.py``).  The
+# previous read from ``two_stage_search.cl_strategy_search.n_per_dataset``
+# silently overrode the seed-generation value via CLI — bug.  Also read the
+# noisy-stage knobs so they're transparent in the log and explicitly piped
+# to the CLI rather than silently default-loaded.
+N_PER_DATASET=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['seed_generation']['n_per_dataset'])")
+N_NOISY_PER_DATASET=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['seed_generation'].get('n_noisy_per_dataset', 0) or 0)")
+NOISY_ITERS=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['seed_generation'].get('noisy_pretrain_iters', 100) or 100)")
 TOP_K_STR=$(python -c    "import yaml; c=yaml.safe_load(open('${CONFIG}', encoding='utf-8')); print(c['two_stage_search']['cl_strategy_search']['top_k_strategies'])")
 TOP_K_ENC=1
-echo "YAML scalars     : n_per_dataset=${N_PER_DATASET}  top_k_enc=${TOP_K_ENC} (forced, GGS only)  top_k_strategies=${TOP_K_STR}"
+echo "YAML scalars     : n_per_dataset=${N_PER_DATASET} (clean)  n_noisy_per_dataset=${N_NOISY_PER_DATASET}  noisy_pretrain_iters=${NOISY_ITERS}  top_k_enc=${TOP_K_ENC} (forced, GGS only)  top_k_strategies=${TOP_K_STR}"
 
 # ── Auto-chain: queue the downstream pipeline upfront ─────────────────────
 # Task 0 (only) GENERATES an inline downstream sbatch in ${OUT_DIR} that
@@ -214,9 +263,13 @@ if [[ "${ARRAY_ID}" == "0" && "${ZAC_NO_CHAIN:-}" != "1" ]]; then
 #!/usr/bin/env bash
 #SBATCH --job-name=zac_post_multi
 #SBATCH --partition=gpu_spot
-#SBATCH --gpus=nvidia_geforce_rtx_4090:1
+#SBATCH --gpus=1
 #SBATCH --gpu-bind=closest
-#SBATCH --constraint=vram24g&cc8.9
+# Mirror the parent run_array.sbatch GPU pool: prefer A100 / L40s, fall
+# back to 4090 OR 3090 (both 24GB, CC ≥ 8.0).  See parent file's banner
+# for the full rationale.  Total eligible pool ≈ 18 GPUs on gpu_spot.
+#SBATCH --constraint=(vram80g|vram48g|vram24g)&cc8.0
+#SBATCH --prefer=vram80g|vram48g
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -503,24 +556,35 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 SRC_CKPT="${SEEDS_DIR}/_seeds_${SRC}.json"
 
+# Rev 2026-05-12: the per-(sub_idx, stage) checkpoint inside
+# ``seed_generator.py`` now handles partial resume itself, so a non-empty
+# ``${SRC_CKPT}`` no longer means "done" — it may also mean "partial".  We
+# pass through to ``run_generate_seeds.py`` unconditionally; the script's
+# own logic skips already-completed (sub_idx, stage) pairs and re-runs the
+# rest.  Stale ``n_per_dataset`` / ``n_noisy_per_dataset`` changes auto-
+# invalidate the cache so config edits don't require manual deletion.
 echo
 echo "═══════ Stage B.1 [${SRC}] (array task ${ARRAY_ID}) ═══════"
 if [[ -s "${SRC_CKPT}" ]]; then
-    echo "[stage-B.1] ${SRC_CKPT} exists — skipping (delete to re-run)"
+    echo "[stage-B.1] ${SRC_CKPT} exists — entering partial-resume mode"
+    echo "            (delete the file to force a full restart)"
 else
-    srun --unbuffered python -u scripts/run_generate_seeds.py \
-        --data_dir                  "${DATA_DIR}" \
-        --save_dir                  "${SEEDS_DIR}" \
-        --config                    "${CONFIG}" \
-        --datasets                  "${SRC}" \
-        --n_per_dataset             "${N_PER_DATASET}" \
-        --encoder_grid              "${ENCODER_GRID}" \
-        --top_k_enc                 "${TOP_K_ENC}" \
-        --source_global_idx_offset  "${ARRAY_ID}" \
-        --seed                      "${SEED}" \
-        > >(tee -a "${OUT_DIR}/run_array_${ARRAY_ID}_${SRC}.log") \
-        2> >(tee -a "${OUT_DIR}/run_array_${ARRAY_ID}_${SRC}.log" >&2)
+    echo "[stage-B.1] no checkpoint, starting fresh"
 fi
+srun --unbuffered python -u scripts/run_generate_seeds.py \
+    --data_dir                  "${DATA_DIR}" \
+    --save_dir                  "${SEEDS_DIR}" \
+    --config                    "${CONFIG}" \
+    --datasets                  "${SRC}" \
+    --n_per_dataset             "${N_PER_DATASET}" \
+    --n_noisy_per_dataset       "${N_NOISY_PER_DATASET}" \
+    --noisy_pretrain_iters      "${NOISY_ITERS}" \
+    --encoder_grid              "${ENCODER_GRID}" \
+    --top_k_enc                 "${TOP_K_ENC}" \
+    --source_global_idx_offset  "${ARRAY_ID}" \
+    --seed                      "${SEED}" \
+    > >(tee -a "${OUT_DIR}/run_array_${ARRAY_ID}_${SRC}.log") \
+    2> >(tee -a "${OUT_DIR}/run_array_${ARRAY_ID}_${SRC}.log" >&2)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-task post-merge:  every array task ends by re-merging whatever

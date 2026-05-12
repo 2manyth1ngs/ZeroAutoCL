@@ -77,6 +77,22 @@ def parse_args() -> argparse.Namespace:
                         "identical across ALL sources; the rest are sampled "
                         "fresh per source.  None → read from YAML "
                         "(seed_generation.n_shared, default 0).")
+    p.add_argument("--n_noisy_per_dataset", type=int, default=None,
+                   help="Noisy candidates per (source × sub-task).  When >0, "
+                        "each sub-task runs an additional cheap-budget pass "
+                        "(noisy_pretrain_iters per candidate) producing "
+                        "stage=\"noisy\" seed records.  Increases the per-task "
+                        "pair pool ~10× at ~1.4× the clean-stage cost.  "
+                        "None → read from YAML "
+                        "(seed_generation.n_noisy_per_dataset, default 0 = "
+                        "noisy disabled).")
+    p.add_argument("--noisy_pretrain_iters", type=int, default=None,
+                   help="Iter budget per noisy candidate.  100 ≈ 1/6 of the "
+                        "canonical 600-iter clean budget.  Lower values save "
+                        "wall-clock but risk noisier labels; the per-sub-task "
+                        "noisy-vs-clean Spearman ρ printed at sub-task end is "
+                        "the calibration signal.  None → read from YAML "
+                        "(seed_generation.noisy_pretrain_iters, default 100).")
     p.add_argument("--source_global_idx_offset", type=int, default=0,
                    help="Per-source ds-index offset for SLURM job-array "
                         "fan-out.  Each array task processes ONE source "
@@ -159,6 +175,16 @@ def main() -> None:
     if crop_len is not None:
         crop_len = int(crop_len)
 
+    # Noisy stage resolution: CLI overrides YAML.
+    n_noisy_per_dataset = args.n_noisy_per_dataset
+    if n_noisy_per_dataset is None:
+        n_noisy_per_dataset = int(sg_cfg.get("n_noisy_per_dataset", 0) or 0)
+    n_noisy_per_dataset = max(0, int(n_noisy_per_dataset))
+    noisy_pretrain_iters = args.noisy_pretrain_iters
+    if noisy_pretrain_iters is None:
+        noisy_pretrain_iters = int(sg_cfg.get("noisy_pretrain_iters", 100) or 100)
+    noisy_pretrain_iters = max(1, int(noisy_pretrain_iters))
+
     # ── Forecasting task variants (time windows + horizon groups) ─────────
     n_time_windows = int(variants_cfg.get("n_time_windows", 1) or 1)
     if args.n_time_windows is not None:
@@ -228,6 +254,13 @@ def main() -> None:
         args.datasets, n_per_dataset, n_shared, n_per_dataset - n_shared,
         pretrain_lr, batch_size,
     )
+    if n_noisy_per_dataset > 0:
+        logger.info(
+            "Noisy stage ENABLED: n_noisy_per_dataset=%d  noisy_pretrain_iters=%d",
+            n_noisy_per_dataset, noisy_pretrain_iters,
+        )
+    else:
+        logger.info("Noisy stage disabled (n_noisy_per_dataset=0).")
     logger.info("Per-dataset budgets: %s", dataset_budgets)
 
     logger.info("crop_len=%s", crop_len)
@@ -260,6 +293,8 @@ def main() -> None:
         n_variable_subsets=n_variable_subsets,
         var_size_rates=var_size_rates,
         min_var_count=min_var_count,
+        n_noisy_per_dataset=n_noisy_per_dataset,
+        noisy_pretrain_iters=noisy_pretrain_iters,
     )
 
     logger.info("Done — generated %d seed records.", len(seeds))

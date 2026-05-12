@@ -50,24 +50,66 @@ def _fmt_hms(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def _spearman_rho(xs: List[float], ys: List[float]) -> float:
+    """Spearman rank correlation between two equal-length sequences.
+
+    Returns ``float('nan')`` when there's insufficient data (n < 3) or both
+    inputs are constant (rank-correlation is undefined).  Used as a noisy-
+    vs-clean label-quality diagnostic on the shared-head overlap of each
+    sub-task's two candidate pools.
+    """
+    if len(xs) < 3 or len(xs) != len(ys):
+        return float("nan")
+    if len(set(xs)) == 1 or len(set(ys)) == 1:
+        return float("nan")
+    try:
+        from scipy.stats import spearmanr
+    except ImportError:                                             # pragma: no cover
+        return float("nan")
+    rho, _ = spearmanr(xs, ys)
+    return float(rho)
+
+
 # ---------------------------------------------------------------------------
 # Seed record
 # ---------------------------------------------------------------------------
 
 @dataclass
 class SeedRecord:
-    """One evaluated (encoder_config, cl_strategy) on a specific task."""
+    """One evaluated (encoder_config, cl_strategy) on a specific task.
+
+    ``stage`` distinguishes the two seed-generation budgets:
+
+    - ``"clean"`` — full per-source CL pretrain budget (e.g. 600 iters).  The
+      label is reliable enough to use as ground truth for ranking.
+    - ``"noisy"`` — cheap CL pretrain budget (e.g. 100 iters).  Labels carry
+      higher variance but the cost-per-record is ~6× lower, so we can afford
+      far more candidates and lift the per-task pair count into the regime
+      where the comparator's task-conditional head can actually learn.
+
+    The pair-construction logic in ``pretrain_comparator._split_seeds_and_pairs``
+    only pairs records that share BOTH ``task_id`` AND ``stage`` — noisy and
+    clean labels live on slightly different convergence scales and shouldn't
+    be mixed in the same comparison.  Default ``"clean"`` preserves backwards
+    compatibility with seed files generated before this field existed.
+    """
 
     encoder_config: Dict[str, int]
     strategy: Dict
     task_id: str
     performance: float  # primary metric (higher is better)
+    stage: str = "clean"
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict) -> "SeedRecord":
+        # Tolerate seed files written before ``stage`` existed — treat them as
+        # clean (the conservative interpretation: assume those records had a
+        # full training budget).
+        d = dict(d)
+        d.setdefault("stage", "clean")
         return cls(**d)
 
 
@@ -264,6 +306,8 @@ def generate_seeds(
     n_variable_subsets: int = 1,
     var_size_rates: Optional[List[float]] = None,
     min_var_count: int = 4,
+    n_noisy_per_dataset: int = 0,
+    noisy_pretrain_iters: int = 100,
 ) -> List[SeedRecord]:
     """Generate seed data across source datasets.
 
@@ -342,12 +386,28 @@ def generate_seeds(
             :func:`make_forecasting_subtasks`).
         min_var_count: Minimum raw-variable channel count required to
             enable variable subsampling for a given source.
+        n_noisy_per_dataset: Per-sub-task count for the cheap "noisy" seed
+            pass (AutoCTS++ ``noisy_seeds`` mode).  Default ``0`` disables
+            noisy seeds entirely.  When ``>0``, each sub-task runs an
+            additional N-candidate pass with the ``noisy_pretrain_iters``
+            budget, producing ``SeedRecord(stage="noisy")`` entries.  Noisy
+            and clean records share their first ``n_shared`` candidates so
+            the per-sub-task Spearman ρ between the two label sources can
+            be measured (logged at sub-task end) as a label-quality check.
+            Pair construction in the comparator only pairs records sharing
+            the same ``(task_id, stage)``; noisy and clean are never mixed
+            in the same pair because their absolute perf scales differ
+            (noisy under-converges).
+        noisy_pretrain_iters: Iter budget used for each noisy candidate.
+            Default ``100`` is ~1/6 of the canonical 600-iter clean budget
+            and matches the AutoCTS++ noisy/clean wall-clock ratio.  Ignored
+            when ``n_noisy_per_dataset == 0``.
 
     Returns:
         List of all :class:`SeedRecord` objects.  Length is
-        ``len(source_datasets) × n_per_dataset × n_time_windows ×
-        n_variable_subsets × len(horizon_groups)`` (modulo sub-tasks
-        skipped for being too short or having too few variables).
+        ``len(source_datasets) × (n_per_dataset + n_noisy_per_dataset) ×
+        n_time_windows × n_variable_subsets × len(horizon_groups)`` (modulo
+        sub-tasks skipped for being too short or having too few variables).
     """
     set_seed(seed)
     if device is None:
@@ -505,55 +565,11 @@ def generate_seeds(
         ds_has_windows     = ds_n_time_windows     > 1
         ds_has_var_subsets = ds_n_variable_subsets > 1
 
-        # ── Per-dataset checkpoint resume ──────────────────────────────
-        # On crash mid-loop (e.g. PEMS07 OOM) we lose ``all_seeds`` because
-        # the bottom-of-function ``seeds.json`` write is unreached.  A
-        # sidecar ``_seeds_<ds>.json`` is written after each source
-        # completes; on the next invocation we replay it instead of re-
-        # training the source.  Per-candidate seeds derive from
-        # ``effective_ds_idx`` (independent of iteration order), so cache
-        # resume needs no counter bookkeeping.
-        #
-        # Stale-cache guard: when the user bumps ``n_time_windows`` for a
-        # source (e.g. ETTh2 3 → 9 to fix the ETT-cluster underrepresentation)
-        # the existing checkpoint silently keeps the old sub-task count.
-        # Detect that and force regeneration.
-        ds_ckpt = (
-            os.path.join(save_dir, f"_seeds_{ds_name}.json")
-            if save_dir is not None else None
-        )
-        if ds_ckpt and os.path.exists(ds_ckpt) and os.path.getsize(ds_ckpt) > 0:
-            try:
-                with open(ds_ckpt, encoding="utf-8") as f:
-                    payload = json.load(f)
-                cached = [SeedRecord.from_dict(d) for d in payload["records"]]
-                n_sub_cached = int(payload.get("n_subtasks", 0))
-                if n_sub_cached > 0 and n_sub_cached < ds_n_time_windows:
-                    logger.warning(
-                        "[%s] checkpoint has n_subtasks=%d but config now "
-                        "requests at least %d (n_time_windows). Discarding "
-                        "stale cache and regenerating; delete %s manually if "
-                        "you want to keep it.",
-                        ds_name, n_sub_cached, ds_n_time_windows, ds_ckpt,
-                    )
-                else:
-                    logger.info(
-                        "[dataset %d/%d] %s — checkpoint hit (%d records, "
-                        "%d sub-tasks); skipping re-training.",
-                        ds_idx + 1, n_datasets, ds_name,
-                        len(cached), n_sub_cached,
-                    )
-                    all_seeds.extend(cached)
-                    continue
-            except Exception as exc:                            # pragma: no cover
-                logger.warning(
-                    "Checkpoint %s unreadable (%s); re-running %s from scratch.",
-                    ds_ckpt, exc, ds_name,
-                )
-
         # Expand the source into one or more sub-tasks (time-window axis
         # × variable-subset axis).  Horizon-group axis is handled inside
         # ``_evaluate_candidate`` (one CL pre-train, multiple Ridge evals).
+        # Built BEFORE the checkpoint resume so the staleness check below can
+        # compare cached ``n_subtasks`` against the actual ``len(sub_tasks)``.
         sub_tasks: List[ForecastingSubTask] = make_forecasting_subtasks(
             ds_name,
             data_dir,
@@ -570,6 +586,120 @@ def generate_seeds(
             "[dataset %d/%d] %s expanded into %d sub-task(s)",
             ds_idx + 1, n_datasets, ds_name, len(sub_tasks),
         )
+
+        # ── Per-(sub_idx, stage) checkpoint resume (rev 2026-05-12) ────
+        # Schema:
+        #   { ds_name, n_subtasks, n_per_dataset, n_noisy_per_dataset,
+        #     completed_stages: ["sub{i}:clean", "sub{i}:noisy", ...],
+        #     records: [...all SeedRecords so far...] }
+        #
+        # Granularity matters because noisy adds 30-50 min on top of clean's
+        # 60-90 min per source.  On spot pre-emption (gpu_spot partition) the
+        # old whole-source checkpoint forced re-running everything; this lets
+        # us resume after either stage of any sub-task.
+        #
+        # Staleness: any change in n_subtasks / n_per_dataset /
+        # n_noisy_per_dataset between runs forces a full re-generation so
+        # the seed pool stays consistent with the current config.
+        #
+        # Backward compat: legacy checkpoints (no ``completed_stages`` key)
+        # are treated as fully done — preserves the old whole-source skip.
+        ds_ckpt = (
+            os.path.join(save_dir, f"_seeds_{ds_name}.json")
+            if save_dir is not None else None
+        )
+
+        completed_stages: set = set()
+        ds_seeds: List[SeedRecord] = []
+        legacy_skip = False
+
+        if ds_ckpt and os.path.exists(ds_ckpt) and os.path.getsize(ds_ckpt) > 0:
+            try:
+                with open(ds_ckpt, encoding="utf-8") as f:
+                    payload = json.load(f)
+                cached_records = [
+                    SeedRecord.from_dict(d) for d in payload.get("records", [])
+                ]
+                cached_n_sub   = int(payload.get("n_subtasks", 0))
+                cached_n_per   = payload.get("n_per_dataset")
+                cached_n_noisy = payload.get("n_noisy_per_dataset")
+                cached_stages  = payload.get("completed_stages")  # None on legacy
+
+                # Staleness checks — discard cache on any knob mismatch.
+                reason: Optional[str] = None
+                if cached_n_sub != 0 and cached_n_sub != len(sub_tasks):
+                    reason = (
+                        f"n_subtasks changed {cached_n_sub} -> {len(sub_tasks)}"
+                    )
+                elif (cached_n_per is not None
+                      and int(cached_n_per) != int(n_per_dataset)):
+                    reason = (
+                        f"n_per_dataset changed {cached_n_per} -> {n_per_dataset}"
+                    )
+                elif (cached_n_noisy is not None
+                      and int(cached_n_noisy) != int(n_noisy_per_dataset)):
+                    reason = (
+                        f"n_noisy_per_dataset changed {cached_n_noisy} -> "
+                        f"{n_noisy_per_dataset}"
+                    )
+
+                if reason is not None:
+                    logger.warning(
+                        "[%s] discarding stale cache (%s); delete %s manually "
+                        "to keep.",
+                        ds_name, reason, ds_ckpt,
+                    )
+                elif cached_stages is None:
+                    # Legacy whole-source checkpoint: treat as fully done.
+                    logger.info(
+                        "[dataset %d/%d] %s — legacy checkpoint hit (%d "
+                        "records, %d sub-tasks); skipping re-training.",
+                        ds_idx + 1, n_datasets, ds_name,
+                        len(cached_records), cached_n_sub,
+                    )
+                    all_seeds.extend(cached_records)
+                    legacy_skip = True
+                else:
+                    # Partial resume.  Carry forward already-completed stages.
+                    completed_stages = set(cached_stages)
+                    ds_seeds = list(cached_records)
+                    logger.info(
+                        "[%s] partial checkpoint hit: %d stages done "
+                        "(%s), %d records cached — resuming.",
+                        ds_name, len(completed_stages),
+                        ", ".join(sorted(completed_stages)[:8])
+                        + ("..." if len(completed_stages) > 8 else ""),
+                        len(cached_records),
+                    )
+            except Exception as exc:                            # pragma: no cover
+                logger.warning(
+                    "Checkpoint %s unreadable (%s); re-running %s from scratch.",
+                    ds_ckpt, exc, ds_name,
+                )
+
+        if legacy_skip:
+            continue
+
+        # Atomic checkpoint writer — called after each (sub_idx, stage)
+        # finishes so a mid-source crash never wastes more than one
+        # sub-task × one stage's worth of work.  Uses ``os.replace`` (atomic
+        # on POSIX and on Windows when target exists) to avoid leaving a
+        # corrupt half-written checkpoint on disk.
+        def _persist_ckpt() -> None:
+            if ds_ckpt is None:
+                return
+            payload = {
+                "ds_name":             ds_name,
+                "n_subtasks":          len(sub_tasks),
+                "n_per_dataset":       int(n_per_dataset),
+                "n_noisy_per_dataset": int(n_noisy_per_dataset),
+                "completed_stages":    sorted(completed_stages),
+                "records":             [s.to_dict() for s in ds_seeds],
+            }
+            tmp = ds_ckpt + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, ds_ckpt)
 
         ds_iters  = int(ds_budget.get("pretrain_iters", 0))
         ds_epochs = int(ds_budget.get("pretrain_epochs", pretrain_epochs))
@@ -597,10 +727,9 @@ def generate_seeds(
             random_candidates = []
         candidates = list(shared_candidates) + random_candidates
 
-        # Records produced by THIS source.  Kept separate from ``all_seeds``
-        # so we can write a per-dataset checkpoint atomically once the
-        # source finishes (see end-of-loop block).
-        ds_seeds: List[SeedRecord] = []
+        # ``ds_seeds`` was initialised at cache-load time above — either
+        # empty (fresh) or pre-populated from the partial checkpoint.  Do
+        # NOT reset it here or cached records get nuked.
 
         for sub_idx, sub in enumerate(sub_tasks):
             task_type = sub.train.task_type
@@ -611,67 +740,251 @@ def generate_seeds(
                 sub.window_id, len(sub.horizon_groups),
             )
 
-            for i, (enc_cfg, strat_cfg) in enumerate(candidates):
-                cand_start = time.time()
+            key_clean = f"sub{sub_idx}:clean"
+            key_noisy = f"sub{sub_idx}:noisy"
+            clean_ran_this_invocation = False
+            clean_total = 0.0
 
-                per_cand_seed = (
-                    seed
-                    + (effective_ds_idx * n_max_subtasks + sub_idx) * n_per_dataset
-                    + i
-                )
-                set_seed(per_cand_seed)
+            # First-horizon clean perfs of the shared-head candidates.  Used
+            # *only* for the per-sub-task noisy-vs-clean Spearman diagnostic
+            # below (does not affect seed records or downstream training).
+            diag_clean_perfs: List[float] = []
 
-                perfs = _evaluate_candidate(
-                    enc_cfg, strat_cfg,
-                    sub.train, sub.val,
-                    task_type,
-                    ds_epochs, pretrain_lr, batch_size,
-                    device,
-                    pretrain_iters=ds_iters,
-                    horizon_groups=sub.horizon_groups,
-                    eval_horizons=ds_eval_horizons,
-                )
-                cand_elapsed = time.time() - cand_start
-
-                # One seed record per horizon group.  Encoder pre-train
-                # cost is paid once per (sub-task, candidate); horizon
-                # variation just re-runs the cheap Ridge eval.  The
-                # (tw_idx, vs_idx) come from the sub-task itself — they
-                # may be ``None`` even when the parent run enables the
-                # axis (e.g. a too-narrow source falls back to vs_idx=None).
-                for hg_idx, perf in enumerate(perfs):
-                    tid = build_task_id(
-                        ds_name,
-                        tw_idx=sub.tw_idx,
-                        vs_idx=sub.vs_idx,
-                        hg_idx=hg_idx if has_hg else None,
-                        has_windows=ds_has_windows,
-                        has_variable_subsets=ds_has_var_subsets,
-                        has_horizon_groups=has_hg,
-                    )
-                    ds_seeds.append(
-                        SeedRecord(
-                            encoder_config=enc_cfg,
-                            strategy=strat_cfg,
-                            task_id=tid,
-                            performance=perf,
-                        )
-                    )
-
-                # Progress / ETA reporting at the sub-task granularity.
-                done = i + 1
-                avg_per_cand = (time.time() - sub_start) / done
-                sub_eta = avg_per_cand * (n_per_dataset - done)
+            if key_clean in completed_stages:
                 logger.info(
-                    "    [%s] %d/%d  perfs=[%s]  (enc L%d H%d O%d)  "
-                    "took %s  avg %s/cand  sub-ETA %s",
-                    sub.window_id, done, n_per_dataset,
-                    ", ".join(f"{p:.4f}" for p in perfs),
-                    enc_cfg["n_layers"], enc_cfg["hidden_dim"], enc_cfg["output_dim"],
-                    _fmt_hms(cand_elapsed),
-                    _fmt_hms(avg_per_cand),
-                    _fmt_hms(sub_eta),
+                    "  [%s] sub-task %d/%d  clean: cached, skipping (records "
+                    "already in ds_seeds)",
+                    ds_name, sub_idx + 1, len(sub_tasks),
                 )
+            else:
+                clean_ran_this_invocation = True
+                clean_start = time.time()
+                for i, (enc_cfg, strat_cfg) in enumerate(candidates):
+                    cand_start = time.time()
+
+                    per_cand_seed = (
+                        seed
+                        + (effective_ds_idx * n_max_subtasks + sub_idx) * n_per_dataset
+                        + i
+                    )
+                    set_seed(per_cand_seed)
+
+                    perfs = _evaluate_candidate(
+                        enc_cfg, strat_cfg,
+                        sub.train, sub.val,
+                        task_type,
+                        ds_epochs, pretrain_lr, batch_size,
+                        device,
+                        pretrain_iters=ds_iters,
+                        horizon_groups=sub.horizon_groups,
+                        eval_horizons=ds_eval_horizons,
+                    )
+                    cand_elapsed = time.time() - cand_start
+
+                    # Capture the shared-head perf for the noisy diagnostic.
+                    # Only the first horizon group is used so the comparison
+                    # is well-defined (every shared candidate produces ≥ 1
+                    # perf value, by construction).
+                    if i < n_shared and perfs:
+                        diag_clean_perfs.append(perfs[0])
+
+                    # One seed record per horizon group.  Encoder pre-train
+                    # cost is paid once per (sub-task, candidate); horizon
+                    # variation just re-runs the cheap Ridge eval.  The
+                    # (tw_idx, vs_idx) come from the sub-task itself — they
+                    # may be ``None`` even when the parent run enables the
+                    # axis (e.g. too-narrow source falls back to vs_idx=None).
+                    for hg_idx, perf in enumerate(perfs):
+                        tid = build_task_id(
+                            ds_name,
+                            tw_idx=sub.tw_idx,
+                            vs_idx=sub.vs_idx,
+                            hg_idx=hg_idx if has_hg else None,
+                            has_windows=ds_has_windows,
+                            has_variable_subsets=ds_has_var_subsets,
+                            has_horizon_groups=has_hg,
+                        )
+                        ds_seeds.append(
+                            SeedRecord(
+                                encoder_config=enc_cfg,
+                                strategy=strat_cfg,
+                                task_id=tid,
+                                performance=perf,
+                                stage="clean",
+                            )
+                        )
+
+                    # Progress / ETA reporting at the sub-task granularity.
+                    done = i + 1
+                    avg_per_cand = (time.time() - clean_start) / done
+                    sub_eta = avg_per_cand * (n_per_dataset - done)
+                    logger.info(
+                        "    [%s] %d/%d  perfs=[%s]  (enc L%d H%d O%d)  "
+                        "took %s  avg %s/cand  sub-ETA %s",
+                        sub.window_id, done, n_per_dataset,
+                        ", ".join(f"{p:.4f}" for p in perfs),
+                        enc_cfg["n_layers"], enc_cfg["hidden_dim"],
+                        enc_cfg["output_dim"],
+                        _fmt_hms(cand_elapsed),
+                        _fmt_hms(avg_per_cand),
+                        _fmt_hms(sub_eta),
+                    )
+
+                clean_total = time.time() - clean_start
+
+                # Stage done — checkpoint atomically so a crash before the
+                # noisy stage finishes doesn't waste the clean records.
+                completed_stages.add(key_clean)
+                _persist_ckpt()
+                logger.info(
+                    "  [%s] sub-task %d/%d  clean stage done in %s "
+                    "(checkpoint written)",
+                    ds_name, sub_idx + 1, len(sub_tasks), _fmt_hms(clean_total),
+                )
+
+            # ── Noisy stage (per sub-task) ──────────────────────────────
+            # Same shared-head as clean (so diagnostic ρ on first n_shared
+            # candidates is well-defined), plus a fresh random tail seeded
+            # from a different namespace than the clean random pool.
+            if int(n_noisy_per_dataset) > 0:
+                if key_noisy in completed_stages:
+                    logger.info(
+                        "  [%s] sub-task %d/%d  noisy: cached, skipping",
+                        ds_name, sub_idx + 1, len(sub_tasks),
+                    )
+                else:
+                    noisy_n = int(n_noisy_per_dataset)
+                    n_noisy_random = max(0, noisy_n - n_shared)
+                    if n_noisy_random > 0:
+                        set_seed(seed + 20_000 + effective_ds_idx)
+                        if fixed_encoders is not None:
+                            noisy_random_candidates = batch_sample_strategies(
+                                n_noisy_random, fixed_encoders,
+                            )
+                        else:
+                            noisy_random_candidates = batch_sample_candidates(
+                                n_noisy_random,
+                            )
+                    else:
+                        noisy_random_candidates = []
+                    noisy_candidates = (
+                        list(shared_candidates) + noisy_random_candidates
+                    )
+                    noisy_n = len(noisy_candidates)
+
+                    noisy_start = time.time()
+                    diag_noisy_perfs: List[float] = []
+                    logger.info(
+                        "  [%s] sub-task %d/%d  noisy stage: %d candidates × "
+                        "%d iters (shared=%d + random=%d)",
+                        ds_name, sub_idx + 1, len(sub_tasks), noisy_n,
+                        int(noisy_pretrain_iters), n_shared, n_noisy_random,
+                    )
+
+                    for i, (enc_cfg, strat_cfg) in enumerate(noisy_candidates):
+                        cand_start = time.time()
+
+                        # Distinct seed namespace from clean (offset
+                        # +1_000_000) so noisy reproducibility doesn't collide.
+                        per_cand_seed = (
+                            seed
+                            + 1_000_000
+                            + (effective_ds_idx * n_max_subtasks + sub_idx)
+                              * noisy_n
+                            + i
+                        )
+                        set_seed(per_cand_seed)
+
+                        perfs = _evaluate_candidate(
+                            enc_cfg, strat_cfg,
+                            sub.train, sub.val,
+                            task_type,
+                            ds_epochs, pretrain_lr, batch_size,
+                            device,
+                            pretrain_iters=int(noisy_pretrain_iters),
+                            horizon_groups=sub.horizon_groups,
+                            eval_horizons=ds_eval_horizons,
+                        )
+                        cand_elapsed = time.time() - cand_start
+
+                        if i < n_shared and perfs:
+                            diag_noisy_perfs.append(perfs[0])
+
+                        for hg_idx, perf in enumerate(perfs):
+                            tid = build_task_id(
+                                ds_name,
+                                tw_idx=sub.tw_idx,
+                                vs_idx=sub.vs_idx,
+                                hg_idx=hg_idx if has_hg else None,
+                                has_windows=ds_has_windows,
+                                has_variable_subsets=ds_has_var_subsets,
+                                has_horizon_groups=has_hg,
+                            )
+                            ds_seeds.append(
+                                SeedRecord(
+                                    encoder_config=enc_cfg,
+                                    strategy=strat_cfg,
+                                    task_id=tid,
+                                    performance=perf,
+                                    stage="noisy",
+                                )
+                            )
+
+                        done = i + 1
+                        if done % 10 == 0 or done == noisy_n:
+                            avg_per_cand = (time.time() - noisy_start) / done
+                            noisy_eta = avg_per_cand * (noisy_n - done)
+                            logger.info(
+                                "    [%s] noisy %d/%d  perfs=[%s]  took %s  "
+                                "avg %s/cand  noisy-ETA %s",
+                                sub.window_id, done, noisy_n,
+                                ", ".join(f"{p:.4f}" for p in perfs),
+                                _fmt_hms(cand_elapsed),
+                                _fmt_hms(avg_per_cand),
+                                _fmt_hms(noisy_eta),
+                            )
+
+                    noisy_total = time.time() - noisy_start
+
+                    # Label-quality diagnostic — only meaningful when both
+                    # clean and noisy ran in THIS invocation (so the per-
+                    # candidate perfs are both present in memory).  When
+                    # clean was loaded from cache we skip with a note.
+                    if clean_ran_this_invocation and \
+                       len(diag_clean_perfs) >= 3 and \
+                       len(diag_clean_perfs) == len(diag_noisy_perfs):
+                        rho = _spearman_rho(diag_clean_perfs, diag_noisy_perfs)
+                        if rho == rho:  # not NaN
+                            if rho >= 0.5:
+                                verdict = "[PASS] usable"
+                            elif rho >= 0.3:
+                                verdict = "[WEAK]"
+                            else:
+                                verdict = "[FAIL] unreliable"
+                        else:
+                            verdict = "n/a (constant perf)"
+                            rho = float("nan")
+                        logger.info(
+                            "  [%s] sub-task %d/%d  noisy-vs-clean Spearman "
+                            "rho on %d shared candidates = %+.3f  %s",
+                            ds_name, sub_idx + 1, len(sub_tasks),
+                            len(diag_clean_perfs), rho, verdict,
+                        )
+                    elif not clean_ran_this_invocation:
+                        logger.info(
+                            "  [%s] sub-task %d/%d  noisy-vs-clean rho "
+                            "diagnostic skipped (clean was loaded from cache)",
+                            ds_name, sub_idx + 1, len(sub_tasks),
+                        )
+
+                    completed_stages.add(key_noisy)
+                    _persist_ckpt()
+                    logger.info(
+                        "  [%s] sub-task %d/%d  noisy stage done in %s "
+                        "(checkpoint written)",
+                        ds_name, sub_idx + 1, len(sub_tasks),
+                        _fmt_hms(noisy_total),
+                    )
 
             sub_total = time.time() - sub_start
             logger.info(
@@ -679,22 +992,23 @@ def generate_seeds(
                 ds_name, sub_idx + 1, len(sub_tasks), _fmt_hms(sub_total),
             )
 
-        # Promote this source's records into the global list and persist a
-        # sidecar checkpoint so a later crash on a different source doesn't
-        # cost us this work.  ``n_subtasks`` is logged for diagnostics; the
-        # resume path no longer needs it for seed-counter bookkeeping.
+        # Promote this source's records into the global list.  The per-
+        # source checkpoint was already written incrementally by
+        # ``_persist_ckpt()`` after each (sub_idx, stage), so there's nothing
+        # to write here — just a final log line for visibility.
         all_seeds.extend(ds_seeds)
         if ds_ckpt is not None:
-            payload = {
-                "ds_name": ds_name,
-                "n_subtasks": len(sub_tasks),
-                "records": [s.to_dict() for s in ds_seeds],
-            }
-            with open(ds_ckpt, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            # Final tidy write so the on-disk checkpoint reflects the
+            # post-source state exactly (defensive — every prior _persist_ckpt
+            # call already did this, but a single final pass guarantees
+            # consistency if any per-stage write was skipped).
+            _persist_ckpt()
             logger.info(
-                "  [%s] checkpoint saved: %d records → %s",
-                ds_name, len(ds_seeds), ds_ckpt,
+                "  [%s] all stages done: %d records  | %d/%d stages "
+                "(checkpoint: %s)",
+                ds_name, len(ds_seeds), len(completed_stages),
+                len(sub_tasks) * (2 if int(n_noisy_per_dataset) > 0 else 1),
+                ds_ckpt,
             )
 
         ds_total = time.time() - overall_start
