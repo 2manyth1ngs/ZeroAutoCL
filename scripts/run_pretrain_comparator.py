@@ -81,6 +81,15 @@ def main() -> None:
     crop_len           = sg_cfg.get("crop_len")
     if crop_len is not None:
         crop_len = int(crop_len)
+    # Per-dataset overrides for the slicing axes — generate_seeds() and
+    # precompute_task_features.py --sub_task_mode both honour these; without
+    # them here the sub-task IDs we re-build below would diverge from what's
+    # in seeds.json (e.g. AQ stations override n_variable_subsets to 1 while
+    # the global default is 3 — global-only reconstruction yields tw×vs=9
+    # window_ids that don't match the seeds' tw=3 IDs, and we end up in the
+    # fallback branch looking for a base-name cache that --sub_task_mode
+    # never wrote).
+    dataset_budgets    = cfg.get("dataset_budgets", {}) or {}
     # The variable-subset seed must match what generate_seeds passed in so
     # the (tw_idx, vs_idx) → variable-index mapping is identical at feature
     # extraction time.  We default it to ``args.seed`` for the same reason.
@@ -136,13 +145,25 @@ def main() -> None:
         # tries the sub-task-specific cache first and falls back to the base
         # cache when the sub-task file is missing (e.g. legacy runs that only
         # precomputed base-level features).
+        # Resolve per-dataset axis overrides (matches seed-gen +
+        # precompute_task_features.py --sub_task_mode).  Only the three keys
+        # that can vary per source — n_time_windows / n_variable_subsets /
+        # crop_len — are read here; min_window_len / var_size_rates /
+        # min_var_count are run-level only.
+        ds_budget = dataset_budgets.get(base, {}) or {}
+        ds_n_time_windows     = int(ds_budget.get("n_time_windows", n_time_windows))
+        ds_n_variable_subsets = int(ds_budget.get("n_variable_subsets", n_variable_subsets))
+        ds_crop_len           = ds_budget.get("crop_len", crop_len)
+        if ds_crop_len is not None:
+            ds_crop_len = int(ds_crop_len)
+
         sub_tasks = make_forecasting_subtasks(
             base, args.data_dir,
-            n_time_windows=n_time_windows,
+            n_time_windows=ds_n_time_windows,
             horizon_groups=horizon_groups,
-            crop_len=crop_len,
+            crop_len=ds_crop_len,
             min_window_len=min_window_len,
-            n_variable_subsets=n_variable_subsets,
+            n_variable_subsets=ds_n_variable_subsets,
             var_size_rates=var_size_rates,
             min_var_count=min_var_count,
             var_subset_seed=args.seed,
