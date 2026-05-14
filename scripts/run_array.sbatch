@@ -38,8 +38,7 @@
 # The ``nvidia-smi`` printout at job start (further down in this script)
 # shows which class actually got assigned, so you can spot-check whether
 # the array got A100/L40s/4090/3090.
-#SBATCH --constraint=(vram80g|vram48g|vram24g)&cc8.0
-#SBATCH --prefer=vram80g|vram48g
+#SBATCH --constraint=vram24g&cc8.9
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
