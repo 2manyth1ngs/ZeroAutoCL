@@ -512,6 +512,15 @@ def _train_one_stage(
     patience            = int(config.get("patience", 10))
     eval_every          = int(config.get("eval_every", 1))
     valid_sources       = config.get("valid_sources") or []
+    # Diagnostic flag: filter valid pool down to stage=="clean" only.  Train
+    # pool is left untouched.  Use this when the noisy stage's noisy↔clean
+    # Spearman ρ is so low on the hold-out source that the noisy valid
+    # labels become near-random — in that case noisy-valid BCE plateaus at
+    # ln(2) by construction (random labels), drowning the clean-valid
+    # signal and triggering the P0-3 sanity gate even when the comparator
+    # IS learning on the clean portion.  See result/zac_array_seedgen_43760_4
+    # for the ExchangeRate noisy ρ stats that motivated this flag.
+    valid_clean_only    = bool(config.get("valid_clean_only", True))
     # The "is comparator stuck at random?" log threshold.  At chance level
     # the BCE on a balanced symmetric pair set is exactly ln(2) ≈ 0.693.
     # We flag epochs whose valid BCE sits inside [ln2 - eps, ln2 + eps].
@@ -528,6 +537,19 @@ def _train_one_stage(
     if not train_pairs:
         logger.warning("[%s] No train pairs — skipping stage.", stage_name)
         return comparator
+
+    # Optional valid-only clean filter (does not touch train).  Applied here
+    # so all downstream consumers — the summary log line below, _valid_loss,
+    # early-stop, and the P0-3 sanity gate — see a consistent valid pool.
+    if valid_clean_only and valid_pairs:
+        n_before = len(valid_pairs)
+        valid_pairs = [p for p in valid_pairs if p.get("stage", "clean") == "clean"]
+        n_dropped = n_before - len(valid_pairs)
+        logger.info(
+            "[%s] valid_clean_only=True: dropped %d noisy valid pair(s); "
+            "%d clean valid pair(s) remain.",
+            stage_name, n_dropped, len(valid_pairs),
+        )
 
     n_train_clean = sum(1 for p in train_pairs if p.get("stage") == "clean")
     n_train_noisy = sum(1 for p in train_pairs if p.get("stage") == "noisy")

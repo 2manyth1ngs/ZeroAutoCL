@@ -250,6 +250,20 @@ comparator:
   # z-score units — kept for backwards compat with old small-scale runs.
   valid_gap_threshold: 0.5
 
+  # Rev 2026-05-16 — diagnostic: filter valid pool to stage="clean" only.
+  # Train pool is NOT filtered.  Motivation: seedgen log for the default
+  # hold-out source (ExchangeRate) showed 5/9 sub-tasks with noisy↔clean
+  # Spearman ρ < 0.3 [FAIL] (mean ρ ≈ +0.27).  That means ≈88% of the
+  # valid pool (the noisy stage = 56880/64710 pairs) carried near-random
+  # labels — alone enough to push valid BCE above ln(2) and trigger the
+  # P0-3 sanity gate even when the comparator IS learning on the 12%
+  # clean portion.  Setting this True isolates the clean signal so we
+  # can tell "learning but drowned by bad noisy labels" apart from
+  # "genuinely not learning".  Flip back to False after the diagnostic
+  # decision is made (and noisy quality is improved or noisy stage is
+  # dropped from the offending source).
+  valid_clean_only: true
+
   # Plateau-detection half-width: valid-BCE inside ``ln(2) ± plateau_eps``
   # gets explicitly flagged as "≈ random" in the per-epoch log.  0.02 is
   # tight enough to flag chance-level plateaus without false positives on
