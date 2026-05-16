@@ -3,46 +3,37 @@
 #SBATCH --partition=gpu_spot
 #SBATCH --gpus=1
 #SBATCH --gpu-bind=closest
-# GPU pool (rev 2026-05-12, updated to maximise availability):
+# GPU pool (rev 2026-05-16, RESTRICTED TO 4090 ONLY):
 #
-# Eligible GPUs in ``gpu_spot``, in preference order:
-#   1. ``nvidia_a100``        80GB  CC 8.0   1 node × 4 GPUs  (g3n1)
-#   2. ``nvidia_l40s``        48GB  CC 8.9   1 node × 4 GPUs  (g5n1)
-#   3. ``nvidia_geforce_rtx_4090`` 24GB  CC 8.9   6 nodes × 1 GPU  (g1n1-6)
-#   4. ``nvidia_geforce_rtx_3090`` 24GB  CC 8.6   3 nodes (g4n1-2: 1 GPU each,
-#                                                          g2n1: 2 GPUs)
+# Eligible GPU on ``gpu_spot``:
+#   • ``nvidia_geforce_rtx_4090`` 24GB  CC 8.9   6 nodes × 1 GPU (g1n1-6)
 #
-# Total pool ≈ 18 eligible GPUs on ``gpu_spot``, so a 9-task array with
-# %9 concurrency (all sources running in parallel) almost never has to wait.
+# Excluded (intentionally — user request 2026-05-16):
+#   • A100  80GB CC 8.0   (vram80g but cc8.0 fails &cc8.9)
+#   • L40s  48GB CC 8.9   (cc8.9 OK but vram48g fails vram24g)
+#   • 3090  24GB CC 8.6   (vram24g OK but cc8.6 fails cc8.9)
 #
-# Mechanism (two layers):
-#   • ``--constraint=(vram80g|vram48g|vram24g)&cc8.0`` — accept ANY VRAM
-#     class with CC ≥ 8.0.  Both 3090 (CC 8.6) and 4090 (CC 8.9) satisfy
-#     the 24GB+CC8.0 lower bound; A100 (80GB) and L40s (48GB) satisfy via
-#     the higher VRAM buckets.  Loosened from the old ``vram24g&cc8.9``
-#     which excluded both A100 (CC=8.0) and 3090 (CC=8.6).
-#   • ``--prefer=vram80g|vram48g`` — SOFT preference for A100 / L40s.
-#     Requires SLURM ≥ 22.05; older schedulers ignore the line and rely
-#     on the ``--constraint`` OR clause to pick whatever's free.
+# Constraint mechanism:
+#   ``--constraint=vram24g&cc8.9`` requires BOTH features.  Each node's
+#   features are exact-match strings; only 4090 carries both
+#   ``vram24g`` and ``cc8.9`` simultaneously.
 #
-# Within the 24GB tier (4090 vs 3090), SLURM cannot natively distinguish
-# preference via features — both have ``vram24g`` and our code is
-# functionally identical on either.  Either will be picked based on which
-# node has free resources at submit time.  If you specifically want 4090
-# only, tighten to ``cc8.9`` (excludes 3090 which is CC 8.6).
+# Concurrency implication:
+#   Only 6 × 4090 = 6 GPUs in the pool.  With ``--array=0-8%9`` the
+#   3 extra tasks will queue (PD state) until earlier ones release a
+#   slot — total wallclock rises by roughly 1.5× compared to the old
+#   18-GPU pool (was: 9 parallel ≈ slowest single source).  Drop to
+#   ``%6`` if you want all tasks always-running with no queueing
+#   wait (wallclock ≈ slowest single source again).  Kept at %9 here
+#   since seedgen checkpointing makes preemption-recovery cheap.
 #
-# A100 / L40s are only listed in ``gpu_csi`` (AI-Center-only) and
-# ``gpu_spot``.  As regular users we reach them through ``gpu_spot``
-# (subject to preemption — typically by CSI users).
-#
-# The ``nvidia-smi`` printout at job start (further down in this script)
-# shows which class actually got assigned, so you can spot-check whether
-# the array got A100/L40s/4090/3090.
+# The ``nvidia-smi`` printout at job start (further down) confirms the
+# assigned GPU is a 4090.
 #SBATCH --constraint=vram24g&cc8.9
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=50G
+#SBATCH --mem=48G
 #SBATCH --time=48:00:00
 #SBATCH --requeue
 #SBATCH --array=0-8%9
@@ -264,11 +255,10 @@ if [[ "${ARRAY_ID}" == "0" && "${ZAC_NO_CHAIN:-}" != "1" ]]; then
 #SBATCH --partition=gpu_spot
 #SBATCH --gpus=1
 #SBATCH --gpu-bind=closest
-# Mirror the parent run_array.sbatch GPU pool: prefer A100 / L40s, fall
-# back to 4090 OR 3090 (both 24GB, CC ≥ 8.0).  See parent file's banner
-# for the full rationale.  Total eligible pool ≈ 18 GPUs on gpu_spot.
-#SBATCH --constraint=(vram80g|vram48g|vram24g)&cc8.0
-#SBATCH --prefer=vram80g|vram48g
+# Mirror the parent run_array.sbatch GPU restriction: 4090 only (CC 8.9
+# AND 24 GB VRAM).  Pool size = 6 (g1n1-6).  See parent banner for the
+# rev 2026-05-16 rationale (user request).
+#SBATCH --constraint=vram24g&cc8.9
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

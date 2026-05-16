@@ -225,26 +225,53 @@ comparator:
   batch_size: 64
   hidden_dim: 128
 
-  # Rev 2026-05-12 — hold-out source valid split (preferred).  Seeds whose
-  # task_id base matches any name in ``valid_sources`` go 100% into valid;
-  # all other seeds go 100% into train.  No gap-split is applied — every
-  # bucket forms ALL quadratic pairs.
+  # Rev 2026-05-16 — hold-out switched from ExchangeRate to ETTm2 after
+  # the 2026-05-13 run revealed two compounding issues that produced a
+  # near-zero ρ on the clean-only valid pool (BCE=0.9347, acc=0.507,
+  # ρ=+0.011):
   #
-  # Why ExchangeRate as the default hold-out?
-  #   • 9 sub-tasks (3 × 3) — enough pairs for stable valid BCE.
-  #   • Finance domain has NO target dataset (ETTh1 / Electricity / Weather
-  #     are all non-finance), so losing this source from train doesn't hurt
-  #     downstream zero-shot coverage.
-  #   • Domain diversity test — if the comparator can rank ExchangeRate
-  #     strategies after seeing only the other 8 sources, it has learned a
-  #     transferable task-feature representation rather than memorising
-  #     per-source biases.
+  #   (a) ExchangeRate is the ONLY finance source in the 9-source pool;
+  #       its near-random-walk dynamics make optimal CL strategies
+  #       qualitatively different from the other 8 (ETT/Solar/traffic/AQ
+  #       all have strong periodicity).  Hold-out had no same-domain
+  #       neighbour in train → cross-domain generalisation, not the
+  #       in-distribution generalisation the comparator was meant to learn.
+  #
+  #   (b) The seedgen log (result/zac_array_seedgen_43760_4) showed 5/9
+  #       ExchangeRate sub-tasks with noisy↔clean ρ < 0.3 [FAIL] (mean ρ
+  #       ≈ +0.27).  Even with ``valid_clean_only: true`` reading just
+  #       the clean portion (7830/64710 pairs), the underlying source's
+  #       label instability suggests forecasting on this dataset is
+  #       intrinsically high-variance — making it a poor unit test for
+  #       comparator quality.
+  #
+  # ETTm2 is a fairer hold-out:
+  #   • Two same-domain neighbours in train (ETTh2 + ETTm1) → tests the
+  #     in-domain generalisation the comparator can actually achieve,
+  #     separating "comparator broken" from "ExchangeRate genuinely OOD".
+  #   • 9 sub-tasks (same as ExchangeRate had), so valid pair count is
+  #     directly comparable to the previous baseline.
+  #   • Strong periodicity (15-min ETT) → noisy ρ likely PASS, but with
+  #     ``valid_clean_only: true`` we ignore noisy valid anyway.
+  #
+  # Decision rule for the next run's valid clean BCE:
+  #   < 0.65, ρ > +0.3   → ExchangeRate was the outlier (case a/b).
+  #                        Re-run with rotating-CV hold-out or keep ETTm2.
+  #   ≈ 0.69, ρ ≈ 0      → comparator has a structural problem
+  #                        (task encoder collapse).  Continue to z_task
+  #                        diagnostic + PMA k=1→4 / no-seq_len-mean-pool
+  #                        per Debug/comparator_bug_2026_05_12.md §4.4.
+  #   > 0.75             → both (a/b) AND structural problem stacked.
+  #
+  # Seeds whose task_id base matches any name in ``valid_sources`` go 100%
+  # into valid; all other seeds go 100% into train.  No gap-split is
+  # applied — every bucket forms ALL quadratic pairs.
   #
   # Set to ``[]`` to fall back to the legacy per-task gap-split (carves
   # train seeds away into a valid pool by z-score gap).  Not recommended
   # at scale — see ``random_search.py:502`` for the AutoCTS++ rationale
   # behind a held-out source.
-  valid_sources: [ExchangeRate]
+  valid_sources: [ETTm2]
 
   # Used only when ``valid_sources`` is empty (legacy mode).  Half-σ in
   # z-score units — kept for backwards compat with old small-scale runs.
@@ -270,7 +297,12 @@ comparator:
   # genuinely-near-random epochs early in training.
   plateau_eps: 0.02
 
-  patience: 5               # epochs of non-improvement → early stop
+  # Rev 2026-05-16 — bumped 5 → 20.  Previous run's best valid was at
+  # ep 1 (lucky init) and patience=5 stopped at ep 6 before training had
+  # a chance to escape the initialisation plateau.  20 lets the optimizer
+  # work through ~20× the prior budget without runaway cost (each epoch
+  # is ~24 min at 345k pairs on A100 / ~30 min on 4090).
+  patience: 20              # epochs of non-improvement → early stop
   eval_every: 1             # evaluate valid loss every N epochs
 
 zero_shot:
