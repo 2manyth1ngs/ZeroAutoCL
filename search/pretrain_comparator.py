@@ -507,6 +507,11 @@ def _train_one_stage(
     stage_name = "pretrain"
     epochs              = int(config.get("epochs", 100))
     lr                  = float(config.get("lr", 1e-4))
+    # Rev 2026-05-16 — L2 regularisation added after run 44320 showed
+    # textbook overfitting (train BCE 0.56→0.27 while valid BCE 0.92→1.35
+    # over 10 epochs).  Default 1e-3 is the middle of Adam's typical
+    # range (1e-4 to 1e-2).  Set to 0.0 to disable.
+    weight_decay        = float(config.get("weight_decay", 1e-3))
     batch_size          = int(config.get("batch_size", 256))
     valid_gap_threshold = float(config.get("valid_gap_threshold", 0.02))
     patience            = int(config.get("patience", 10))
@@ -557,14 +562,16 @@ def _train_one_stage(
     n_valid_noisy = sum(1 for p in valid_pairs if p.get("stage") == "noisy")
     logger.info(
         "[%s] train=%d (clean=%d, noisy=%d)  valid=%d (clean=%d, noisy=%d)  "
-        "| lr=%g  epochs=%d  patience=%d  plateau_eps=%.3f  "
+        "| lr=%g  wd=%g  epochs=%d  patience=%d  plateau_eps=%.3f  "
         "random-baseline BCE=%.4f",
         stage_name, len(train_pairs), n_train_clean, n_train_noisy,
         len(valid_pairs), n_valid_clean, n_valid_noisy,
-        lr, epochs, patience, plateau_eps, RANDOM_BASELINE_BCE,
+        lr, weight_decay, epochs, patience, plateau_eps, RANDOM_BASELINE_BCE,
     )
 
-    optimizer = torch.optim.Adam(comparator.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(
+        comparator.parameters(), lr=lr, weight_decay=weight_decay,
+    )
 
     best_valid_loss: float = float("inf")
     best_state: Optional[Dict[str, torch.Tensor]] = None
@@ -664,31 +671,31 @@ def _train_one_stage(
             else:
                 plateau_tag = f"↑ random by {gap:.3f}  ⚠"
 
-            # Always log when something changes (improved, plateau-near, or
-            # every 10 epochs).  Plateau detection lifts the log threshold so
-            # the user can spot "stuck at 0.69" without scanning every line.
-            verbose = (
-                improved
-                or epoch == 0
-                or (epoch + 1) % 10 == 0
-                or abs(gap) <= plateau_eps
+            # Rev 2026-05-16 — main per-epoch line is now ALWAYS printed.
+            # Previously gated by ``verbose`` so silent runs of 9+ epochs
+            # were possible when nothing improved (since ep 2-9 are
+            # neither improved, nor 10-divisible, nor plateau-near in the
+            # typical "stuck above ln(2)" regime).  That made the log
+            # indistinguishable from a hung job.  Per-source / per-stage
+            # breakdowns are still throttled to improved / 10-multiple
+            # epochs to keep the log scannable.
+            logger.info(
+                "[%s] ep %3d/%d  train=%.4f (clean=%.4f noisy=%s)  "
+                "valid=%.4f  acc=%.3f  [%s]  patience=%d/%d%s",
+                stage_name, epoch + 1, epochs, avg_train_loss,
+                clean_train_bce,
+                "n/a" if math.isnan(noisy_train_bce) else f"{noisy_train_bce:.4f}",
+                v_loss, v_acc, plateau_tag,
+                patience_counter, patience,
+                "  *best*" if improved else "",
             )
-            if verbose:
-                logger.info(
-                    "[%s] ep %3d/%d  train=%.4f (clean=%.4f noisy=%s)  "
-                    "valid=%.4f  acc=%.3f  [%s]  patience=%d/%d%s",
-                    stage_name, epoch + 1, epochs, avg_train_loss,
-                    clean_train_bce,
-                    "n/a" if math.isnan(noisy_train_bce) else f"{noisy_train_bce:.4f}",
-                    v_loss, v_acc, plateau_tag,
-                    patience_counter, patience,
-                    "  *best*" if improved else "",
-                )
-                # Per-source breakdown — only on improvement or every 10
-                # epochs to keep the log readable.  Helps spot "comparator
-                # learns globally but is random on one specific source".
+
+            # Per-source breakdown — only on improvement or every 10
+            # epochs to keep the log readable.  Helps spot "comparator
+            # learns globally but is random on one specific source".
+            if improved or (epoch + 1) % 10 == 0:
                 src_bd = breakdown.get("per_source") if breakdown else None
-                if src_bd and (improved or (epoch + 1) % 10 == 0):
+                if src_bd:
                     for base in sorted(src_bd):
                         m = src_bd[base]
                         rho_str = (

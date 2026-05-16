@@ -220,8 +220,16 @@ comparator:
   # Values aligned with AutoCTS++ (random_search.py L28,29,41,538):
   #   batch_size=64, lr=1e-4, epochs=100, tolerance=3 (we allow patience=5
   #   because our valid sets are larger after the symmetric-pair injection).
+  #
+  # Rev 2026-05-16 — lr 1e-4 → 3e-5 and weight_decay 0 → 1e-3 added after
+  # run 44320 showed textbook overfitting on the ETTm2 hold-out (train
+  # BCE 0.56 → 0.27 while valid BCE 0.92 → 1.35 over 10 epochs;
+  # patience=9/20).  Slower lr + L2 penalty curbs the per-task
+  # memorisation that produced this trajectory.  See discussion at the
+  # end of Debug/comparator_bug_2026_05_12.md (or chat 2026-05-16).
   epochs: 100               # upper bound — real stop is triggered by ``patience``
-  lr: 0.0001
+  lr: 0.00003               # 3e-5 (was 1e-4)
+  weight_decay: 0.001       # 1e-3 — typical Adam wd; set 0 to disable
   batch_size: 64
   hidden_dim: 128
 
@@ -297,12 +305,13 @@ comparator:
   # genuinely-near-random epochs early in training.
   plateau_eps: 0.02
 
-  # Rev 2026-05-16 — bumped 5 → 20.  Previous run's best valid was at
-  # ep 1 (lucky init) and patience=5 stopped at ep 6 before training had
-  # a chance to escape the initialisation plateau.  20 lets the optimizer
-  # work through ~20× the prior budget without runaway cost (each epoch
-  # is ~24 min at 345k pairs on A100 / ~30 min on 4090).
-  patience: 20              # epochs of non-improvement → early stop
+  # Rev 2026-05-16 (b) — bumped to 20 earlier today to give a stuck-at-init
+  # comparator more recovery time, then trimmed to 8 after run 44320
+  # showed monotone valid degradation (overfit is detectable by ep 3-5
+  # so waiting 20 epochs wastes ~80 min of 4090 time per run).  8 is
+  # enough headroom for the new regularised optimiser to find a real
+  # min beyond ep 1's lucky-init plateau, while bounding wasted compute.
+  patience: 8               # epochs of non-improvement → early stop
   eval_every: 1             # evaluate valid loss every N epochs
 
 zero_shot:
