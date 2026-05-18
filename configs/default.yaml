@@ -305,6 +305,31 @@ comparator:
   # genuinely-near-random epochs early in training.
   plateau_eps: 0.02
 
+  # Rev 2026-05-18 — noisy-bucket quality filter (level-1 lossless fix
+  # from Debug/noisy_rho_audit_2026_05_16.md §5 #1).  At seedgen-time we
+  # measure the noisy↔clean Spearman ρ on each sub-task's 10 shared-head
+  # candidates; the value is persisted by ``seed_generator.py`` into the
+  # per-source checkpoint and aggregated by ``merge_seed_checkpoints.py``
+  # into ``seeds_meta.json``.  At comparator-train time, noisy
+  # ``(task_id, "noisy")`` buckets whose ρ is **strictly below** this
+  # threshold are dropped from training pairs (clean buckets are NEVER
+  # filtered).  The audit found 49% PASS / 17% WEAK / 34% FAIL on the
+  # zac_2026_05_12 run — 18 noisy buckets (incl. 3 with negative ρ) were
+  # injecting reverse / random gradient.
+  #
+  # Calibration:
+  #   0.0  →  no filter (preserves pre-2026-05-18 behaviour)
+  #   0.3  →  drop FAIL buckets, keep WEAK + PASS  ← recommended default
+  #   0.5  →  drop FAIL + WEAK, keep only PASS    (strict; cuts ~66% noisy)
+  #
+  # No-op unless ``seeds_meta.json`` is present beside ``seeds.json`` —
+  # missing meta file ⇒ empty ρ map ⇒ filter cannot fire.  For older runs
+  # whose checkpoints predate ρ-persistence, run:
+  #   python scripts/merge_seed_checkpoints.py \
+  #       --ckpt_dir <out>/seeds --log_dir <out>
+  # to back-fill ρ from existing logs into the checkpoints, then re-merge.
+  noisy_rho_threshold: 0.3
+
   # Rev 2026-05-16 (b) — bumped to 20 earlier today to give a stuck-at-init
   # comparator more recovery time, then trimmed to 8 after run 44320
   # showed monotone valid degradation (overfit is detectable by ep 3-5

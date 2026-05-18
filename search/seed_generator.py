@@ -611,6 +611,13 @@ def generate_seeds(
 
         completed_stages: set = set()
         ds_seeds: List[SeedRecord] = []
+        # Per-sub-task noisy↔clean Spearman ρ persisted across runs.  Keyed by
+        # ``sub.window_id`` (e.g. ``"Solar:tw0:vs1"``) so that the downstream
+        # comparator trainer can attribute the value to every task_id (across
+        # horizon groups) belonging to that sub-task.  Populated in the noisy
+        # stage right after the diagnostic line is logged; loaded back on
+        # resume so partial reruns don't drop already-computed values.
+        ds_sub_task_rhos: Dict[str, float] = {}
         legacy_skip = False
 
         if ds_ckpt and os.path.exists(ds_ckpt) and os.path.getsize(ds_ckpt) > 0:
@@ -624,6 +631,10 @@ def generate_seeds(
                 cached_n_per   = payload.get("n_per_dataset")
                 cached_n_noisy = payload.get("n_noisy_per_dataset")
                 cached_stages  = payload.get("completed_stages")  # None on legacy
+                # Carry forward any previously-computed sub-task ρ values so a
+                # resumed run doesn't lose them.  Falls back to {} for legacy
+                # checkpoints that pre-date this field.
+                cached_rhos    = payload.get("sub_task_rhos") or {}
 
                 # Staleness checks — discard cache on any knob mismatch.
                 reason: Optional[str] = None
@@ -663,13 +674,17 @@ def generate_seeds(
                     # Partial resume.  Carry forward already-completed stages.
                     completed_stages = set(cached_stages)
                     ds_seeds = list(cached_records)
+                    ds_sub_task_rhos = {
+                        str(k): float(v) for k, v in cached_rhos.items()
+                    }
                     logger.info(
                         "[%s] partial checkpoint hit: %d stages done "
-                        "(%s), %d records cached — resuming.",
+                        "(%s), %d records cached, %d sub-task ρ values "
+                        "cached — resuming.",
                         ds_name, len(completed_stages),
                         ", ".join(sorted(completed_stages)[:8])
                         + ("..." if len(completed_stages) > 8 else ""),
-                        len(cached_records),
+                        len(cached_records), len(ds_sub_task_rhos),
                     )
             except Exception as exc:                            # pragma: no cover
                 logger.warning(
@@ -695,6 +710,15 @@ def generate_seeds(
                 "n_noisy_per_dataset": int(n_noisy_per_dataset),
                 "completed_stages":    sorted(completed_stages),
                 "records":             [s.to_dict() for s in ds_seeds],
+                # Per-sub-task noisy↔clean Spearman ρ (see ds_sub_task_rhos
+                # init above).  Empty dict on clean-only runs or before the
+                # first noisy stage finishes.  Downstream consumer:
+                # ``scripts/merge_seed_checkpoints.py`` aggregates these into
+                # ``seeds_meta.json`` which the comparator trainer reads to
+                # drop noisy buckets whose label quality fell below
+                # ``comparator.noisy_rho_threshold`` (see
+                # ``noisy_rho_audit_2026_05_16.md §5 #1``).
+                "sub_task_rhos":       dict(ds_sub_task_rhos),
             }
             tmp = ds_ckpt + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -961,6 +985,15 @@ def generate_seeds(
                                 verdict = "[WEAK]"
                             else:
                                 verdict = "[FAIL] unreliable"
+                            # Persist the rho keyed by sub.window_id so the
+                            # comparator trainer can attribute it to every
+                            # task_id (across horizon groups) of this sub-task
+                            # and drop the noisy bucket if it's below the
+                            # filter threshold.  NaN rhos (constant perf) are
+                            # intentionally NOT persisted — without a numeric
+                            # value the filter treats the bucket as "unknown
+                            # quality, keep" rather than "definitely bad".
+                            ds_sub_task_rhos[sub.window_id] = float(rho)
                         else:
                             verdict = "n/a (constant perf)"
                             rho = float("nan")

@@ -108,6 +108,47 @@ def main() -> None:
     logger.info("Total: %d seed records across %d file(s).",
                 len(seeds), len(args.seeds_path))
 
+    # ── Load noisy ρ map ─────────────────────────────────────────────
+    # ``seeds_meta.json`` is written next to ``seeds.json`` by
+    # ``scripts/merge_seed_checkpoints.py`` and carries the per-sub-task
+    # noisy↔clean Spearman ρ values needed by the noisy-bucket filter in
+    # ``pretrain_comparator``.  Missing file ⇒ empty map ⇒ no filtering
+    # (preserves old behaviour and lets clean-only runs work unchanged).
+    # When several ``--seeds_path`` files are concatenated we take the
+    # union of every sibling ``seeds_meta.json``; later writers win on
+    # window_id collisions (none expected — window_ids are namespaced by
+    # source).
+    noisy_rho_map: dict = {}
+    for path in args.seeds_path:
+        meta_path = os.path.join(
+            os.path.dirname(path) or ".", "seeds_meta.json",
+        )
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception as exc:
+            logger.warning("  cannot read %s: %s — ignoring", meta_path, exc)
+            continue
+        chunk_rhos = meta.get("noisy_sub_task_rhos") or {}
+        noisy_rho_map.update({str(k): float(v) for k, v in chunk_rhos.items()})
+        logger.info(
+            "  loaded %d noisy-ρ entries from %s",
+            len(chunk_rhos), meta_path,
+        )
+    if noisy_rho_map:
+        logger.info(
+            "Total noisy ρ map: %d window_id entries",
+            len(noisy_rho_map),
+        )
+    else:
+        logger.info(
+            "No seeds_meta.json sibling found — noisy-bucket filter "
+            "will be a no-op (run merge_seed_checkpoints.py with --log_dir "
+            "to back-fill ρ from existing logs).",
+        )
+
     # ── Extract task features for every task_id seen ─────────────────
     # Sub-task IDs of the form ``"{base}:tw{i}"`` / ``"{base}:hg{j}"`` /
     # ``"{base}:tw{i}:hg{j}"`` are resolved by re-running the same
@@ -218,6 +259,13 @@ def main() -> None:
         task_dim=TASK_FEATURE_DIM,
         hidden_dim=int(comp_cfg.get("hidden_dim", 128)),
     )
+    # Inject the loaded noisy ρ map into the comparator config so
+    # ``_split_seeds_and_pairs`` can apply the filter.  YAML-side
+    # ``noisy_rho_threshold`` controls the cutoff (default 0.0 = off);
+    # ``noisy_rho_map`` is wholly runtime-loaded and never appears in
+    # ``configs/default.yaml``.
+    comp_cfg = dict(comp_cfg)
+    comp_cfg["noisy_rho_map"] = noisy_rho_map
     comparator = pretrain_comparator(
         seeds=seeds,
         task_features=task_features,

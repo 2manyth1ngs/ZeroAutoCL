@@ -313,10 +313,16 @@ nvidia-smi
 # that \${SEEDS} reflects every per-source checkpoint regardless of which
 # array task was the last writer.
 echo
-echo "[chained] final seeds merge"
+echo "[chained] final seeds merge (with ρ back-fill from logs)"
+# --log_dir back-fills any missing noisy↔clean Spearman ρ values from
+# run_array_*_<SRC>.log into the per-source checkpoints, then writes
+# seeds_meta.json (sibling of seeds.json) so the comparator trainer can
+# apply ``comparator.noisy_rho_threshold``.  Idempotent — no-op once
+# every checkpoint already carries its ρ values.
 python -u scripts/merge_seed_checkpoints.py \\
     --ckpt_dir "\${SEEDS_DIR}" \\
     --out      "\${SEEDS}" \\
+    --log_dir  "\${OUT_DIR}" \\
     > >(tee -a "\${OUT_DIR}/run_post.log") \\
     2> >(tee -a "\${OUT_DIR}/run_post.log" >&2)
 
@@ -602,9 +608,14 @@ srun --unbuffered python -u scripts/run_generate_seeds.py \
 # ─────────────────────────────────────────────────────────────────────────────
 echo
 echo "[stage-B.1] [${SRC}] merging per-source checkpoints into ${SEEDS_DIR}/seeds.json"
+# --log_dir back-fills noisy↔clean Spearman ρ from logs into per-source
+# checkpoints (idempotent) and writes seeds_meta.json next to seeds.json
+# so the downstream comparator trainer can apply the noisy-bucket quality
+# filter (configs/default.yaml::comparator.noisy_rho_threshold).
 python -u scripts/merge_seed_checkpoints.py \
     --ckpt_dir "${SEEDS_DIR}" \
     --out      "${SEEDS_DIR}/seeds.json" \
+    --log_dir  "${OUT_DIR}" \
     > >(tee -a "${OUT_DIR}/run_array_${ARRAY_ID}_${SRC}.log") \
     2> >(tee -a "${OUT_DIR}/run_array_${ARRAY_ID}_${SRC}.log" >&2)
 

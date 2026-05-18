@@ -154,12 +154,112 @@ def _zscore_seeds(seeds: List[SeedRecord]) -> List[SeedRecord]:
     ]
 
 
+def _window_id_from_task_id(task_id: str) -> str:
+    """Reduce a task_id to its window_id by stripping the ``:hgX`` suffix.
+
+    The noisy-vs-clean Spearman ρ map persisted by
+    :func:`search.seed_generator.generate_seeds` is keyed by ``sub.window_id``
+    (e.g. ``"Solar:tw0:vs1"``) — i.e. one ρ per (time-window × variable-subset)
+    sub-task.  Multiple seed records share that ρ when the sub-task has
+    multiple horizon groups (one record per (sub-task, horizon_group), all
+    with the same shared-head candidates), so the comparator's per-task_id
+    filter must collapse ``task_id`` down to ``window_id`` before lookup.
+
+    Examples::
+
+        "Solar:tw0:vs1:hg0"  → "Solar:tw0:vs1"
+        "ETTh2:tw0"          → "ETTh2:tw0"
+        "AQShunyi"           → "AQShunyi"
+    """
+    parts = parse_task_id(task_id)
+    wid = parts.base
+    if parts.tw_idx is not None:
+        wid += f":tw{parts.tw_idx}"
+    if parts.vs_idx is not None:
+        wid += f":vs{parts.vs_idx}"
+    return wid
+
+
+def _filter_noisy_buckets_by_rho(
+    by_group: Dict[Tuple[str, str], List[SeedRecord]],
+    noisy_rho_map: Dict[str, float],
+    noisy_rho_threshold: float,
+) -> Tuple[Dict[Tuple[str, str], List[SeedRecord]], Dict[str, int]]:
+    """Drop noisy ``(task_id, "noisy")`` buckets with ρ < threshold.
+
+    Implements the recommendation in
+    ``Debug/noisy_rho_audit_2026_05_16.md §5 #1``: the noisy stage of a
+    sub-task whose ρ(noisy, clean) on the shared-head overlap fell below
+    ``noisy_rho_threshold`` carries near-random or actively-inverted labels,
+    so its pairs poison the comparator gradient.  We drop those buckets
+    entirely — clean buckets of the same sub-task stay intact, and noisy
+    buckets without a recorded ρ (e.g. clean-only sub-tasks, or runs where
+    ρ never computed) pass through untouched.
+
+    Args:
+        by_group: ``(task_id, stage) → records`` after the initial grouping.
+        noisy_rho_map: ``{window_id: ρ}``.  Sourced from ``seeds_meta.json``
+            written by :func:`scripts.merge_seed_checkpoints.main`.  Empty
+            dict means "no ρ data available, do not filter".
+        noisy_rho_threshold: Floor.  Buckets with ρ strictly less than this
+            value are dropped.  Negative-ρ buckets (reverse correlation —
+            actively poisonous) are always dropped regardless of the floor.
+
+    Returns:
+        ``(filtered_by_group, summary)`` where ``summary`` is a dict with
+        keys ``kept``, ``dropped``, ``no_rho``, ``dropped_pair_count_est``,
+        and ``dropped_buckets`` (a list of ``(task_id, window_id, ρ)`` tuples
+        for logging).
+    """
+    if not noisy_rho_map:
+        return by_group, {
+            "kept": 0, "dropped": 0, "no_rho": 0,
+            "dropped_pair_count_est": 0, "dropped_buckets": [],
+        }
+
+    kept_by_group: Dict[Tuple[str, str], List[SeedRecord]] = {}
+    dropped_buckets: List[Tuple[str, str, float]] = []
+    n_kept = n_dropped = n_no_rho = 0
+    dropped_pair_count_est = 0
+    for (task_id, stage), records in by_group.items():
+        if stage != "noisy":
+            kept_by_group[(task_id, stage)] = records
+            continue
+        wid = _window_id_from_task_id(task_id)
+        if wid not in noisy_rho_map:
+            kept_by_group[(task_id, stage)] = records
+            n_no_rho += 1
+            continue
+        rho = noisy_rho_map[wid]
+        if rho < noisy_rho_threshold:
+            n_dropped += 1
+            # Symmetric pairs → N(N-1) per bucket, doubled for the (A,B) /
+            # (B,A) emission.  Use n*(n-1)*2 as the rough drop estimate.
+            n = len(records)
+            dropped_pair_count_est += 2 * n * max(0, n - 1)
+            dropped_buckets.append((task_id, wid, rho))
+        else:
+            kept_by_group[(task_id, stage)] = records
+            n_kept += 1
+
+    summary = {
+        "kept": n_kept,
+        "dropped": n_dropped,
+        "no_rho": n_no_rho,
+        "dropped_pair_count_est": dropped_pair_count_est,
+        "dropped_buckets": dropped_buckets,
+    }
+    return kept_by_group, summary
+
+
 @torch.no_grad()
 def _split_seeds_and_pairs(
     seeds: List[SeedRecord],
     task_features: Dict[str, Tensor],
     valid_gap_threshold: float,
     valid_sources: Optional[List[str]] = None,
+    noisy_rho_map: Optional[Dict[str, float]] = None,
+    noisy_rho_threshold: float = 0.0,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Build train / valid pair pools from raw seed records.
 
@@ -197,6 +297,15 @@ def _split_seeds_and_pairs(
         valid_sources: List of source dataset base names whose seeds become
             the valid pool.  ``None`` or empty falls back to legacy gap-split
             so existing scripts keep working unchanged.
+        noisy_rho_map: Optional ``{window_id: ρ}`` map from ``seeds_meta.json``
+            written by :func:`scripts.merge_seed_checkpoints.main`.  Drives
+            the noisy-bucket quality filter — when present, noisy buckets
+            whose sub-task ρ < ``noisy_rho_threshold`` are dropped.  Empty
+            or ``None`` disables filtering.
+        noisy_rho_threshold: Spearman ρ floor for noisy buckets.  Default
+            ``0.0`` keeps everything (no-op).  ``0.3`` reproduces the
+            "WEAK/PASS only" filter recommended in
+            ``Debug/noisy_rho_audit_2026_05_16.md §5 #1``.
 
     Returns:
         ``(train_pairs, valid_pairs)`` — each a list of dicts compatible
@@ -210,6 +319,32 @@ def _split_seeds_and_pairs(
     by_group: Dict[Tuple[str, str], List[SeedRecord]] = {}
     for s in seeds:
         by_group.setdefault((s.task_id, s.stage), []).append(s)
+
+    # ── Noisy-bucket quality filter ───────────────────────────────────
+    # Drop noisy ``(task_id, "noisy")`` buckets whose sub-task ρ on the
+    # noisy↔clean shared-head overlap fell below ``noisy_rho_threshold``.
+    # This is the "level-1 lossless fix" from
+    # ``Debug/noisy_rho_audit_2026_05_16.md §5 #1``: negative or near-zero
+    # ρ buckets inject reverse / random gradient into the comparator.
+    # Clean buckets are NEVER filtered — only noisy.  No-op when the ρ
+    # map is empty (e.g. clean-only runs, or runs predating the ρ
+    # persistence change).
+    if noisy_rho_map and float(noisy_rho_threshold) > 0:
+        by_group, filt = _filter_noisy_buckets_by_rho(
+            by_group, noisy_rho_map, float(noisy_rho_threshold),
+        )
+        logger.info(
+            "[split] noisy-ρ filter (threshold=%.3f): kept %d noisy bucket(s), "
+            "dropped %d, %d had no ρ — est. %d noisy pairs removed",
+            float(noisy_rho_threshold),
+            filt["kept"], filt["dropped"], filt["no_rho"],
+            filt["dropped_pair_count_est"],
+        )
+        for task_id, wid, rho in filt["dropped_buckets"]:
+            logger.info(
+                "[split]   DROP noisy %s  (window=%s, ρ=%+.3f < %.3f)",
+                task_id, wid, rho, float(noisy_rho_threshold),
+            )
 
     train_pairs: List[Dict] = []
     valid_pairs: List[Dict] = []
@@ -530,6 +665,12 @@ def _train_one_stage(
     # the BCE on a balanced symmetric pair set is exactly ln(2) ≈ 0.693.
     # We flag epochs whose valid BCE sits inside [ln2 - eps, ln2 + eps].
     plateau_eps         = float(config.get("plateau_eps", 0.02))
+    # Noisy-bucket quality filter knobs (see _filter_noisy_buckets_by_rho).
+    # ``noisy_rho_map`` is the {window_id: ρ} dict loaded from
+    # ``seeds_meta.json`` by ``run_pretrain_comparator.py``.  Empty / 0.0
+    # threshold ⇒ no filtering (preserves old behaviour).
+    noisy_rho_map       = config.get("noisy_rho_map") or {}
+    noisy_rho_threshold = float(config.get("noisy_rho_threshold", 0.0))
 
     comparator.train()
 
@@ -538,6 +679,8 @@ def _train_one_stage(
         seeds, task_features,
         valid_gap_threshold=valid_gap_threshold,
         valid_sources=list(valid_sources) if valid_sources else None,
+        noisy_rho_map=noisy_rho_map,
+        noisy_rho_threshold=noisy_rho_threshold,
     )
     if not train_pairs:
         logger.warning("[%s] No train pairs — skipping stage.", stage_name)
@@ -782,6 +925,14 @@ def pretrain_comparator(
             - ``sanity_skip`` (bool, False): bypass the P0-3 gate (only
               for ablation runs that intentionally want to save a
               chance-level comparator).
+            - ``noisy_rho_threshold`` (float, 0.0): noisy-bucket quality
+              floor.  Noisy ``(task_id, "noisy")`` buckets whose sub-task
+              ρ(noisy, clean) on the shared-head overlap < this value are
+              dropped from training pairs.  0.0 disables (no-op);
+              ``Debug/noisy_rho_audit_2026_05_16.md §5 #1`` recommends 0.3.
+            - ``noisy_rho_map`` (dict[str, float], {}): ``{window_id: ρ}``
+              read from ``seeds_meta.json``.  Required for the filter to
+              do anything; empty disables.
 
         comparator: Optional pre-constructed comparator.  When ``None`` a
             fresh :class:`TCLSC` with ``hidden_dim`` from *config* is built.
