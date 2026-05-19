@@ -231,7 +231,16 @@ comparator:
   lr: 0.00003               # 3e-5 (was 1e-4)
   weight_decay: 0.001       # 1e-3 — typical Adam wd; set 0 to disable
   batch_size: 64
-  hidden_dim: 128
+  # Rev 2026-05-19 — hidden_dim 128 → 64 (P2-7 step 3).  After step 1 (PMA
+  # k=1→4) + step 2 (drop seq_len mean-pool, n_inducing 16→64) the total
+  # TCLSC parameter count had grown ~330k → 583k while the supervisory
+  # signal stayed at 48 distinct training tasks; the resulting comparator
+  # anti-learned at ep 1 (valid BCE 0.7103 > random 0.6931) and was
+  # rejected by the P0-3 sanity gate.  Halving hidden_dim brings total
+  # params to ~190k — below the original architecture's 330k — while
+  # preserving the 1+2 attention-side expressivity (k=4 PMA seeds and the
+  # 12×-larger token stream remain untouched).
+  hidden_dim: 64
 
   # Rev 2026-05-16 — hold-out switched from ExchangeRate to ETTm2 after
   # the 2026-05-13 run revealed two compounding issues that produced a

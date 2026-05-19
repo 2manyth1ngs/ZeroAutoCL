@@ -65,9 +65,13 @@ class _SetTaskFeatureEncoder(nn.Module):
     Args:
         repr_dim: Per-element repr dim ``D``.
         hidden_dim: Output dim ``H`` (the comparator's hidden size).
-        n_inducing: ISAB inducing-point count.  Default bumped 16→64 to keep
-            roughly the same token/inducing-point ratio after step-2's 12×
-            token-count expansion.
+        n_inducing: ISAB inducing-point count.  Rev 2026-05-19 (P2-7 step 3):
+            64 → 32 to halve attention capacity in tandem with hidden_dim
+            128 → 64; the 1+2-only run anti-learned at ep 1 because the
+            combined attention expressivity outran the 48-task supervisory
+            signal.  32 inducing points on 1200 tokens still gives a
+            healthier token/inducing ratio (~38) than the pre-1+2 baseline
+            (100 tokens / 16 inducing = ~6).
         n_heads:    Multihead-attention heads.
     """
 
@@ -75,7 +79,7 @@ class _SetTaskFeatureEncoder(nn.Module):
         self,
         repr_dim: int,
         hidden_dim: int,
-        n_inducing: int = 64,
+        n_inducing: int = 32,
         n_heads: int = 4,
     ) -> None:
         super().__init__()
