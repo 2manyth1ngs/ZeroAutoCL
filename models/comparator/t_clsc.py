@@ -52,16 +52,22 @@ from .task_feature import TASK_FEATURE_DIM
 class _SetTaskFeatureEncoder(nn.Module):
     """Encode a (N_set, seq_len, D) task feature tensor into a (H,) vector.
 
-    Pipeline:
-      1. Mean-pool over ``seq_len`` → ``(N_set, D)``.
-      2. Add batch dim → ``(1, N_set, D)``.
-      3. :class:`SetTransformerEncoder` (ISAB×2 → PMA(k=1) → Linear) → ``(1, H)``.
+    Pipeline (post-2026-05-19, P2-7 step 2):
+      1. Flatten ``(N_set, seq_len, D)`` → ``(N_set * seq_len, D)`` so every
+         time-step contributes its own token to the SetTransformer (was:
+         seq_len mean-pool, which discarded intra-window structure and was a
+         primary suspect for the z_task cluster-collapse observed in
+         ``Debug/p2_7_z_task_cosine_verify.py`` on the post-filter run).
+      2. Add batch dim → ``(1, N_set * seq_len, D)``.
+      3. :class:`SetTransformerEncoder` (ISAB×2 → PMA(k=4) → Linear) → ``(1, H)``.
       4. Squeeze → ``(H,)``.
 
     Args:
         repr_dim: Per-element repr dim ``D``.
         hidden_dim: Output dim ``H`` (the comparator's hidden size).
-        n_inducing: ISAB inducing-point count.
+        n_inducing: ISAB inducing-point count.  Default bumped 16→64 to keep
+            roughly the same token/inducing-point ratio after step-2's 12×
+            token-count expansion.
         n_heads:    Multihead-attention heads.
     """
 
@@ -69,7 +75,7 @@ class _SetTaskFeatureEncoder(nn.Module):
         self,
         repr_dim: int,
         hidden_dim: int,
-        n_inducing: int = 16,
+        n_inducing: int = 64,
         n_heads: int = 4,
     ) -> None:
         super().__init__()
@@ -86,22 +92,22 @@ class _SetTaskFeatureEncoder(nn.Module):
 
         Args:
             x: Shape ``(N_set, seq_len, D)``.  A 2-d ``(N_set, D)`` tensor is
-               also accepted (skips the seq_len pooling step) for cases where
-               the caller has already pooled.
+               also accepted (treats N_set rows as the token sequence) so
+               callers that pre-pooled seq_len still work.
 
         Returns:
             Shape ``(hidden_dim,)``.
         """
         if x.dim() == 3:
-            z = x.mean(dim=-2)        # (N_set, D)
+            z = x.reshape(-1, x.shape[-1])    # (N_set * seq_len, D)
         elif x.dim() == 2:
-            z = x                      # (N_set, D)
+            z = x                              # (N_set, D)
         else:
             raise ValueError(
                 f"_SetTaskFeatureEncoder expects (N_set, seq_len, D) or "
                 f"(N_set, D); got {tuple(x.shape)}",
             )
-        z = z.unsqueeze(0)             # (1, N_set, D)
+        z = z.unsqueeze(0)             # (1, n_tokens, D)
         return self.set_encoder(z).squeeze(0)   # (hidden_dim,)
 
 

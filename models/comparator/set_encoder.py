@@ -2,8 +2,8 @@
 
 Simplified implementation with:
   - 2 ISAB (Induced Set Attention Block) layers, *m* inducing points each
-  - 1 PMA  (Pooling by Multihead Attention)  layer, *k* = 1 seed vector
-  - Output: fixed-size vector of dimension *d_out*
+  - 1 PMA  (Pooling by Multihead Attention)  layer, *k* = 4 seed vectors
+  - Concat the *k* PMA outputs, then project to dimension *d_out*
 
 Since the task feature extractor already computes fixed-dimension statistics,
 a plain MLP fallback is also provided (``SetTransformerEncoder.from_fixed``).
@@ -77,7 +77,7 @@ class SetTransformerEncoder(nn.Module):
 
     Architecture::
 
-        input_proj → ISAB(m) → ISAB(m) → PMA(k=1) → squeeze → output_proj
+        input_proj → ISAB(m) → ISAB(m) → PMA(k=4) → flatten → output_proj
 
     Args:
         d_in: Dimension of each input vector in the set.
@@ -85,6 +85,10 @@ class SetTransformerEncoder(nn.Module):
         d_hidden: Hidden dimension used throughout the transformer blocks.
         n_inducing: Number of inducing points *m* in each ISAB.
         n_heads: Number of attention heads.
+        n_pma_seeds: Number of PMA seed vectors *k* (default 4).  Each seed
+            attends over the encoded set with its own query, so k>1 lets
+            different aspects of the set drive different output components.
+            The k seeds are concatenated before ``output_proj``.
     """
 
     def __init__(
@@ -94,14 +98,16 @@ class SetTransformerEncoder(nn.Module):
         d_hidden: int = 128,
         n_inducing: int = 16,
         n_heads: int = 4,
+        n_pma_seeds: int = 4,
     ) -> None:
         super().__init__()
 
+        self.n_pma_seeds = n_pma_seeds
         self.input_proj = nn.Linear(d_in, d_hidden)
         self.isab1 = _ISAB(d_hidden, n_inducing, n_heads)
         self.isab2 = _ISAB(d_hidden, n_inducing, n_heads)
-        self.pma = _PMA(d_hidden, k=1, n_heads=n_heads)
-        self.output_proj = nn.Linear(d_hidden, d_out)
+        self.pma = _PMA(d_hidden, k=n_pma_seeds, n_heads=n_heads)
+        self.output_proj = nn.Linear(d_hidden * n_pma_seeds, d_out)
 
     def forward(self, x: Tensor) -> Tensor:
         """Encode a set of vectors.
@@ -116,8 +122,8 @@ class SetTransformerEncoder(nn.Module):
         h = self.input_proj(x)          # (B, N, d_hidden)
         h = self.isab1(h)               # (B, N, d_hidden)
         h = self.isab2(h)               # (B, N, d_hidden)
-        h = self.pma(h)                 # (B, 1, d_hidden)
-        h = h.squeeze(1)                # (B, d_hidden)
+        h = self.pma(h)                 # (B, k, d_hidden)
+        h = h.flatten(start_dim=1)      # (B, k * d_hidden)
         return self.output_proj(h)      # (B, d_out)
 
     @classmethod
