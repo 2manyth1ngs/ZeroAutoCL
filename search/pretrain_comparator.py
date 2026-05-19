@@ -625,6 +625,7 @@ def _train_one_stage(
     comparator: TCLSC,
     config: Dict,
     device: torch.device,
+    save_path: Optional[str] = None,
 ) -> TCLSC:
     """Train *comparator* over *seeds* and load best-by-valid weights.
 
@@ -801,6 +802,22 @@ def _train_one_stage(
                 best_state = copy.deepcopy(comparator.state_dict())
                 best_epoch = epoch + 1
                 patience_counter = 0
+                # Rev 2026-05-19 — persist best weights to disk on every
+                # improvement.  Previously the only save was at the end of
+                # ``pretrain_comparator`` after the P0-3 sanity gate, so a
+                # run that never beat ln(2) lost all weights even though
+                # the in-memory best_state was perfectly usable for
+                # diagnostics (z_task_cosine_verify, Phase 4 trial runs).
+                # Saving here means save_path always contains the current
+                # best — newer bests overwrite older ones.
+                if save_path is not None:
+                    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+                    torch.save(best_state, save_path)
+                    logger.info(
+                        "[%s] ep %3d  saved best weights to %s "
+                        "(valid loss %.4f)",
+                        stage_name, epoch + 1, save_path, v_loss,
+                    )
             else:
                 patience_counter += 1
 
@@ -961,39 +978,58 @@ def pretrain_comparator(
 
     comparator = _train_one_stage(
         seeds, task_features, comparator, config, device,
+        save_path=save_path,
     )
 
     # ── P0-3 sanity gate ─────────────────────────────────────────────
     # A comparator whose best valid BCE never escaped the ln(2) random-
-    # baseline plateau is downstream-useless: zero_shot_search would just
-    # produce noise rankings.  Refuse to save such weights so the user
-    # gets a loud failure rather than a silent regression.  The threshold
-    # ``ln(2) − sanity_eps`` mirrors the per-epoch plateau marker — if the
-    # log already screams "[≈ random]" for the best epoch, the gate fires.
+    # baseline plateau is unreliable for downstream zero-shot search.
+    # Rev 2026-05-19 — softened from hard RuntimeError to a loud WARNING.
+    # Rationale: ``_train_one_stage`` now persists best-by-valid weights to
+    # ``save_path`` on every improvement (see the new ``torch.save`` block
+    # inside the train loop), so the best comparator is always on disk
+    # regardless of whether it crossed the sanity threshold.  Refusing to
+    # save here would no longer prevent garbage weights from being used
+    # downstream — it would just delete the only diagnostic artefact we
+    # have for figuring out *why* a run failed to learn.
     #
-    # Override via ``config["sanity_skip"] = True`` (escape hatch for
-    # ablation / diagnostic runs where you WANT to save a random model).
+    # Override via ``config["sanity_skip"] = True`` to silence the warning
+    # entirely (e.g. for ablation runs that intentionally save a
+    # chance-level comparator).
     sanity_eps  = float(config.get("sanity_eps", 0.02))
     sanity_skip = bool(config.get("sanity_skip", False))
     best_valid  = getattr(comparator, "_best_valid_loss", float("inf"))
-    if not sanity_skip and best_valid >= RANDOM_BASELINE_BCE - sanity_eps:
-        raise RuntimeError(
-            f"[P0-3 sanity gate] Comparator never beat random: "
-            f"best_valid_loss = {best_valid:.4f} >= "
-            f"ln(2) - {sanity_eps} = {RANDOM_BASELINE_BCE - sanity_eps:.4f}.  "
-            f"Refusing to save weights — downstream zero-shot search would be "
-            f"noise.  Diagnose via the per-source / per-stage breakdown in "
-            f"the training log and rerun, or pass config['sanity_skip']=True "
-            f"to bypass (e.g. for ablation runs).",
+    sanity_failed = (
+        not sanity_skip
+        and best_valid >= RANDOM_BASELINE_BCE - sanity_eps
+    )
+    if sanity_failed:
+        logger.warning(
+            "[P0-3 sanity gate] Comparator never beat random: "
+            "best_valid_loss = %.4f >= ln(2) - %.3f = %.4f.  Weights have "
+            "still been saved (see the per-epoch '[pretrain] ep N saved "
+            "best weights' lines) so you can diagnose via "
+            "Debug/p2_7_z_task_cosine_verify.py or run a trial Phase 4, "
+            "but treat any downstream ranking as untrustworthy until the "
+            "training log shows valid BCE < %.4f.",
+            best_valid, sanity_eps, RANDOM_BASELINE_BCE - sanity_eps,
+            RANDOM_BASELINE_BCE - sanity_eps,
         )
 
     if save_path is not None:
+        # The per-epoch save inside ``_train_one_stage`` already wrote the
+        # best weights to ``save_path``; this end-of-run write is a no-op
+        # in the common case (same bytes) but kept for the edge case where
+        # the train loop exited before any improvement was recorded (in
+        # which case the in-training save never fired and we still want
+        # *something* on disk for inspection).
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         torch.save(comparator.state_dict(), save_path)
         logger.info(
             "Saved comparator weights to %s  (best_valid_loss=%.4f, "
-            "gap to ln 2 = %+.4f)",
+            "gap to ln 2 = %+.4f%s)",
             save_path, best_valid, best_valid - RANDOM_BASELINE_BCE,
+            "  [SANITY GATE TRIPPED — see warning above]" if sanity_failed else "",
         )
 
     return comparator

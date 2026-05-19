@@ -52,26 +52,25 @@ from .task_feature import TASK_FEATURE_DIM
 class _SetTaskFeatureEncoder(nn.Module):
     """Encode a (N_set, seq_len, D) task feature tensor into a (H,) vector.
 
-    Pipeline (post-2026-05-19, P2-7 step 2):
-      1. Flatten ``(N_set, seq_len, D)`` → ``(N_set * seq_len, D)`` so every
-         time-step contributes its own token to the SetTransformer (was:
-         seq_len mean-pool, which discarded intra-window structure and was a
-         primary suspect for the z_task cluster-collapse observed in
-         ``Debug/p2_7_z_task_cosine_verify.py`` on the post-filter run).
-      2. Add batch dim → ``(1, N_set * seq_len, D)``.
+    Pipeline (post-2026-05-19, P2-7 step-2 revert):
+      1. Mean-pool over ``seq_len`` → ``(N_set, D)``.  Earlier P2-7 step 2
+         removed this pool and fed all ``N_set * seq_len ≈ 1200`` tokens to
+         the SetTransformer; with only 48 distinct training tasks the
+         attention found per-token spurious patterns that anti-generalised
+         to the ETTm2 hold-out (ep 1 valid BCE 0.6995-0.7103, ρ < 0.12, see
+         training logs 2026-05-19).  Reverting step 2 keeps token count at
+         100 and preserves steps 1 (PMA k=4) + 3 (hidden_dim 64), which
+         together still address z_task cluster-collapse but without the
+         token-blowup overfit.
+      2. Add batch dim → ``(1, N_set, D)``.
       3. :class:`SetTransformerEncoder` (ISAB×2 → PMA(k=4) → Linear) → ``(1, H)``.
       4. Squeeze → ``(H,)``.
 
     Args:
         repr_dim: Per-element repr dim ``D``.
         hidden_dim: Output dim ``H`` (the comparator's hidden size).
-        n_inducing: ISAB inducing-point count.  Rev 2026-05-19 (P2-7 step 3):
-            64 → 32 to halve attention capacity in tandem with hidden_dim
-            128 → 64; the 1+2-only run anti-learned at ep 1 because the
-            combined attention expressivity outran the 48-task supervisory
-            signal.  32 inducing points on 1200 tokens still gives a
-            healthier token/inducing ratio (~38) than the pre-1+2 baseline
-            (100 tokens / 16 inducing = ~6).
+        n_inducing: ISAB inducing-point count.  Back to 16 (was 32 under the
+            step-2 token expansion) — 100 tokens don't need more.
         n_heads:    Multihead-attention heads.
     """
 
@@ -79,7 +78,7 @@ class _SetTaskFeatureEncoder(nn.Module):
         self,
         repr_dim: int,
         hidden_dim: int,
-        n_inducing: int = 32,
+        n_inducing: int = 16,
         n_heads: int = 4,
     ) -> None:
         super().__init__()
@@ -96,22 +95,22 @@ class _SetTaskFeatureEncoder(nn.Module):
 
         Args:
             x: Shape ``(N_set, seq_len, D)``.  A 2-d ``(N_set, D)`` tensor is
-               also accepted (treats N_set rows as the token sequence) so
-               callers that pre-pooled seq_len still work.
+               also accepted (skips the seq_len pooling step) for cases where
+               the caller has already pooled.
 
         Returns:
             Shape ``(hidden_dim,)``.
         """
         if x.dim() == 3:
-            z = x.reshape(-1, x.shape[-1])    # (N_set * seq_len, D)
+            z = x.mean(dim=-2)        # (N_set, D)
         elif x.dim() == 2:
-            z = x                              # (N_set, D)
+            z = x                      # (N_set, D)
         else:
             raise ValueError(
                 f"_SetTaskFeatureEncoder expects (N_set, seq_len, D) or "
                 f"(N_set, D); got {tuple(x.shape)}",
             )
-        z = z.unsqueeze(0)             # (1, n_tokens, D)
+        z = z.unsqueeze(0)             # (1, N_set, D)
         return self.set_encoder(z).squeeze(0)   # (hidden_dim,)
 
 
