@@ -272,6 +272,7 @@ def main() -> None:
         min_window_len, var_size_rates, min_var_count,
     )
 
+    fcv = variants_cfg
     seeds = generate_seeds(
         source_datasets=args.datasets,
         data_dir=args.data_dir,
@@ -295,6 +296,9 @@ def main() -> None:
         min_var_count=min_var_count,
         n_noisy_per_dataset=n_noisy_per_dataset,
         noisy_pretrain_iters=noisy_pretrain_iters,
+        use_random_time_windows=bool(fcv.get("use_random_time_windows", False)),
+        max_overlap_ratio=float(fcv.get("max_overlap_ratio", 0.7)),
+        time_window_params=fcv.get("time_window_params"),
     )
 
     logger.info("Done — generated %d seed records.", len(seeds))

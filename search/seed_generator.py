@@ -130,6 +130,7 @@ def _evaluate_candidate(
     pretrain_iters: int = 0,
     horizon_groups: Optional[List[Optional[List[int]]]] = None,
     eval_horizons: Optional[List[int]] = None,
+    n_eval_checkpoints: int = 1,
 ) -> List[float]:
     """Train one candidate and return its validation performance(s).
 
@@ -141,6 +142,11 @@ def _evaluate_candidate(
         horizon_groups: When the task is forecasting, evaluate the trained
             encoder once per horizon list and return a perf score per group.
             ``None`` (or ``[None]``) keeps the legacy single-eval behaviour.
+        n_eval_checkpoints: Number of evenly-spaced checkpoints at which to
+            evaluate the encoder during pretraining.  When > 1, the best
+            (max) performance across all checkpoints is returned per horizon
+            group (best-of-N labeling for the noisy stage).  Default 1
+            preserves the existing single-shot end-of-training evaluation.
 
     Returns:
         List of perf values, one per horizon group (always length 1 for
@@ -165,6 +171,55 @@ def _evaluate_candidate(
         "batch_size":      batch_size,
     }
 
+    if n_eval_checkpoints <= 1:
+        # ── Single-shot path (clean stage, unchanged) ──
+        try:
+            contrastive_pretrain(
+                encoder=encoder,
+                cl_pipeline=pipeline,
+                train_data=train_dataset,
+                config=cfg,
+                device=device,
+                task_type=task_type,
+                val_data=None,
+                horizons=eval_horizons,
+            )
+        except Exception as exc:                           # pragma: no cover
+            logger.warning("contrastive_pretrain failed for candidate: %s", exc)
+            return [-1e9] * n_groups
+
+        # When the dataset has a per-source ``eval_horizons`` override (e.g.
+        # PEMS07's [24, 48, 168] to dodge the H=720 CPU OOM), substitute it for
+        # the default-sentinel ``None`` group.  Explicit horizon groups from
+        # ``forecasting_task_variants.horizon_groups`` win — the user's request
+        # is always honoured.
+        encoder.eval()
+        perfs: List[float] = []
+        for hg in horizon_groups:
+            eval_hg = hg if hg is not None else eval_horizons
+            perf = _quick_eval(
+                encoder, train_dataset, val_dataset, task_type, device,
+                horizons=eval_hg,
+            )
+            perfs.append(perf)
+        return perfs
+
+    # ── Best-of-N path (noisy stage, new) ──
+    # eval_callback fires every eval_every steps; we record per-horizon-group
+    # perf at each fire and return max over checkpoints (= argmin MAE, matching
+    # AutoCTS++ best-of-5-epoch).
+    eval_every = max(1, pretrain_iters // n_eval_checkpoints)
+    checkpoint_perfs: List[List[float]] = [[] for _ in horizon_groups]
+
+    def _eval_cb(enc: DilatedCNNEncoder, step: int) -> None:
+        for hg_idx, hg in enumerate(horizon_groups):
+            eval_hg = hg if hg is not None else eval_horizons
+            perf = _quick_eval(
+                enc, train_dataset, val_dataset, task_type, device,
+                horizons=eval_hg,
+            )
+            checkpoint_perfs[hg_idx].append(perf)
+
     try:
         contrastive_pretrain(
             encoder=encoder,
@@ -175,26 +230,25 @@ def _evaluate_candidate(
             task_type=task_type,
             val_data=None,
             horizons=eval_horizons,
+            eval_callback=_eval_cb,
+            eval_every=eval_every,
         )
-    except Exception as exc:                           # pragma: no cover
-        logger.warning("contrastive_pretrain failed for candidate: %s", exc)
+    except Exception as exc:
+        logger.warning("contrastive_pretrain (best-of-N) failed: %s", exc)
         return [-1e9] * n_groups
 
-    # When the dataset has a per-source ``eval_horizons`` override (e.g.
-    # PEMS07's [24, 48, 168] to dodge the H=720 CPU OOM), substitute it for
-    # the default-sentinel ``None`` group.  Explicit horizon groups from
-    # ``forecasting_task_variants.horizon_groups`` win — the user's request
-    # is always honoured.
-    encoder.eval()
-    perfs: List[float] = []
-    for hg in horizon_groups:
-        eval_hg = hg if hg is not None else eval_horizons
-        perf = _quick_eval(
-            encoder, train_dataset, val_dataset, task_type, device,
-            horizons=eval_hg,
-        )
-        perfs.append(perf)
-    return perfs
+    # If callback never fired (training crashed before first checkpoint),
+    # fall back to single eval at the end.
+    if not checkpoint_perfs[0]:
+        encoder.eval()
+        return [
+            _quick_eval(encoder, train_dataset, val_dataset, task_type,
+                        device, horizons=(hg if hg is not None else eval_horizons))
+            for hg in horizon_groups
+        ]
+
+    # max over N checkpoints — perf is "higher is better" (negated MAE).
+    return [max(cp) for cp in checkpoint_perfs]
 
 
 def _quick_eval(
@@ -308,6 +362,9 @@ def generate_seeds(
     min_var_count: int = 4,
     n_noisy_per_dataset: int = 0,
     noisy_pretrain_iters: int = 100,
+    use_random_time_windows: bool = False,
+    max_overlap_ratio: float = 0.7,
+    time_window_params: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> List[SeedRecord]:
     """Generate seed data across source datasets.
 
@@ -331,9 +388,12 @@ def generate_seeds(
             gives the comparator dense task-conditional supervision: each
             shared config appears in ``len(source_datasets) × n_sub_tasks``
             (task, perf) cells, training the task-feature head to recognise
-            how the same config's rank shifts across tasks.  Clamped to
-            ``[0, n_per_dataset]``.  ``0`` (default) preserves the old
-            independent per-source pool behaviour.
+            how the same config's rank shifts across tasks.  Clamped to the
+            minimum positive stage budget across ``[n_per_dataset,
+            n_noisy_per_dataset]`` — a stage with budget 0 (e.g. clean
+            disabled in noisy-only mode) does NOT constrain the shared pool.
+            ``0`` (default) preserves the old independent per-source pool
+            behaviour.
         source_global_idx_offset: Per-source ds-index offset for SLURM
             job-array fan-out.  When seed generation is split across an
             array (one source per task), each task's local ``ds_idx`` is
@@ -461,8 +521,20 @@ def generate_seeds(
     # head of the candidate list.  Re-seeding off the base ``seed`` makes
     # the shared pool reproducible regardless of whether downstream
     # per-source pools or per-candidate seeds advance the global RNG.
-    n_shared = max(0, min(int(n_shared), int(n_per_dataset)))
-    n_random = n_per_dataset - n_shared
+    # L-share clamp — shared pool must fit within EVERY active stage.
+    # A stage with budget == 0 (e.g. clean stage disabled in noisy-only
+    # mode per AutoCTS++ alignment) does NOT constrain the shared pool
+    # size; without this guard, the legacy clamp ``min(n_shared,
+    # n_per_dataset)`` would zero out the shared pool whenever clean is
+    # disabled, silently breaking AutoCTS++ Algorithm 1's L-share
+    # mechanism (paper §3.2.x: |S0| = L shared arch-hypers across all
+    # tasks + |Si| = L random per task).
+    clean_budget = int(n_per_dataset)
+    noisy_budget = int(n_noisy_per_dataset)
+    active_budgets = [b for b in (clean_budget, noisy_budget) if b > 0]
+    upper = min(active_budgets) if active_budgets else 0
+    n_shared = max(0, min(int(n_shared), upper))
+    n_random = max(0, clean_budget - n_shared)
     if n_shared > 0:
         set_seed(seed)
         if fixed_encoders is not None:
@@ -470,7 +542,8 @@ def generate_seeds(
         else:
             shared_candidates = batch_sample_candidates(n_shared)
         logger.info(
-            "[generate_seeds] L-share enabled: %d shared + %d random per source",
+            "[generate_seeds] L-share enabled: %d shared (AutoCTS++ |S0|=L)"
+            " — applied to noisy stage head; clean stage gets %d random per source",
             n_shared, n_random,
         )
     else:
@@ -581,6 +654,9 @@ def generate_seeds(
             var_size_rates=var_size_rates,
             min_var_count=min_var_count,
             var_subset_seed=seed,
+            use_random_time_windows=use_random_time_windows,
+            max_overlap_ratio=max_overlap_ratio,
+            random_window_params=(time_window_params or {}).get(ds_name),
         )
         logger.info(
             "[dataset %d/%d] %s expanded into %d sub-task(s)",
@@ -727,10 +803,15 @@ def generate_seeds(
 
         ds_iters  = int(ds_budget.get("pretrain_iters", 0))
         ds_epochs = int(ds_budget.get("pretrain_epochs", pretrain_epochs))
+        # Per-source noisy iter override (T10 fix): adaptive_iter writes
+        # ``noisy_pretrain_iters`` into ``dataset_budgets`` per source.  When
+        # absent, fall back to the global ``noisy_pretrain_iters`` arg.
+        ds_noisy_iters = int(ds_budget.get("noisy_pretrain_iters", 0)) or int(noisy_pretrain_iters)
         if ds_iters > 0:
             logger.info("  budget: pretrain_iters=%d", ds_iters)
         else:
             logger.info("  budget: pretrain_epochs=%d", ds_epochs)
+        logger.info("  budget: noisy_pretrain_iters=%d", ds_noisy_iters)
 
         # Per-source candidate pool: cross-source L-share head (sampled
         # once before the loop, identical across every source) plus a
@@ -774,7 +855,27 @@ def generate_seeds(
             # below (does not affect seed records or downstream training).
             diag_clean_perfs: List[float] = []
 
-            if key_clean in completed_stages:
+            # AutoCTS++ noisy-only alignment: skip clean stage when
+            # ``n_per_dataset == 0``.  Clean labels for random archs were
+            # AutoCTS++ dead code (``mode='clean_seeds'`` never invoked); the
+            # only real clean training is Phase 4 retrain of top-K in
+            # run_phase4_finalists.py.  When clean is skipped the noisy stage
+            # still runs in full but the ρ diagnostic is skipped (nothing
+            # to compare against).
+            skip_clean = (int(n_per_dataset) == 0)
+            if skip_clean and key_clean not in completed_stages:
+                logger.info(
+                    "  [%s] sub-task %d/%d  clean stage SKIPPED "
+                    "(n_per_dataset=0)",
+                    ds_name, sub_idx + 1, len(sub_tasks),
+                )
+
+            if skip_clean:
+                # Mark the clean stage as a no-op so the checkpoint book-
+                # keeping stays consistent across resumes.  No records are
+                # emitted, no candidate seeds are consumed.
+                completed_stages.add(key_clean)
+            elif key_clean in completed_stages:
                 logger.info(
                     "  [%s] sub-task %d/%d  clean: cached, skipping (records "
                     "already in ds_seeds)",
@@ -902,7 +1003,7 @@ def generate_seeds(
                         "  [%s] sub-task %d/%d  noisy stage: %d candidates × "
                         "%d iters (shared=%d + random=%d)",
                         ds_name, sub_idx + 1, len(sub_tasks), noisy_n,
-                        int(noisy_pretrain_iters), n_shared, n_noisy_random,
+                        int(ds_noisy_iters), n_shared, n_noisy_random,
                     )
 
                     for i, (enc_cfg, strat_cfg) in enumerate(noisy_candidates):
@@ -925,9 +1026,10 @@ def generate_seeds(
                             task_type,
                             ds_epochs, pretrain_lr, batch_size,
                             device,
-                            pretrain_iters=int(noisy_pretrain_iters),
+                            pretrain_iters=int(ds_noisy_iters),
                             horizon_groups=sub.horizon_groups,
                             eval_horizons=ds_eval_horizons,
+                            n_eval_checkpoints=5,
                         )
                         cand_elapsed = time.time() - cand_start
 
@@ -1002,6 +1104,13 @@ def generate_seeds(
                             "rho on %d shared candidates = %+.3f  %s",
                             ds_name, sub_idx + 1, len(sub_tasks),
                             len(diag_clean_perfs), rho, verdict,
+                        )
+                    elif skip_clean:
+                        logger.info(
+                            "  [%s] sub-task %d/%d  noisy-vs-clean rho "
+                            "diagnostic skipped (clean stage disabled, "
+                            "n_per_dataset=0)",
+                            ds_name, sub_idx + 1, len(sub_tasks),
                         )
                     elif not clean_ran_this_invocation:
                         logger.info(

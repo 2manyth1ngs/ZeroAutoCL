@@ -260,6 +260,7 @@ def _split_seeds_and_pairs(
     valid_sources: Optional[List[str]] = None,
     noisy_rho_map: Optional[Dict[str, float]] = None,
     noisy_rho_threshold: float = 0.0,
+    noisy_only: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Build train / valid pair pools from raw seed records.
 
@@ -306,6 +307,12 @@ def _split_seeds_and_pairs(
             ``0.0`` keeps everything (no-op).  ``0.3`` reproduces the
             "WEAK/PASS only" filter recommended in
             ``Debug/noisy_rho_audit_2026_05_16.md §5 #1``.
+        noisy_only: AutoCTS++ alignment switch (rev 2026-05-20).  When
+            ``True``, drop all ``(task_id, "clean")`` buckets after the
+            initial grouping so the comparator trains exclusively on
+            noisy seeds — mirroring AutoCTS++'s AHC pipeline, where the
+            ``clean_seeds`` mode is dead code and never invoked.  Default
+            ``False`` preserves legacy two-stage (clean + noisy) mixing.
 
     Returns:
         ``(train_pairs, valid_pairs)`` — each a list of dicts compatible
@@ -319,6 +326,21 @@ def _split_seeds_and_pairs(
     by_group: Dict[Tuple[str, str], List[SeedRecord]] = {}
     for s in seeds:
         by_group.setdefault((s.task_id, s.stage), []).append(s)
+
+    # ── AutoCTS++ noisy-only alignment (rev 2026-05-20) ───────────────
+    # When ``noisy_only`` is set, drop all clean buckets so pair construction
+    # operates exclusively on stage="noisy" records.  This eliminates the
+    # (clean, noisy) two-stage mixing that doesn't exist in AutoCTS++'s
+    # pipeline (where AHC trains exclusively on noisy seeds).
+    if noisy_only:
+        before = len(by_group)
+        by_group = {k: v for k, v in by_group.items() if k[1] == "noisy"}
+        after = len(by_group)
+        logger.info(
+            "[split] noisy_only=True: dropped %d clean bucket(s), kept %d "
+            "noisy bucket(s)",
+            before - after, after,
+        )
 
     # ── Noisy-bucket quality filter ───────────────────────────────────
     # Drop noisy ``(task_id, "noisy")`` buckets whose sub-task ρ on the
@@ -672,6 +694,9 @@ def _train_one_stage(
     # threshold ⇒ no filtering (preserves old behaviour).
     noisy_rho_map       = config.get("noisy_rho_map") or {}
     noisy_rho_threshold = float(config.get("noisy_rho_threshold", 0.0))
+    # AutoCTS++ noisy-only alignment switch (rev 2026-05-20).  When True,
+    # drop all stage="clean" buckets from pair construction.
+    noisy_only          = bool(config.get("noisy_only", False))
 
     comparator.train()
 
@@ -682,6 +707,7 @@ def _train_one_stage(
         valid_sources=list(valid_sources) if valid_sources else None,
         noisy_rho_map=noisy_rho_map,
         noisy_rho_threshold=noisy_rho_threshold,
+        noisy_only=noisy_only,
     )
     if not train_pairs:
         logger.warning("[%s] No train pairs — skipping stage.", stage_name)
@@ -950,6 +976,10 @@ def pretrain_comparator(
             - ``noisy_rho_map`` (dict[str, float], {}): ``{window_id: ρ}``
               read from ``seeds_meta.json``.  Required for the filter to
               do anything; empty disables.
+            - ``noisy_only`` (bool, False): AutoCTS++ alignment switch.
+              When True, drop all stage="clean" buckets from pair
+              construction so the comparator trains exclusively on noisy
+              seeds (mirrors AutoCTS++ AHC pipeline).
 
         comparator: Optional pre-constructed comparator.  When ``None`` a
             fresh :class:`TCLSC` with ``hidden_dim`` from *config* is built.

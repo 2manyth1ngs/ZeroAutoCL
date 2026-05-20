@@ -79,6 +79,8 @@ def contrastive_pretrain(
     val_data: Optional[TimeSeriesDataset] = None,
     task_type: Optional[str] = None,
     horizons: Optional[List[int]] = None,
+    eval_callback=None,              # NEW: Callable[[encoder, int], None] | None
+    eval_every: Optional[int] = None,  # NEW: fire cadence (iters); required if callback set
 ) -> DilatedCNNEncoder:
     """Train *encoder* via contrastive learning.
 
@@ -137,7 +139,7 @@ def contrastive_pretrain(
     iters      = int(config.get("pretrain_iters", 0))
     lr         = float(config.get("pretrain_lr", config.get("lr", 1e-3)))
     batch_size = int(config.get("batch_size", 64))
-    eval_every = int(config.get("eval_every", 0))
+    eval_every_epoch = int(config.get("eval_every", 0))
     use_ema    = bool(config.get("use_ema", True))
     # Optimizer / gradient-clipping toggles.  Defaults preserve the original
     # ZeroAutoCL behaviour (Adam + clip_grad_norm 1.0) so existing callers
@@ -165,7 +167,7 @@ def contrastive_pretrain(
     #                          best-by-val pick the wrong epoch); on for
     #                          classification / anomaly detection.
     eval_enabled = (
-        eval_every > 0
+        eval_every_epoch > 0
         and val_data is not None
         and task_type is not None
     )
@@ -258,6 +260,19 @@ def contrastive_pretrain(
             n_batches += 1
             global_step += 1
 
+            # ── Periodic eval callback (Task 7 / best-of-N hook) ──
+            if (
+                eval_callback is not None
+                and eval_every is not None
+                and global_step > 0
+                and global_step % eval_every == 0
+            ):
+                encoder.eval()
+                try:
+                    eval_callback(encoder, global_step)
+                finally:
+                    encoder.train()
+
             if iter_mode and global_step >= iters:
                 stop = True
                 break
@@ -270,7 +285,7 @@ def contrastive_pretrain(
         # best state.  Forecasting keeps eval on (for logging) but val_best
         # off (because of train/val/test distribution drift).
         val_score: Optional[float] = None
-        if eval_enabled and ((epoch + 1) % eval_every == 0 or epoch == epochs - 1):
+        if eval_enabled and ((epoch + 1) % eval_every_epoch == 0 or epoch == epochs - 1):
             # When EMA is on, evaluate the AVERAGED weights (that's what
             # downstream code ultimately uses).  Swap them into encoder
             # temporarily, then restore the training weights so optimisation

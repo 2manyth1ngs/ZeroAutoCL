@@ -14,6 +14,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 seed_generation:
+  # ─── AutoCTS++ noisy-only alignment (rev 2026-05-20) ─────────────────────
+  # Clean stage disabled (n_per_dataset=0) — clean labels for random archs
+  # was AutoCTS++ dead code (`mode='clean_seeds'` never invoked).  The only
+  # clean-equivalent training is Phase 4 retraining of top-K searched archs
+  # via run_phase4_finalists.py (mirrors AutoCTS++ `mode='train'`).
+  #
   # Rev 2026-05-12 — noisy stage RE-INTRODUCED alongside hold-out-source
   # valid (see ``comparator.valid_sources`` below).  The previous removal
   # (P0 fix, 2026-04-29) blamed noisy labels for the BCE-stuck-at-ln(2)
@@ -25,8 +31,9 @@ seed_generation:
   # ``pretrain_comparator``, this configuration lifts per-task train pairs
   # from O(14²) to O((30+80)²) = 110² ≈ 12k pairs per (sub-task, stage),
   # roughly 50× the previous train-pool size.
-  n_per_dataset: 30         # CLEAN candidates per (source × sub-task);
-                            # full ``pretrain_iters`` budget per candidate.
+  n_per_dataset: 0          # CLEAN candidates per (source × sub-task); 0
+                            # disables the clean stage entirely (AutoCTS++
+                            # alignment, see header comment above).
   n_noisy_per_dataset: 80   # NOISY candidates per (source × sub-task);
                             # cheap ``noisy_pretrain_iters`` budget each.
                             # 0 disables the noisy stage (legacy behaviour).
@@ -46,7 +53,15 @@ seed_generation:
   # AutoCTS++ uses 1:1 (sample_num shared + sample_num random); we mirror
   # that by default.  ``0`` disables L-share (independent per-source
   # pools, the pre-2026-04-30 behaviour).
-  n_shared: 10
+  # L-share (AutoCTS++ Algorithm 1 + paper §3.2.x): n_shared archs are
+  # SAMPLED ONCE then appear at the head of EVERY source's noisy candidate
+  # list.  This forces the comparator's task-feature encoder to learn
+  # task-conditional ranking — the same arch seen on different tasks
+  # produces different perfs, so the difference MUST come from task
+  # encoding.  AutoCTS++ uses |S0| = |Si| = L (50/50 split); here with
+  # n_noisy_per_dataset=80, we set L=40 → 40 shared + 40 random per source.
+  # Strict alignment with AutoCTS++ Algorithm 1 (|S0|=|Si|=L=40).
+  n_shared: 40
   pretrain_epochs: 40       # fallback only (forecasting uses iter budgets)
   pretrain_lr: 0.001
   batch_size: 32
@@ -87,8 +102,30 @@ forecasting_task_variants:
   # source — roughly an order-of-magnitude more learning signal at the
   # cost of n_time_windows × n_variable_subsets more CL pretrain runs.
   n_time_windows: 3
-  horizon_groups: null
+  horizon_groups:
   min_window_len: 1000        # skip slicing when window < this many timesteps
+
+  # ── Time-window randomization (rev 2026-05-19) ───────────────────────────
+  # Replace fixed equal-length non-overlapping windows with random
+  # (start, length) sampling, gated by max_overlap_ratio rejection.
+  # When use_random_time_windows is false, legacy equal-length code path
+  # runs (back-compat).
+  use_random_time_windows: true
+  max_overlap_ratio: 0.7
+
+  # Per-source random-window params.  When use_random_time_windows is true
+  # and a source appears here, n_windows / min_len / max_len from this map
+  # override the top-level n_time_windows + min_window_len for that source.
+  time_window_params:
+    ETTh2: {n_windows: 6, min_len: 5800, max_len: 12000}
+    ETTm1: {n_windows: 15, min_len: 5800, max_len: 25000}
+    ETTm2: {n_windows: 15, min_len: 5800, max_len: 25000}
+    Solar: {n_windows: 6, min_len: 5800, max_len: 20000}
+    traffic: {n_windows: 6, min_len: 5800, max_len: 12000}
+    AQShunyi: {n_windows: 6, min_len: 5800, max_len: 25000}
+    AQWanliu: {n_windows: 12, min_len: 5800, max_len: 25000}
+    AQGuanyuan: {n_windows: 6, min_len: 5800, max_len: 25000}
+    ExchangeRate: {n_windows: 5, min_len: 4096, max_len: 7588}
 
   # Variable-subsampling axis (mirrors AutoCTS++ dataset_slice.py rate buckets,
   # minus the adjacency-matrix reconstruction — ZeroAutoCL's dilated CNN
@@ -107,6 +144,27 @@ forecasting_task_variants:
   #   • Narrow (ETT univariate, 1 var)    : 3 × 1 = 3 sub-tasks
   #     (variable subset axis silently disabled by min_var_count=4)
   #   • ExchangeRate (8 vars)             : 3 × 3 = 9 sub-tasks
+
+# ─── Adaptive iter formula (rev 2026-05-19) ──────────────────────────────
+# Per-source pretrain_iters / noisy_pretrain_iters computed from data scale
+# via log_clip formula:
+#
+#   T_eff = (random_window_params.min_len + max_len) / 2     # avg window length
+#   C_eff = mean(var subset sizes after stratified bucketing)
+#   scale = T_eff × C_eff / ref_T_C
+#   iter_clean = clip(base_iter × (1 + log2(scale)), clean_cap_min, clean_cap_max)
+#   iter_noisy = iter_clean × noisy_ratio
+#
+# Resolved values are written into ``dataset_budgets`` below by
+# ``scripts/compute_adaptive_iters.py``.  The cap (1200) keeps total compute
+# at ~Path 2 (4.81× current baseline ≈ 577 GPU-h).
+adaptive_iter:
+  formula: "log_clip"
+  base_iter: 600
+  ref_T_C: 5800              # ETTh2 sub-task (5800 × 1)
+  clean_cap_min: 600
+  clean_cap_max: 1200
+  noisy_ratio: 0.4           # Path 2 half-aligned (0.2 light / 0.6+ full AutoCTS++ align)
 
 # Per-dataset training budget (Bug #003a).
 #
@@ -151,9 +209,9 @@ dataset_budgets:
   # ─────────────────────────────────────────────────────────────────────────
 
   # ── Targets (3) — for Phase-4 retrain only, not seed-gen ─────────────────
-  ETTh1:        { pretrain_iters: 600 }
-  Electricity:  { pretrain_iters: 600 }
-  Weather:      { pretrain_iters: 600 }
+  ETTh1: {pretrain_iters: 600}
+  Electricity: {pretrain_iters: 600}
+  Weather: {pretrain_iters: 600}
 
   # ── ETT-family sources (3) — univariate ETT (1 raw var), so the
   #    variable-subset axis is auto-bypassed by ``min_var_count: 4`` and we
@@ -161,19 +219,19 @@ dataset_budgets:
   #    default of 3 (window 17400/3=5800, safely above RF=2047).  ETTm1/m2
   #    have ~4× the series length (69680 vs 17400) so we boost to 9 windows
   #    (each 7742 timesteps) without dipping below RF.
-  ETTh2:        { pretrain_iters: 600 }
-  ETTm1:        { pretrain_iters: 600, n_time_windows: 9 }
-  ETTm2:        { pretrain_iters: 600, n_time_windows: 9 }
+  ETTh2: {pretrain_iters: 971, noisy_pretrain_iters: 388}
+  ETTm1: {pretrain_iters: 1200, n_time_windows: 9, noisy_pretrain_iters: 480}
+  ETTm2: {pretrain_iters: 1200, n_time_windows: 9, noisy_pretrain_iters: 480}
 
   # ── Energy source (1) — 137 PV-plant channels, parallel sensors.
   #    Default 3×3 var subsetting at rates [0.25,0.5,0.75] gives 34/68/103
   #    plant subsets, all retain "many parallel solar farms" character.
-  Solar:        { pretrain_iters: 600 }
+  Solar: {pretrain_iters: 1200, noisy_pretrain_iters: 480}
 
   # ── Transport source (1) — 862 road-occupancy channels.  Default 3×3
   #    subsetting gives 215/431/646 sensor subsets, all retain "many
   #    parallel road sensors" character.  Window 17544/3=5848 safely > RF.
-  traffic:      { pretrain_iters: 600 }
+  traffic: {pretrain_iters: 1200, noisy_pretrain_iters: 480}
 
   # ── Atmospheric sources (3 Beijing PRSA stations) — 11 raw vars per
   #    station (6 pollutants + 5 meteorology).  Variable subsetting at 0.25
@@ -182,9 +240,12 @@ dataset_budgets:
   #    these datasets their characteristic dynamics.  Override
   #    ``n_variable_subsets: 1`` to keep the full 11 vars per sub-task.
   #    Window 35064/3=11688 — comfortably above RF.
-  AQShunyi:     { pretrain_iters: 600, n_variable_subsets: 1 }
-  AQWanliu:     { pretrain_iters: 600, n_variable_subsets: 1 }
-  AQGuanyuan:   { pretrain_iters: 600, n_variable_subsets: 1 }
+  AQShunyi: {pretrain_iters: 1200, n_variable_subsets: 1, noisy_pretrain_iters: 
+      480}
+  AQWanliu: {pretrain_iters: 1200, n_variable_subsets: 1, noisy_pretrain_iters: 
+      480}
+  AQGuanyuan: {pretrain_iters: 1200, n_variable_subsets: 1, noisy_pretrain_iters: 
+      480}
 
   # ── Finance source (1) — 8 currency pairs.  Default 3×3 subsetting gives
   #    2/4/6-currency baskets; the 2-currency floor is informationally
@@ -192,7 +253,7 @@ dataset_budgets:
   #    for narrow-source datasets.  Window 7588/3=2529 is just above RF
   #    (2047) — tight but functional.  Outlier values are handled by the
   #    StandardScaler in ``_load_exchange_rate``.
-  ExchangeRate: { pretrain_iters: 600 }
+  ExchangeRate: {pretrain_iters: 1200, noisy_pretrain_iters: 480}
   # ── Legacy / unused (kept here as documentation of the failed 2026-04
   #    12-source experiment that triggered the rev to this CL-aligned pool):
   #    PEMS03/04/07/08, PEMS-BAY, METR-LA, ILI.  Loaders still exist in
@@ -204,14 +265,14 @@ dataset_budgets:
   # wall-clock cost across datasets.  Phase 4 (run_phase4_finalists_cls.py)
   # reads only pretrain_epochs and ignores pretrain_iters, so it still uses
   # epoch-based training with val-best checkpointing as intended.
-  HAR:          { pretrain_iters: 600, pretrain_epochs: 40 }
-  Epilepsy:     { pretrain_iters: 600, pretrain_epochs: 40 }
-  SleepEEG:     { pretrain_iters: 600, pretrain_epochs: 40 }
-  Gesture:      { pretrain_iters: 600, pretrain_epochs: 40 }
-  NATOPS:       { pretrain_iters: 600, pretrain_epochs: 40 }
+  HAR: {pretrain_iters: 600, pretrain_epochs: 40}
+  Epilepsy: {pretrain_iters: 600, pretrain_epochs: 40}
+  SleepEEG: {pretrain_iters: 600, pretrain_epochs: 40}
+  Gesture: {pretrain_iters: 600, pretrain_epochs: 40}
+  NATOPS: {pretrain_iters: 600, pretrain_epochs: 40}
   # ── Anomaly detection (epoch-based) ──────────────────────────────────────
-  Yahoo:        { pretrain_epochs: 40 }
-  KPI:          { pretrain_epochs: 40 }
+  Yahoo: {pretrain_epochs: 40}
+  KPI: {pretrain_epochs: 40}
 
 comparator:
   # T-CLSC training config.  See search/pretrain_comparator.py for the
@@ -288,7 +349,20 @@ comparator:
   # train seeds away into a valid pool by z-score gap).  Not recommended
   # at scale — see ``random_search.py:502`` for the AutoCTS++ rationale
   # behind a held-out source.
-  valid_sources: [ETTm2]
+  #
+  # AutoCTS++ alignment: comparator trains on noisy buckets only.  valid
+  # hold-out switched to AQWanliu (mean ρ=0.76 — cleanest noisy source per
+  # the 2026-05-16 audit) — using ExchangeRate (mean ρ=0.27) as valid would
+  # have measured "fit to noise" rather than "predict ranking".
+  valid_sources: [AQWanliu]
+
+  # Rev 2026-05-20 — AutoCTS++ alignment: drop all stage='clean' buckets
+  # from train/valid pair construction.  Random-arch clean seeds were
+  # AutoCTS++ dead code (``mode='clean_seeds'`` never invoked by any shell
+  # script).  Combined with ``seed_generation.n_per_dataset=0`` above this
+  # makes the pipeline strictly noisy-only.  Set to ``false`` to restore
+  # legacy two-stage (clean + noisy) mixing.
+  noisy_only: true
 
   # Used only when ``valid_sources`` is empty (legacy mode).  Half-σ in
   # z-score units — kept for backwards compat with old small-scale runs.
@@ -306,7 +380,12 @@ comparator:
   # "genuinely not learning".  Flip back to False after the diagnostic
   # decision is made (and noisy quality is improved or noisy stage is
   # dropped from the offending source).
-  valid_clean_only: true
+  #
+  # Rev 2026-05-20 — forced to false since ``noisy_only: true`` above
+  # drops all stage='clean' buckets BEFORE this filter runs.  Leaving
+  # this true would empty the valid pool entirely (no clean records left
+  # to keep).  Re-enable only if reverting to clean+noisy mixing.
+  valid_clean_only: false
 
   # Plateau-detection half-width: valid-BCE inside ``ln(2) ± plateau_eps``
   # gets explicitly flagged as "≈ random" in the per-epoch log.  0.02 is
@@ -337,7 +416,12 @@ comparator:
   #   python scripts/merge_seed_checkpoints.py \
   #       --ckpt_dir <out>/seeds --log_dir <out>
   # to back-fill ρ from existing logs into the checkpoints, then re-merge.
-  noisy_rho_threshold: 0.3
+  #
+  # Rev 2026-05-20 — forced to 0 since the clean stage is disabled
+  # (``seed_generation.n_per_dataset=0``).  Without clean labels there is
+  # no ground truth to compute noisy↔clean ρ against, so the filter has
+  # no signal to act on.  Leaving the field for documentation.
+  noisy_rho_threshold: 0
 
   # Rev 2026-05-16 (b) — bumped to 20 earlier today to give a stuck-at-init
   # comparator more recovery time, then trimmed to 8 after run 44320

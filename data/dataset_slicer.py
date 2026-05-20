@@ -46,7 +46,7 @@ import logging
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -54,6 +54,80 @@ import torch
 from data.dataset import TimeSeriesDataset, load_dataset
 
 logger = logging.getLogger(__name__)
+
+
+def _iou(w1: Tuple[int, int], w2: Tuple[int, int]) -> float:
+    """Intersection-over-Union for two half-open [start, end) intervals.
+
+    Returns 0.0 when both intervals are empty (zero-length) — this keeps the
+    rejection-sampling caller robust against degenerate windows.
+    """
+    inter = max(0, min(w1[1], w2[1]) - max(w1[0], w2[0]))
+    union = (w1[1] - w1[0]) + (w2[1] - w2[0]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _sample_time_windows(
+    T_total: int,
+    n_windows: int,
+    min_len: int,
+    max_len: int,
+    max_overlap_ratio: float,
+    seed: int,
+    max_reject_attempts: int = 50,
+) -> List[Tuple[int, int]]:
+    """Sample *n_windows* (start, end) tuples with bounded pairwise IoU.
+
+    Mirrors ``reference/AutoCTS_plusplus/exps/dataset_slice.py``'s
+    ``random_sample`` with one addition: pairs that overlap by more than
+    ``max_overlap_ratio`` (IoU > floor) are rejected and resampled.  This
+    prevents windows from collapsing into near-duplicates of each other
+    while still allowing the controlled overlap that lets the comparator
+    see multi-scale variants of the same source.
+
+    Args:
+        T_total: Length of the source series.
+        n_windows: Number of windows to return.
+        min_len: Minimum window length (must be <= ``T_total``).
+        max_len: Maximum window length (clipped to ``T_total``).
+        max_overlap_ratio: Reject samples whose IoU with any already-accepted
+            window exceeds this floor.  ``1.0`` disables the rejection.
+        seed: RNG seed (deterministic).
+        max_reject_attempts: Per-window cap on rejection retries.  When
+            exhausted, the last sampled window is accepted with a warning
+            (graceful degradation rather than crashing).
+
+    Returns:
+        ``[(start_0, end_0), ..., (start_{n-1}, end_{n-1})]``, length
+        ``n_windows``, each in ``[0, T_total]``.
+    """
+    rng = np.random.default_rng(seed)
+    max_len_eff = min(max_len, T_total)
+    if min_len > max_len_eff:
+        raise ValueError(
+            f"_sample_time_windows: min_len={min_len} > max_len_eff={max_len_eff}"
+        )
+
+    accepted: List[Tuple[int, int]] = []
+    for w_idx in range(n_windows):
+        last_sample: Optional[Tuple[int, int]] = None
+        for attempt in range(max_reject_attempts):
+            length = int(rng.integers(min_len, max_len_eff + 1))
+            start = int(rng.integers(0, T_total - length + 1))
+            end = start + length
+            last_sample = (start, end)
+            if all(_iou(last_sample, w) <= max_overlap_ratio for w in accepted):
+                accepted.append(last_sample)
+                break
+        else:
+            logger.warning(
+                "_sample_time_windows: seed=%s window %d/%d rejected %d times "
+                "without finding IoU<=%.2f sample; accepting last attempt %s",
+                seed, w_idx + 1, n_windows, max_reject_attempts,
+                max_overlap_ratio, last_sample,
+            )
+            accepted.append(last_sample)
+    return accepted
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +363,9 @@ def make_forecasting_subtasks(
     var_size_rates: Optional[List[float]] = None,
     min_var_count: int = 4,
     var_subset_seed: int = 0,
+    use_random_time_windows: bool = False,
+    max_overlap_ratio: float = 0.7,
+    random_window_params: Optional[Dict[str, int]] = None,
 ) -> List[ForecastingSubTask]:
     """Expand a source dataset into multiple sub-tasks.
 
@@ -382,25 +459,51 @@ def make_forecasting_subtasks(
     T_total = full.shape[1]
     n_raw_vars = full.shape[2] - n_cov
 
-    # ── Resolve the time-window axis (start_end pairs + window indices) ─
-    use_windows = n_time_windows > 1
-    if use_windows:
-        seg_len = T_total // n_time_windows
-        if seg_len < min_window_len:
+    # ── Resolve the time-window axis ──
+    # New path: random (start, length) sampling with IoU rejection.
+    # Old path: fixed equal-length non-overlapping windows (legacy / back-compat).
+    if use_random_time_windows and random_window_params is not None:
+        rp = random_window_params
+        n_windows_req = int(rp.get("n_windows", n_time_windows))
+        min_len_req = int(rp.get("min_len", min_window_len))
+        max_len_req = int(rp.get("max_len", T_total))
+        if min_len_req > T_total:
             logger.warning(
-                "make_forecasting_subtasks: %s segment length (%d) < min "
-                "(%d); disabling time-window slicing for this source.",
-                name, seg_len, min_window_len,
+                "make_forecasting_subtasks: %s min_len=%d > T_total=%d; "
+                "falling back to single window.",
+                name, min_len_req, T_total,
             )
-            use_windows = False
-
-    if use_windows:
-        time_windows = [
-            (tw, tw * seg_len, tw * seg_len + seg_len)
-            for tw in range(n_time_windows)
-        ]
+            time_windows = [(None, 0, T_total)]
+        else:
+            sampled = _sample_time_windows(
+                T_total=T_total,
+                n_windows=n_windows_req,
+                min_len=min_len_req,
+                max_len=max_len_req,
+                max_overlap_ratio=max_overlap_ratio,
+                seed=var_subset_seed + hash(name) % (2**31),
+            )
+            time_windows = [(i, s, e) for i, (s, e) in enumerate(sampled)]
+        use_windows = len(time_windows) > 1
     else:
-        time_windows = [(None, 0, T_total)]
+        # ── Legacy equal-length path (unchanged) ──
+        use_windows = n_time_windows > 1
+        if use_windows:
+            seg_len = T_total // n_time_windows
+            if seg_len < min_window_len:
+                logger.warning(
+                    "make_forecasting_subtasks: %s segment length (%d) < min "
+                    "(%d); disabling time-window slicing for this source.",
+                    name, seg_len, min_window_len,
+                )
+                use_windows = False
+        if use_windows:
+            time_windows = [
+                (tw, tw * seg_len, tw * seg_len + seg_len)
+                for tw in range(n_time_windows)
+            ]
+        else:
+            time_windows = [(None, 0, T_total)]
 
     # ── Resolve the variable-subset axis ──────────────────────────────
     use_var_subsets = n_variable_subsets > 1
