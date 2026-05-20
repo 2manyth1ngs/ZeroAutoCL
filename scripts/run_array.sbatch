@@ -3,33 +3,41 @@
 #SBATCH --partition=gpu_spot
 #SBATCH --gpus=1
 #SBATCH --gpu-bind=closest
-# GPU pool (rev 2026-05-16, RESTRICTED TO 4090 ONLY):
+# GPU pool (rev 2026-05-20, 4090 + 3090):
 #
 # Eligible GPU on ``gpu_spot``:
-#   • ``nvidia_geforce_rtx_4090`` 24GB  CC 8.9   6 nodes × 1 GPU (g1n1-6)
+#   • ``nvidia_geforce_rtx_4090`` 24GB  CC 8.9   g1n[1-6]            6 × 1 GPU = 6
+#   • ``nvidia_geforce_rtx_3090`` 24GB  CC 8.6   g2n1 + g4n[1-2]     1×2 + 2×1 = 4
+#   Pool size: 10 GPUs.
 #
-# Excluded (intentionally — user request 2026-05-16):
-#   • A100  80GB CC 8.0   (vram80g but cc8.0 fails &cc8.9)
-#   • L40s  48GB CC 8.9   (cc8.9 OK but vram48g fails vram24g)
-#   • 3090  24GB CC 8.6   (vram24g OK but cc8.6 fails cc8.9)
+# Excluded (still — user request 2026-05-16):
+#   • A100  80GB CC 8.0   (vram80g != vram24g; also no cc8.6 feature)
+#   • L40s  48GB CC 8.9   (vram48g != vram24g)
 #
 # Constraint mechanism:
-#   ``--constraint=vram24g&cc8.9`` requires BOTH features.  Each node's
-#   features are exact-match strings; only 4090 carries both
-#   ``vram24g`` and ``cc8.9`` simultaneously.
+#   ``--constraint=vram24g&cc8.6`` requires BOTH features.  In this
+#   cluster, ``vram*`` features are exact-tier (vram24g != vram48g) but
+#   ``cc*`` features are cumulative on the same node — 4090 nodes
+#   advertise cc8.0, cc8.6 AND cc8.9 simultaneously (verified via
+#   ``sinfo -N -p gpu_spot -o "%n %f"`` on 2026-05-20).  So
+#   ``vram24g&cc8.6`` matches 4090 (CC 8.9 ⊃ cc8.6 feature) and 3090
+#   (CC 8.6 native), while excluding L40s (no vram24g) and A100 (no
+#   cc8.6 AND no vram24g).
 #
 # Concurrency implication:
-#   Only 6 × 4090 = 6 GPUs in the pool.  With ``--array=0-8%9`` the
-#   3 extra tasks will queue (PD state) until earlier ones release a
-#   slot — total wallclock rises by roughly 1.5× compared to the old
-#   18-GPU pool (was: 9 parallel ≈ slowest single source).  Drop to
-#   ``%6`` if you want all tasks always-running with no queueing
-#   wait (wallclock ≈ slowest single source again).  Kept at %9 here
-#   since seedgen checkpointing makes preemption-recovery cheap.
+#   10 GPUs in the pool.  With ``--array=0-8%9`` all 9 tasks can run in
+#   parallel when the pool is uncontended (wallclock ≈ slowest single
+#   source).  3090 fallback prevents the 2-of-6 4090-contention bottleneck
+#   observed on 2026-05-20 (4 of 6 4090 nodes were chronically allocated
+#   to other tenants, throttling us to 2 concurrent tasks).
+#
+# Rev 2026-05-20 change (user request): relaxed cc8.9 → cc8.6 to include
+# 3090.  L40s / A100 still excluded — those exclusions are vram-driven,
+# not cc-driven, so this loosening doesn't accidentally re-enable them.
 #
 # The ``nvidia-smi`` printout at job start (further down) confirms the
-# assigned GPU is a 4090.
-#SBATCH --constraint=vram24g&cc8.9
+# assigned GPU model.
+#SBATCH --constraint=vram24g&cc8.6
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -42,29 +50,42 @@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ZeroAutoCL — Stage B.1 (seed generation) parallelised across SLURM job array.
-# Rev 2026-05-10: 9-source CL-aligned pool + 3 targets (ETTh1, Electricity,
+# Rev 2026-05-20: 9-source CL-aligned pool + 3 targets (ETTh1, Electricity,
 # Weather).  ONCE STARTED, NO MANUAL OPS — the auto-chain in task 0 queues
 # the entire downstream pipeline (Stage T → B.2 → 3× (B.3 + Phase 4)).
 #
 # One array task per source dataset: each task does a full seed-gen run for
 # its own source and writes ``${SEEDS_DIR}/_seeds_<SRC>.json``.  9 tasks
-# total (``--array=0-8%9``), ALL concurrent — the 18-GPU pool on
+# total (``--array=0-8%9``), ALL concurrent — the 10-GPU pool (4090+3090) on
 # ``gpu_spot`` comfortably absorbs 9 simultaneous jobs (1 per source).
 #
-# Rev 2026-05-12 budget update — now runs BOTH a clean stage
-# (``n_per_dataset=30`` × 600 iters each) AND a noisy stage
-# (``n_noisy_per_dataset=80`` × 100 iters each) per sub-task.  Combined
-# wall-time per source: ~1.5-2.5 h (was ~1 h).  With %9 (full parallel),
-# B.1 wall ≈ wallclock of slowest single source ≈ 2-2.5 h.
+# Rev 2026-05-20 — AutoCTS++ noisy-only alignment (T12+T13) + time-window
+# randomization (rev 2026-05-19) + adaptive iter:
+#   - Clean stage DISABLED (yaml ``n_per_dataset=0``); random-arch clean
+#     labels were AutoCTS++ dead code (``mode='clean_seeds'`` never
+#     invoked).  Phase 4 retrain is the only clean-equivalent training
+#     (mirrors AutoCTS++ ``mode='train'``).
+#   - Noisy stage ONLY: ``n_noisy_per_dataset=80`` per sub-task, with
+#     per-source adaptive iter budgets (ETTh2: 388, others: 480 — see
+#     ``adaptive_iter.log_clip`` block in default.yaml) and best-of-N=5
+#     over checkpoints (label = max over the 5 perfs).
+#   - L-share: ``n_shared=40`` (50/50 of n_noisy=80, AutoCTS++ Algorithm 1
+#     ``|S0|=|Si|=L``); shared head identical across every source.
+#   - Time-window randomization: per-source random (start, length) windows
+#     with IoU≤0.7 rejection → 111 sub-tasks total (was 57 equal-length).
+#     Per-source params in ``forecasting_task_variants.time_window_params``.
+#
 # Per-(sub_idx, stage) checkpointing inside ``seed_generator.py`` limits
 # spot-pre-emption loss to one (sub-task × stage) chunk (~30 min worst case).
 # Downstream after array completes: Stage T 1h + B.2 30min + 3 targets ×
-# ~1.5h each ≈ 6h.  Grand total ≈ 8-9 h (was 9-10 h with %6).
+# ~1.5h each ≈ 6h.  Grand total wall ≈ 3 days single-card → ~1 day with
+# 9-wide parallel array (driven by the slowest source — traffic or Solar).
 #
 # L-share consistency is preserved across the array thanks to two pieces:
 #
-#   1. The shared 10 candidates are sampled by ``set_seed(seed)`` only —
-#      identical across all 6 tasks regardless of array task ID.
+#   1. The shared 40 candidates (``n_shared=40`` in yaml) are sampled by
+#      ``set_seed(seed)`` only — identical across all 9 tasks regardless
+#      of array task ID.
 #   2. ``--source_global_idx_offset $SLURM_ARRAY_TASK_ID`` is threaded into
 #      ``generate_seeds(...)`` so each task's per-source random tail seed
 #      and per-candidate training seed line up exactly with the sequential
@@ -117,7 +138,7 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/ZeroAutoCL}"
 cd "$PROJECT_ROOT"
 
-OUT_DIR="outputs/zac_2026_05_12"
+OUT_DIR="outputs/zac_2026_05_20"
 DATA_DIR="data/datasets"
 CONFIG="configs/default.yaml"
 
@@ -133,29 +154,33 @@ mkdir -p logs "${OUT_DIR}" "${SEEDS_DIR}"
 # wallclock; failing fast here lets the user catch resource issues without
 # waiting on the lighter tasks.
 #
-# 9-source CL-aligned pool (rev 2026-05-10) — every target has ≥2
-# same-domain neighbours; sub-task counts are tuned per source in
-# ``configs/default.yaml::dataset_budgets`` to keep windows above the
-# encoder RF=2047 and preserve each dataset's characteristic structure:
+# 9-source CL-aligned pool (rev 2026-05-20, time-window randomization +
+# AQWanliu boost) — every target has ≥2 same-domain neighbours.  Per-source
+# random-window params (n_windows, min_len, max_len) live in
+# ``forecasting_task_variants.time_window_params`` (default.yaml).  Windows
+# are sampled uniformly in [min_len, max_len] with pairwise IoU ≤ 0.7, and
+# every min_len ≥ encoder RF (2047) to keep CL pretraining stable:
 #
 #   ETT family   (univariate OT column, auto-skips var-subsetting):
-#     - ETTh2  3 windows × 1 var = 3 sub-tasks   (window ≈ 2880, hourly)
-#     - ETTm1  9 windows × 1 var = 9 sub-tasks   (window ≈ 7742, 15-min)
-#     - ETTm2  9 windows × 1 var = 9 sub-tasks   (window ≈ 7742, 15-min)
+#     - ETTh2   6 × 1 =  6 sub-tasks   (window 5800-12000, hourly)
+#     - ETTm1  15 × 1 = 15 sub-tasks   (window 5800-25000, 15-min)
+#     - ETTm2  15 × 1 = 15 sub-tasks   (window 5800-25000, 15-min)
 #   Energy:
-#     - Solar    137 ch, 3×3 = 9 sub-tasks       (window ≈ 17520, 10-min)
+#     - Solar    137 ch,  6 × 3 = 18 sub-tasks   (window 5800-20000, 10-min)
 #   Transport (no graph):
-#     - traffic  862 ch, 3×3 = 9 sub-tasks       (window ≈ 5848, hourly)
+#     - traffic  862 ch,  6 × 3 = 18 sub-tasks   (window 5800-12000, hourly)
 #   Atmospheric (var-subsetting disabled to preserve pollutant×weather):
-#     - AQShunyi    11 ch, 3×1 = 3 sub-tasks     (window ≈ 11688, hourly)
-#     - AQWanliu    11 ch, 3×1 = 3 sub-tasks
-#     - AQGuanyuan  11 ch, 3×1 = 3 sub-tasks
+#     - AQShunyi    11 ch,  6 × 1 =  6 sub-tasks   (window 5800-25000, hourly)
+#     - AQWanliu    11 ch, 12 × 1 = 12 sub-tasks   (boost: cleanest noisy ρ)
+#     - AQGuanyuan  11 ch,  6 × 1 =  6 sub-tasks
 #   Finance:
-#     - ExchangeRate  8 ch, 3×3 = 9 sub-tasks    (window ≈ 2529, daily)
+#     - ExchangeRate  8 ch,  5 × 3 = 15 sub-tasks  (window 4096-7588, daily)
 #
-# Total 57 sub-tasks.  Domain breakdown: ETT 37% / Energy 16% / Transport
-# 16% / Atmospheric 16% / Finance 16% — mirrors AutoCTS++ §4.1.1's 36% ETT
-# ratio.
+# Total 111 sub-tasks.  Domain breakdown: ETT 32% / Energy 16% / Transport
+# 16% / Atmospheric 22% (AQWanliu boosted to feed Weather target) /
+# Finance 14% — broadly mirrors AutoCTS++ §4.1.1's 36% ETT ratio with
+# intentional +6pp on Atmospheric (Weather has no in-domain neighbour
+# outside the 3 Beijing PRSA stations).
 #
 # Order: heaviest first (traffic, Solar) → ETT-15min → finance → AQ
 # stations → ETTh2 (cheapest).  Failing fast on resource issues at task 0.
@@ -255,10 +280,10 @@ if [[ "${ARRAY_ID}" == "0" && "${ZAC_NO_CHAIN:-}" != "1" ]]; then
 #SBATCH --partition=gpu_spot
 #SBATCH --gpus=1
 #SBATCH --gpu-bind=closest
-# Mirror the parent run_array.sbatch GPU restriction: 4090 only (CC 8.9
-# AND 24 GB VRAM).  Pool size = 6 (g1n1-6).  See parent banner for the
-# rev 2026-05-16 rationale (user request).
-#SBATCH --constraint=vram24g&cc8.9
+# Mirror the parent run_array.sbatch GPU restriction: 4090 + 3090
+# (24 GB VRAM, CC >= 8.6).  Pool size = 10 (g1n[1-6] + g2n1 + g4n[1-2]).
+# See parent banner for the rev 2026-05-20 rationale (user request).
+#SBATCH --constraint=vram24g&cc8.6
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -345,7 +370,21 @@ python -u scripts/merge_seed_checkpoints.py \\
 echo
 echo "═══════ Stage T: precompute task features ═══════"
 TASK_FEAT_DIR="outputs/task_features"
+# Eviction marker for rev 2026-05-20 — time-window randomization (rev
+# 2026-05-19) keeps the sub-task slug names (e.g. ETTh2__tw0__vs1)
+# identical but changes the underlying window coordinates.
+# precompute_task_features.py checks cache hits by FILENAME only, so
+# without this guard old .npy files from the equal-window era would be
+# silently reused with mismatched data — task features would not match
+# the seed records.  Idempotent: presence of the marker file means the
+# cache is already on the current rev; subsequent runs skip eviction.
+TASK_FEAT_REV_MARKER="\${TASK_FEAT_DIR}/.rev_2026_05_20"
+if [[ -d "\${TASK_FEAT_DIR}" && ! -f "\${TASK_FEAT_REV_MARKER}" ]]; then
+    echo "[migration] task_features cache predates rev 2026-05-20 — evicting"
+    rm -rf "\${TASK_FEAT_DIR}"
+fi
 mkdir -p "\${TASK_FEAT_DIR}"
+touch "\${TASK_FEAT_REV_MARKER}"
 
 # Option B (2026-05-10): sources use --sub_task_mode so each (tw, vs)
 # sub-task gets its own task feature .npy (mirrors AutoCTS++'s per-subset

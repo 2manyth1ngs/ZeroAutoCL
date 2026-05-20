@@ -167,7 +167,12 @@ def main() -> None:
     n_shared        = args.n_shared
     if n_shared is None:
         n_shared = int(sg_cfg.get("n_shared", 0) or 0)
-    n_shared = max(0, min(int(n_shared), int(n_per_dataset)))
+    # n_shared clamp deferred until n_noisy_per_dataset is also resolved
+    # (see "L-share clamp" block below).  The legacy
+    # ``min(n_shared, n_per_dataset)`` clamp was wrong for noisy-only
+    # runs (n_per=0): it would silently zero out L-share before the
+    # value ever reached generate_seeds(), bypassing the new active-
+    # budgets clamp in seed_generator.py:524-537.
     pretrain_epochs = sg_cfg.get("pretrain_epochs", 40)
     pretrain_lr     = sg_cfg.get("pretrain_lr",     1e-3)
     batch_size      = sg_cfg.get("batch_size",      args.batch_size)
@@ -184,6 +189,19 @@ def main() -> None:
     if noisy_pretrain_iters is None:
         noisy_pretrain_iters = int(sg_cfg.get("noisy_pretrain_iters", 100) or 100)
     noisy_pretrain_iters = max(1, int(noisy_pretrain_iters))
+
+    # L-share clamp — mirrors seed_generator.py:524-537.  Clamp against
+    # every ACTIVE stage budget; a stage with budget == 0 (e.g. clean
+    # stage disabled in noisy-only mode per AutoCTS++ alignment) does
+    # NOT constrain the shared pool size.  Without this, the legacy
+    # ``min(n_shared, n_per_dataset)`` clamp would zero out L-share
+    # whenever clean is off, silently breaking AutoCTS++ Algorithm 1's
+    # |S0|=L shared arch-hypers mechanism.
+    _active_budgets = [
+        b for b in (int(n_per_dataset), int(n_noisy_per_dataset)) if b > 0
+    ]
+    _upper = min(_active_budgets) if _active_budgets else 0
+    n_shared = max(0, min(int(n_shared), _upper))
 
     # ── Forecasting task variants (time windows + horizon groups) ─────────
     n_time_windows = int(variants_cfg.get("n_time_windows", 1) or 1)
